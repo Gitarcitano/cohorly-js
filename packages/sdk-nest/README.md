@@ -4,7 +4,7 @@ NestJS integration for [Cohorly](https://github.com/Gitarcitano/cohorly-js), hos
 
 **Documentation:** [NestJS SDK reference](https://cohorly-docs.velloalabs.com/sdks/nest) · [Quickstart](https://cohorly-docs.velloalabs.com/quickstart) · [HTTP API](https://cohorly-docs.velloalabs.com/api/ingestion)
 
-Supports `@nestjs/common` ^10 and ^11 (peer dependency). Requires Node 18+.
+Supports `@nestjs/common` ^10 and ^11 (peer dependency). Requires Node 22+.
 
 ## Installation
 

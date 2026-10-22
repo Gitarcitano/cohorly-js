@@ -4,7 +4,7 @@ Server-side Node.js SDK for [Cohorly](https://github.com/Gitarcitano/cohorly-js)
 
 **Documentation:** [Node.js SDK reference](https://cohorly-docs.velloalabs.com/sdks/node) · [Quickstart](https://cohorly-docs.velloalabs.com/quickstart) · [HTTP API](https://cohorly-docs.velloalabs.com/api/ingestion)
 
-Requires Node 18+ (global `fetch`). Zero runtime dependencies.
+Requires Node 22+ (global `fetch`). Zero runtime dependencies.
 
 ## Installation
 
