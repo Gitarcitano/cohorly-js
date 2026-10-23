@@ -78,3 +78,5 @@ requests to third-party analytics hosts, and keeps `apiHost` private.
 | `createCohorlyProxy(options)` | `@cohorly/nextjs/server` | `{ apiHost?, allowedPaths?, token? }` -> `{ POST }` route handler. `apiHost` defaults to the hosted API; `allowedPaths` defaults to `["track", "engage", "alias"]`. |
 
 Requires Next.js 13+ and React 18+ (peer dependencies).
+
+Security note (2026-10-23): if you run Next.js 15, use `>=15.5.28`; if Next.js 16, use `>=16.4.1` (GHSA-673q-mjm6-r5xr / CVE-2026-96889 / GHSA-p3m5-59mp-jv5r). This workspace pins `next@16.4.1+` for CI.
