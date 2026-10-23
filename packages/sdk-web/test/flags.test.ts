@@ -129,4 +129,67 @@ describe("web feature flags", () => {
     cohorly.isFeatureEnabled("checkout");
     expect(exposures()).toHaveLength(0);
   });
+
+  it("getFeatureFlagDetails reports the source, and fallback reads emit none", async () => {
+    init({
+      apiHost: "http://localhost:4000",
+      token: "tok-w",
+      loadFeatureFlags: false,
+    });
+    expect(cohorly.getFeatureFlagDetails("nope", "control").source).toBe(
+      "fallback",
+    );
+
+    await cohorly.reloadFeatureFlags();
+    expect(cohorly.getFeatureFlagDetails("banner")).toEqual({
+      key: "banner",
+      value: "blue",
+      enabled: true,
+      payload: { color: "#00f" },
+      source: "network",
+    });
+    cohorly.getFeatureFlag("nope", "control");
+    // Only the details read of the known flag exposed; fallback emitted none.
+    expect(exposures()).toHaveLength(1);
+  });
+
+  it("serves the persisted cache across init() and flagPersistence passes through", async () => {
+    init({
+      apiHost: "http://localhost:4000",
+      token: "tok-w",
+      loadFeatureFlags: false,
+    });
+    await cohorly.reloadFeatureFlags();
+    const distinctId = cohorly.getDistinctId();
+    expect(JSON.parse(window.localStorage.getItem("chl_flags")!).stored_at).toEqual(
+      expect.any(Number),
+    );
+
+    // Second init, network down: the persisted cache serves with
+    // source "persistence" - the option defaults reach the core client.
+    fetchMock.mockImplementation(async () => {
+      throw new Error("offline");
+    });
+    init({
+      apiHost: "http://localhost:4000",
+      token: "tok-w",
+      loadFeatureFlags: false,
+    });
+    expect(cohorly.getDistinctId()).toBe(distinctId);
+    const details = cohorly.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("persistence");
+    expect(details.ttlMs).toBe(24 * 60 * 60 * 1000);
+    expect(typeof details.persistedAt).toBe("number");
+
+    // networkOnly: the same cache is ignored, never served.
+    init({
+      apiHost: "http://localhost:4000",
+      token: "tok-w",
+      loadFeatureFlags: false,
+      flagPersistence: "networkOnly",
+    });
+    expect(cohorly.getFeatureFlagDetails("banner").source).toBe("fallback");
+    await cohorly.reloadFeatureFlags(); // fetch still throws: no recovery
+    expect(cohorly.getFeatureFlag("banner")).toBe(false);
+  });
 });

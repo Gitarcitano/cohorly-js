@@ -18,7 +18,7 @@ pnpm add @react-native-async-storage/async-storage
 
 ```ts
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { init, track, identify, register, people } from "@cohorly/react-native";
+import { init, track, identify, people } from "@cohorly/react-native";
 
 init({
   // Project token: stamped on every tracked event's properties and included
@@ -27,8 +27,6 @@ init({
   storage: AsyncStorage, // injects real persistence; falls back to in-memory if omitted
   // apiHost defaults to the hosted Cohorly API; set it to target a different deployment.
 });
-
-register({ app_version: "1.2.0" });
 
 track("Screen Viewed", { screen: "Home" });
 

@@ -1,4 +1,9 @@
-import type { FlagResult, PeopleProperties } from "@cohorly/core";
+import type {
+  FlagDetails,
+  FlagPersistenceMode,
+  FlagResult,
+  PeopleProperties,
+} from "@cohorly/core";
 import { CohorlyClient, fetchTransport } from "@cohorly/core";
 import { getAttributionProperties, initAttribution } from "./attribution.js";
 import type { AutocaptureConfig, AutocaptureOption } from "./autocapture.js";
@@ -50,6 +55,22 @@ export interface CohorlyWebOptions {
    * session (cleared on identify()/reset()). Default true.
    */
   sendExposureEvents?: boolean;
+  /**
+   * Flag persistence policy: "networkOnly" never touches the persisted
+   * cache, "networkFirst" serves a still-valid identity-scoped cache
+   * (strictly within `flagCacheTtlMs`), and
+   * "persistenceUntilNetworkSuccess" serves it until the first successful
+   * network evaluation replaces it - still serving an expired cache up to
+   * 7 days stale. Default "persistenceUntilNetworkSuccess".
+   */
+  flagPersistence?: FlagPersistenceMode;
+  /**
+   * How long the persisted flag cache stays valid, in ms. Bounds strict
+   * serving under "networkFirst"; under "persistenceUntilNetworkSuccess" an
+   * expired cache still serves up to 7 days stale. Legacy caches without a
+   * write timestamp never expire. Default 86400000 (24 hours).
+   */
+  flagCacheTtlMs?: number;
   /** Max events retained in the persisted queue (drop oldest on overflow). Default 1000. */
   maxQueueSize?: number;
   /** Upper bound on retry backoff delay, in ms. Default 600000 (10 min). */
@@ -74,13 +95,37 @@ export interface Cohorly {
   isAnonymous(): boolean;
   /** Re-evaluate feature flags for the current distinct id. Never rejects. */
   reloadFeatureFlags(): Promise<void>;
-  /** Variant key if the flag has one, else its enabled boolean; false when unknown/not loaded. */
-  getFeatureFlag(key: string): boolean | string;
-  isFeatureEnabled(key: string): boolean;
+  /**
+   * Variant key if the flag has one, else its enabled boolean; `fallback`
+   * (default false) when unknown/not loaded. Fallback reads emit no exposure.
+   */
+  getFeatureFlag(key: string, fallback?: boolean | string): boolean | string;
+  /**
+   * The flag's enabled boolean; `fallback` (default false) when
+   * unknown/not loaded. Fallback reads emit no exposure.
+   */
+  isFeatureEnabled(key: string, fallback?: boolean): boolean;
+  /**
+   * The full result for one flag: value, enabled, payload, and `source`
+   * ("network" | "persistence" | "fallback"), with `ttlMs` - and
+   * `persistedAt` when the cache carries a write timestamp - when served
+   * from the persisted cache.
+   */
+  getFeatureFlagDetails(
+    key: string,
+    fallback?: boolean | string,
+  ): FlagDetails;
   getFeatureFlagPayload(key: string): unknown | null;
   /**
-   * Subscribe to flag updates. Fires after every successful reload, and
-   * immediately if flags are already loaded. Returns an unsubscribe function.
+   * Whether a flag set is currently being served. Goes back to false on
+   * identify()/reset() until the new identity's flags land.
+   */
+  areFeatureFlagsLoaded(): boolean;
+  /**
+   * Subscribe to flag updates. Fires whenever the served flag set changes:
+   * after every successful reload, when identify()/reset() clears the
+   * outgoing identity's flags (with an empty map), and immediately if flags
+   * are already loaded. Returns an unsubscribe function.
    */
   onFeatureFlags(cb: (flags: Record<string, FlagResult>) => void): () => void;
 }
@@ -166,14 +211,20 @@ export const cohorly: Cohorly = {
   reloadFeatureFlags() {
     return ensureClient().reloadFeatureFlags();
   },
-  getFeatureFlag(key) {
-    return ensureClient().getFeatureFlag(key);
+  getFeatureFlag(key, fallback) {
+    return ensureClient().getFeatureFlag(key, fallback);
   },
-  isFeatureEnabled(key) {
-    return ensureClient().isFeatureEnabled(key);
+  isFeatureEnabled(key, fallback) {
+    return ensureClient().isFeatureEnabled(key, fallback);
+  },
+  getFeatureFlagDetails(key, fallback) {
+    return ensureClient().getFeatureFlagDetails(key, fallback);
   },
   getFeatureFlagPayload(key) {
     return ensureClient().getFeatureFlagPayload(key);
+  },
+  areFeatureFlagsLoaded() {
+    return ensureClient().areFeatureFlagsLoaded();
   },
   onFeatureFlags(cb) {
     return ensureClient().onFeatureFlags(cb);
@@ -207,6 +258,8 @@ export function init(options: CohorlyWebOptions): Cohorly {
     maxQueueSize: options.maxQueueSize,
     maxRetryDelayMs: options.maxRetryDelayMs,
     sendExposureEvents: options.sendExposureEvents,
+    flagPersistence: options.flagPersistence,
+    flagCacheTtlMs: options.flagCacheTtlMs,
   });
 
   if (options.superProperties) {
@@ -253,7 +306,10 @@ export type {
   CohorlyStorage,
   CohorlyTransport,
   EngageOp,
+  FlagDetails,
+  FlagPersistenceMode,
   FlagResult,
+  FlagSource,
   FlagsFetcher,
   PeopleProperties,
   TrackedEvent,

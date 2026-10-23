@@ -1,5 +1,10 @@
 import { CohorlyClient } from "./client.js";
-import type { CohorlyOptions, FlagResult, Properties } from "./types.js";
+import type {
+  CohorlyOptions,
+  FlagDetails,
+  FlagResult,
+  Properties,
+} from "./types.js";
 
 export { CohorlyClient, TransportError } from "./client.js";
 export { InMemoryStorage } from "./storage.js";
@@ -8,7 +13,10 @@ export type {
   AsyncStorageLike,
   CohorlyOptions,
   EngagePayload,
+  FlagDetails,
+  FlagPersistenceMode,
   FlagResult,
+  FlagSource,
   PlatformInfo,
   Properties,
   TrackEvent,
@@ -86,13 +94,30 @@ export function reloadFeatureFlags(): Promise<void> {
   return client().reloadFeatureFlags();
 }
 
-/** Variant key if the flag has one, else its enabled boolean; false when unknown/not loaded. */
-export function getFeatureFlag(key: string): boolean | string {
-  return client().getFeatureFlag(key);
+/** Variant key if the flag has one, else its enabled boolean; `fallback`
+ * (default false) when unknown/not loaded. Fallback reads emit no exposure. */
+export function getFeatureFlag(
+  key: string,
+  fallback?: boolean | string,
+): boolean | string {
+  return client().getFeatureFlag(key, fallback);
 }
 
-export function isFeatureEnabled(key: string): boolean {
-  return client().isFeatureEnabled(key);
+/** The flag's enabled boolean; `fallback` (default false) when
+ * unknown/not loaded. Fallback reads emit no exposure. */
+export function isFeatureEnabled(key: string, fallback?: boolean): boolean {
+  return client().isFeatureEnabled(key, fallback);
+}
+
+/** The full result for one flag: value, enabled, payload, and `source`
+ * ("network" | "persistence" | "fallback"), with `ttlMs` - and
+ * `persistedAt` when the cache carries a write timestamp - when served
+ * from the persisted cache. */
+export function getFeatureFlagDetails(
+  key: string,
+  fallback?: boolean | string,
+): FlagDetails {
+  return client().getFeatureFlagDetails(key, fallback);
 }
 
 export function getFeatureFlagPayload(key: string): unknown | null {

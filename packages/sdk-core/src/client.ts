@@ -3,6 +3,8 @@ import type {
   CohorlyClientOptions,
   CohorlyStorage,
   CohorlyTransport,
+  FlagDetails,
+  FlagPersistenceMode,
   FlagResult,
   FlagsFetcher,
   PeopleProperties,
@@ -23,15 +25,42 @@ const DEFAULT_API_HOST = "https://cohorly-service.velloalabs.com";
 const DEFAULT_MAX_QUEUE_SIZE = 1000;
 const DEFAULT_MAX_RETRY_DELAY_MS = 10 * 60 * 1000; // 10 minutes
 const BACKOFF_BASE_MS = 2000;
+/**
+ * Default flag-cache TTL: 24 hours, matching the Mixpanel flag-persistence
+ * reference TTL for its persistent lookup policies.
+ */
+const DEFAULT_FLAG_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Hard staleness bound for `persistenceUntilNetworkSuccess`: that policy
+ * trades freshness for offline availability, so a cache past
+ * `flagCacheTtlMs` is still served while it is within this window - the
+ * served window is the wider of the configured TTL and 7 days.
+ */
+const FLAG_CACHE_MAX_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** A TTL must be a positive finite duration; anything else falls back to
+ * the 24h default so a stray negative or NaN option cannot disable or
+ * unbound the cache window. */
+function normalizeFlagCacheTtlMs(ttl: number | undefined): number {
+  return ttl !== undefined && Number.isFinite(ttl) && ttl > 0
+    ? ttl
+    : DEFAULT_FLAG_CACHE_TTL_MS;
+}
 
 /**
  * Persisted flag cache. `distinct_id` scopes the cache: on load it is
  * discarded when it does not match the current distinct id, so different
- * users never see each other's flags.
+ * users never see each other's flags. `stored_at` bounds its age per the
+ * active `flagPersistence` policy (see isFlagCacheUsable). Caches written
+ * by pre-TTL SDK versions carry no `stored_at`; their age cannot be proven,
+ * so they are served rather than expired - the graceful-upgrade path that
+ * preserves the pre-feature behavior (the cache was served indefinitely).
  */
 interface FlagsCache {
   distinct_id: string;
   flags: Record<string, FlagResult>;
+  stored_at?: number;
 }
 
 /**
@@ -72,10 +101,24 @@ export class CohorlyClient {
   private effectiveBatchSize: number;
 
   private readonly fetcher: FlagsFetcher;
+  /** Flag persistence policy; see CohorlyClientOptions.flagPersistence. */
+  private readonly flagPersistence: FlagPersistenceMode;
+  /** TTL (ms) applied to the persisted flag cache. */
+  private readonly flagCacheTtlMs: number;
   /** Last known flag results for the current distinct id (memory copy of the cache). */
   private flags: Record<string, FlagResult> = {};
   /** True once flags were loaded (from cache or a successful reload). */
   private flagsLoaded = false;
+  /**
+   * Where the currently served flags came from: "network" after a
+   * successful reload this session, "persistence" while the persisted
+   * cache is being served. Undefined until flags are loaded.
+   */
+  private flagsSource: "network" | "persistence" | undefined;
+  /** Epoch ms the served persisted cache was written (persistence source only). */
+  private flagsPersistedAt: number | undefined;
+  /** TTL (ms) in effect for the served persisted cache (persistence source only). */
+  private flagsTtlMs: number | undefined;
   private flagRequestSeq = 0;
   private readonly flagListeners = new Set<
     (flags: Record<string, FlagResult>) => void
@@ -126,15 +169,12 @@ export class CohorlyClient {
 
     this.fetcher = options.fetcher ?? fetchFlagsFetcher;
     this.sendExposureEvents = options.sendExposureEvents ?? true;
-    // Load the persisted flag cache, but only when it belongs to the current
-    // distinct id - a different user's cache is discarded, never served.
-    const flagsCache = this.readJson<FlagsCache | null>(KEY_FLAGS, null);
-    if (flagsCache && flagsCache.distinct_id === this.distinctId) {
-      this.flags = flagsCache.flags ?? {};
-      this.flagsLoaded = true;
-    } else if (flagsCache) {
-      this.storage.remove(KEY_FLAGS);
-    }
+    this.flagPersistence =
+      options.flagPersistence ?? "persistenceUntilNetworkSuccess";
+    this.flagCacheTtlMs = normalizeFlagCacheTtlMs(options.flagCacheTtlMs);
+    // Adopt the persisted flag cache when policy and freshness allow it, so
+    // a restart serves the last known assignments immediately.
+    this.adoptPersistedFlags();
 
     this.superProps = this.readJson(KEY_SUPER_PROPS, {});
     this.timedEvents = this.readJson(KEY_TIMED_EVENTS, {});
@@ -248,12 +288,12 @@ export class CohorlyClient {
     this.storage.set(KEY_DISTINCT_ID, this.distinctId);
     this.storage.set(KEY_ANONYMOUS, "0");
 
-    // Flags are per-identity: drop the previous identity's cache before the
-    // refresh (a slow or failed reload must not keep serving the old user's
-    // variants to the new id), and let the new identity record its own
-    // exposures.
-    this.flags = {};
-    this.flagsLoaded = false;
+    // Flags are per-identity: drop the previous identity's in-memory state
+    // and remove its persisted cache before the refresh (a slow or failed
+    // reload must not keep serving the old user's variants to the new id),
+    // and let the new identity record its own exposures. The persisted entry
+    // is removed under every policy - identity hygiene, not flag serving.
+    this.clearFlagState();
     this.exposedFlags.clear();
     this.storage.remove(KEY_FLAGS);
     void this.reloadFeatureFlags();
@@ -286,9 +326,9 @@ export class CohorlyClient {
     this.storage.set(KEY_ANONYMOUS, "1");
     this.clearTimedEvents();
     // Flags are per-identity: the previous identity's flags must not be
-    // served to the new anonymous id, so drop them before the refresh.
-    this.flags = {};
-    this.flagsLoaded = false;
+    // served to the new anonymous id, so drop them and remove the persisted
+    // cache (under every policy) before the refresh.
+    this.clearFlagState();
     this.exposedFlags.clear();
     this.storage.remove(KEY_FLAGS);
     void this.reloadFeatureFlags();
@@ -296,8 +336,9 @@ export class CohorlyClient {
 
   /**
    * Re-evaluate feature flags for the current distinct id via
-   * POST /flags/evaluate, caching the result in memory and storage
-   * (key `chl_flags`, scoped by distinct id). Errors are swallowed - the
+   * POST /flags/evaluate, caching the result in memory and - unless the
+   * policy is `networkOnly` - in storage (key `chl_flags`, scoped by
+   * distinct id, stamped with `stored_at`). Errors are swallowed - the
    * stale cache is kept and no rejection escapes.
    */
   async reloadFeatureFlags(): Promise<void> {
@@ -317,13 +358,70 @@ export class CohorlyClient {
     }
     this.flags = flags as Record<string, FlagResult>;
     this.flagsLoaded = true;
-    this.storage.set(
-      KEY_FLAGS,
-      JSON.stringify({
-        distinct_id: requestedId,
-        flags: this.flags,
-      } satisfies FlagsCache),
-    );
+    this.flagsSource = "network";
+    this.flagsPersistedAt = undefined;
+    this.flagsTtlMs = undefined;
+    if (this.flagPersistence !== "networkOnly") {
+      this.storage.set(
+        KEY_FLAGS,
+        JSON.stringify({
+          distinct_id: requestedId,
+          flags: this.flags,
+          stored_at: Date.now(),
+        } satisfies FlagsCache),
+      );
+    }
+    this.emitFlags();
+  }
+
+  /**
+   * Serves the persisted flag cache at construction when policy allows it:
+   * the cache must belong to the CURRENT distinct id and be servable under
+   * `flagPersistence` (see isFlagCacheUsable). A cache written for another
+   * identity, or one too stale for the active policy, is removed and never
+   * served. `networkOnly` never reads the persisted cache. Identity
+   * switches do not adopt anything: the single-slot cache is removed on
+   * identify()/reset(), so it can only ever hold the outgoing identity's
+   * entry.
+   */
+  private adoptPersistedFlags(): void {
+    if (this.flagPersistence === "networkOnly") return;
+    const cache = this.readJson<FlagsCache | null>(KEY_FLAGS, null);
+    if (!cache) return;
+    if (cache.distinct_id !== this.distinctId || !this.isFlagCacheUsable(cache)) {
+      this.storage.remove(KEY_FLAGS);
+      return;
+    }
+    this.flags = cache.flags ?? {};
+    this.flagsLoaded = true;
+    this.flagsSource = "persistence";
+    // Undefined for a legacy cache without `stored_at`: persistedAt stays
+    // absent on FlagDetails and the exposure, while ttlMs is still reported.
+    this.flagsPersistedAt = cache.stored_at;
+    this.flagsTtlMs = this.flagCacheTtlMs;
+    // A future `stored_at` (clock moved backwards after the write) would
+    // stay fresh on every adoption until real time catches up, outliving
+    // the TTL bound. Normalize the stamp to now and rewrite the entry so
+    // subsequent launches age it honestly.
+    if (typeof cache.stored_at === "number" && cache.stored_at > Date.now()) {
+      this.flagsPersistedAt = Date.now();
+      this.storage.set(
+        KEY_FLAGS,
+        JSON.stringify({
+          distinct_id: this.distinctId,
+          flags: this.flags,
+          stored_at: this.flagsPersistedAt,
+        } satisfies FlagsCache),
+      );
+    }
+    // Served values changed: notify listeners (none exist at construction,
+    // but the invariant mirrors emitFlags everywhere flags are adopted).
+    this.emitFlags();
+  }
+
+  /** Notifies every onFeatureFlags listener; a throwing listener never
+   * breaks the others (or the caller). */
+  private emitFlags(): void {
     for (const cb of this.flagListeners) {
       try {
         cb(this.flags);
@@ -334,28 +432,127 @@ export class CohorlyClient {
   }
 
   /**
-   * The flag's variant key when it has one, else its enabled boolean.
-   * `false` for unknown flags or before flags are loaded.
+   * True when a persisted cache may be served under `flagPersistence`.
+   * `networkFirst` is strict: only while `stored_at` is within
+   * `flagCacheTtlMs`. `persistenceUntilNetworkSuccess` trades freshness for
+   * offline availability and serves until the wider of `flagCacheTtlMs` and
+   * `FLAG_CACHE_MAX_STALE_MS` (a cache inside the TTL always serves; an
+   * expired one still serves up to 7 days stale). A legacy cache without
+   * `stored_at` has no provable age: it is served indefinitely, matching
+   * the pre-TTL behavior it was written under, until a successful reload
+   * replaces it with the stamped format.
    */
-  getFeatureFlag(key: string): boolean | string {
+  private isFlagCacheUsable(cache: FlagsCache): boolean {
+    if (typeof cache.stored_at !== "number") return true;
+    // A future `stored_at` (clock moved backwards after the write) yields a
+    // negative age that would bypass every bound below; clamp it to fresh.
+    // The stamp itself is normalized to now on adoption so later launches
+    // age it honestly instead of staying fresh until the clock catches up.
+    const age = Math.max(0, Date.now() - cache.stored_at);
+    if (this.flagPersistence === "networkFirst") {
+      return age <= this.flagCacheTtlMs;
+    }
+    return age <= Math.max(this.flagCacheTtlMs, FLAG_CACHE_MAX_STALE_MS);
+  }
+
+  /** Drops all in-memory flag state of the outgoing identity, then notifies
+   * listeners: the served set changed to empty, so subscribers (React hooks
+   * included) stop serving the old values immediately instead of holding
+   * them until the next reload lands. */
+  private clearFlagState(): void {
+    this.flags = {};
+    this.flagsLoaded = false;
+    this.flagsSource = undefined;
+    this.flagsPersistedAt = undefined;
+    this.flagsTtlMs = undefined;
+    this.emitFlags();
+  }
+
+  /**
+   * The flag's variant key when it has one, else its enabled boolean.
+   * `fallback` (default `false`) is returned for unknown flags or before
+   * flags are loaded; a read that resolves to the fallback is a default,
+   * not an exposure - it emits no `$feature_flag_called`.
+   */
+  getFeatureFlag(
+    key: string,
+    fallback: boolean | string = false,
+  ): boolean | string {
     const flag = this.flags[key];
-    if (!flag) return false;
+    if (!flag) return fallback;
     const value = flag.variant ?? flag.enabled;
     this.trackExposure(key, value);
     return value;
   }
 
-  isFeatureEnabled(key: string): boolean {
+  /**
+   * The flag's enabled boolean. `fallback` (default `false`) is returned for
+   * unknown flags or before flags are loaded; a fallback read is not an
+   * exposure.
+   */
+  isFeatureEnabled(key: string, fallback = false): boolean {
     const flag = this.flags[key];
-    if (!flag) return false;
+    if (!flag) return fallback;
     this.trackExposure(key, flag.variant ?? flag.enabled);
     return flag.enabled;
   }
 
   /**
+   * The full result for one flag, including where the value was served from.
+   * `source` is "network" for a successful evaluation this session,
+   * "persistence" for the identity-scoped persisted cache (within the
+   * policy's staleness window; the cache's real age stays observable via
+   * `persistedAt`, and `persistedAt` is absent for a legacy cache without
+   * `stored_at`), or "fallback" when the flag is unknown - in which case
+   * `value` is `fallback` (default
+   * `false`) and `enabled` is `Boolean(fallback)`. A read of a known flag
+   * counts as an exposure, like the other getters; a fallback result never
+   * does.
+   */
+  getFeatureFlagDetails(
+    key: string,
+    fallback: boolean | string = false,
+  ): FlagDetails {
+    const flag = this.flags[key];
+    if (!flag) {
+      return {
+        key,
+        value: fallback,
+        enabled: Boolean(fallback),
+        payload: null,
+        source: "fallback",
+      };
+    }
+    const value = flag.variant ?? flag.enabled;
+    this.trackExposure(key, value);
+    const details: FlagDetails = {
+      key,
+      value,
+      enabled: flag.enabled,
+      payload: flag.payload ?? null,
+      source: this.flagsSource ?? "network",
+    };
+    if (details.source === "persistence") {
+      // Absent for a legacy cache without `stored_at` (unprovable age);
+      // ttlMs is still reported either way.
+      if (this.flagsPersistedAt !== undefined) {
+        details.persistedAt = this.flagsPersistedAt;
+      }
+      details.ttlMs = this.flagsTtlMs;
+    }
+    return details;
+  }
+
+  /**
    * Emit `$feature_flag_called` once per (key, value) per identity session.
-   * Only real reads of a loaded, known flag count as an exposure - the `false`
-   * returned for an unknown key or before load is a default, not an exposure.
+   * Only real reads of a loaded, known flag count as an exposure - the
+   * fallback returned for an unknown key or before load is a default, not
+   * an exposure. The event always carries `$feature_flag_source` (the same
+   * "network"/"persistence" provenance as getFeatureFlagDetails), and for
+   * persistence-sourced values also `$feature_flag_ttl_ms` and - when the
+   * served cache carries `stored_at` - `$feature_flag_persisted_at`. Dedup
+   * is by (key, value): the same value served first from persistence and
+   * later from network is not re-emitted.
    */
   private trackExposure(key: string, value: boolean | string): void {
     if (!this.sendExposureEvents || !this.flagsLoaded) return;
@@ -365,6 +562,16 @@ export class CohorlyClient {
     this.track("$feature_flag_called", {
       $feature_flag: key,
       $feature_flag_response: value,
+      $feature_flag_source: this.flagsSource ?? "network",
+      ...(this.flagsSource === "persistence"
+        ? {
+            // Absent for a legacy cache without `stored_at`.
+            ...(this.flagsPersistedAt !== undefined
+              ? { $feature_flag_persisted_at: this.flagsPersistedAt }
+              : {}),
+            $feature_flag_ttl_ms: this.flagsTtlMs,
+          }
+        : {}),
     });
   }
 
@@ -373,8 +580,22 @@ export class CohorlyClient {
   }
 
   /**
-   * Subscribe to flag updates. `cb` fires after every successful reload, and
-   * immediately when flags are already loaded. Returns an unsubscribe function.
+   * Whether a flag set is currently being served (a successful network
+   * evaluation or an adopted persisted cache). Goes back to false on
+   * identify()/reset() until the new identity's flags land - subscribers
+   * use it to keep serving "unloaded" instead of getter fallbacks while
+   * the next set is still loading.
+   */
+  areFeatureFlagsLoaded(): boolean {
+    return this.flagsLoaded;
+  }
+
+  /**
+   * Subscribe to flag updates. `cb` fires whenever the served flag set
+   * changes: after a successful reload, when a persisted cache is adopted,
+   * and when identify()/reset() clears the outgoing identity's flags (with
+   * an empty map) - plus immediately when flags are already loaded.
+   * Returns an unsubscribe function.
    */
   onFeatureFlags(cb: (flags: Record<string, FlagResult>) => void): () => void {
     this.flagListeners.add(cb);

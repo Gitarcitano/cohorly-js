@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/nest",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "NestJS integration for Cohorly, hosted product analytics (Mixpanel-style). Dynamic module (forRoot/forRootAsync) + injectable CohorlyService wrapping @cohorly/node with a graceful shutdown flush.",
   "type": "module",
   "main": "dist/index.js",

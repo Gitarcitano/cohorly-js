@@ -738,6 +738,441 @@ describe("feature flags", () => {
       "blue",
     );
   });
+
+  it("explicit fallbacks resolve unknown keys without emitting an exposure", async () => {
+    const { client, storage } = makeFlagClient();
+    expect(client.getFeatureFlag("nope", "control")).toBe("control");
+    expect(client.isFeatureEnabled("nope", true)).toBe(true);
+    expect(client.getFeatureFlag("checkout", "control")).toBe("control");
+
+    await client.reloadFeatureFlags();
+    expect(client.getFeatureFlag("nope", "control")).toBe("control");
+    expect(client.isFeatureEnabled("nope", true)).toBe(true);
+    // A known flag ignores the fallback and still counts as an exposure.
+    expect(client.getFeatureFlag("banner", "red")).toBe("blue");
+    expect(client.isFeatureEnabled("hidden", true)).toBe(false);
+
+    const queued = JSON.parse(storage.get("cohorly_queue") ?? "[]") as {
+      event: string;
+    }[];
+    const fired = queued.filter((e) => e.event === "$feature_flag_called");
+    // Exactly two exposures, both reads of known flags (banner + hidden);
+    // every read that resolved to the fallback emitted nothing.
+    expect(fired).toHaveLength(2);
+  });
+
+  it("getFeatureFlagDetails reports the value, payload and source", async () => {
+    const { client } = makeFlagClient();
+    // Unknown before load: fallback source, caller's fallback as value.
+    expect(client.getFeatureFlagDetails("nope", "control")).toEqual({
+      key: "nope",
+      value: "control",
+      enabled: true,
+      payload: null,
+      source: "fallback",
+    });
+
+    await client.reloadFeatureFlags();
+    expect(client.getFeatureFlagDetails("banner")).toEqual({
+      key: "banner",
+      value: "blue",
+      enabled: true,
+      payload: { color: "#00f" },
+      source: "network",
+    });
+    // Still fallback after load for a key the evaluation did not return.
+    expect(client.getFeatureFlagDetails("nope").source).toBe("fallback");
+  });
+});
+
+describe("feature flag persistence", () => {
+  const flagsResponse = {
+    flags: {
+      checkout: { enabled: true, variant: null, payload: null, reason: "rule:0" },
+      banner: {
+        enabled: true,
+        variant: "blue",
+        payload: { color: "#00f" },
+        reason: "rule:0",
+      },
+    },
+  };
+
+  function makeFlagClient(overrides?: {
+    storage?: CohorlyStorage;
+    respond?: (body: unknown) => unknown;
+    options?: {
+      flagPersistence?: "networkOnly" | "networkFirst" | "persistenceUntilNetworkSuccess";
+      flagCacheTtlMs?: number;
+    };
+  }) {
+    const storage = overrides?.storage ?? makeStorage();
+    const fetchCalls: { url: string; body: unknown }[] = [];
+    const respond = overrides?.respond ?? (() => flagsResponse);
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      storage,
+      transport: async () => {},
+      flushIntervalMs: 0,
+      token: "tok-1",
+      fetcher: async (url, body) => {
+        fetchCalls.push({ url, body });
+        return respond(body);
+      },
+      ...overrides?.options,
+    });
+    return { client, storage, fetchCalls };
+  }
+
+  function writeCache(
+    storage: CohorlyStorage,
+    distinctId: string,
+    storedAt: number | undefined,
+  ) {
+    storage.set(
+      "chl_flags",
+      JSON.stringify({
+        distinct_id: distinctId,
+        flags: flagsResponse.flags,
+        ...(storedAt !== undefined ? { stored_at: storedAt } : {}),
+      }),
+    );
+  }
+
+  const exposures = (storage: CohorlyStorage) =>
+    (JSON.parse(storage.get("cohorly_queue") ?? "[]") as {
+      event: string;
+      properties: Record<string, unknown>;
+    }[]).filter((e) => e.event === "$feature_flag_called");
+
+  it("serves a valid persisted cache on startup while offline (default policy)", async () => {
+    const storage = makeStorage();
+    const { client: c1 } = makeFlagClient({ storage });
+    await c1.reloadFeatureFlags();
+    const distinctId = c1.getDistinctId();
+
+    // Second launch, network down: the persisted cache answers immediately.
+    const { client: c2, fetchCalls } = makeFlagClient({
+      storage,
+      respond: () => undefined,
+    });
+    expect(c2.getDistinctId()).toBe(distinctId);
+    expect(c2.getFeatureFlag("banner")).toBe("blue");
+    const details = c2.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("persistence");
+    expect(typeof details.persistedAt).toBe("number");
+    expect(details.ttlMs).toBe(24 * 60 * 60 * 1000);
+
+    await c2.reloadFeatureFlags(); // fails: cache keeps serving
+    expect(fetchCalls).toHaveLength(1);
+    expect(c2.getFeatureFlagDetails("banner").source).toBe("persistence");
+  });
+
+  it("flips source to network and re-persists after the first successful reload", async () => {
+    const storage = makeStorage();
+    const { client: c1 } = makeFlagClient({ storage });
+    await c1.reloadFeatureFlags();
+
+    const { client: c2 } = makeFlagClient({ storage });
+    expect(c2.getFeatureFlagDetails("banner").source).toBe("persistence");
+
+    await c2.reloadFeatureFlags();
+    const details = c2.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("network");
+    expect(details.persistedAt).toBeUndefined();
+    expect(details.ttlMs).toBeUndefined();
+    // Re-persisted with a fresh stored_at.
+    const cached = JSON.parse(storage.get("chl_flags")!);
+    expect(cached.distinct_id).toBe(c2.getDistinctId());
+    expect(typeof cached.stored_at).toBe("number");
+  });
+
+  it("serves a cache past the TTL but within 7 days under persistenceUntilNetworkSuccess, not under networkFirst", async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const storedAt = Date.now() - 2 * DAY; // past the 24 h TTL, inside 7 d
+    const storage = makeStorage();
+    storage.set("cohorly_distinct_id", "user-1");
+    storage.set("cohorly_anonymous", "0");
+    writeCache(storage, "user-1", storedAt);
+
+    // Default policy trades freshness for offline availability: the stale
+    // cache still serves, and its real age stays observable via persistedAt.
+    const { client: puns } = makeFlagClient({
+      storage,
+      respond: () => undefined,
+    });
+    const details = puns.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("persistence");
+    expect(details.value).toBe("blue");
+    expect(details.persistedAt).toBe(storedAt);
+    expect(details.ttlMs).toBe(DAY);
+
+    // networkFirst is strict: the same expired cache is discarded.
+    const storage2 = makeStorage();
+    storage2.set("cohorly_distinct_id", "user-1");
+    storage2.set("cohorly_anonymous", "0");
+    writeCache(storage2, "user-1", storedAt);
+    const { client: nf } = makeFlagClient({
+      storage: storage2,
+      respond: () => undefined,
+      options: { flagPersistence: "networkFirst" },
+    });
+    expect(nf.getFeatureFlag("banner")).toBe(false);
+    expect(nf.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage2.get("chl_flags")).toBeNull();
+  });
+
+  it("normalizes a future stored_at to now so later adoptions age it honestly", async () => {
+    // Clock moved backwards after the write: the raw age is negative and
+    // would satisfy every bound indefinitely - the stamp is normalized to
+    // now on adoption so the entry ages from here instead of staying
+    // fresh until real time catches up.
+    const storage = makeStorage();
+    storage.set("cohorly_distinct_id", "user-1");
+    storage.set("cohorly_anonymous", "0");
+    writeCache(storage, "user-1", Date.now() + 365 * 24 * 60 * 60 * 1000);
+
+    const { client } = makeFlagClient({
+      storage,
+      respond: () => undefined,
+      options: { flagPersistence: "networkFirst" },
+    });
+    expect(client.getFeatureFlagDetails("banner").source).toBe("persistence");
+    const rewritten = JSON.parse(storage.get("chl_flags") as string) as {
+      stored_at?: number;
+    };
+    expect(rewritten.stored_at).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("discards a cache stale beyond the 7-day window under any persistent policy", async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const storedAt = Date.now() - 8 * DAY;
+
+    const storage = makeStorage();
+    storage.set("cohorly_distinct_id", "user-1");
+    storage.set("cohorly_anonymous", "0");
+    writeCache(storage, "user-1", storedAt);
+    const { client: puns } = makeFlagClient({
+      storage,
+      respond: () => undefined,
+    });
+    expect(puns.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage.get("chl_flags")).toBeNull();
+
+    const storage2 = makeStorage();
+    storage2.set("cohorly_distinct_id", "user-1");
+    storage2.set("cohorly_anonymous", "0");
+    writeCache(storage2, "user-1", storedAt);
+    const { client: nf } = makeFlagClient({
+      storage: storage2,
+      respond: () => undefined,
+      options: { flagPersistence: "networkFirst" },
+    });
+    expect(nf.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage2.get("chl_flags")).toBeNull();
+  });
+
+  it("serves a legacy cache without stored_at as persistence, under any persistent policy", async () => {
+    const storage = makeStorage();
+    storage.set("cohorly_distinct_id", "user-1");
+    storage.set("cohorly_anonymous", "0");
+    writeCache(storage, "user-1", undefined); // pre-TTL format: no stored_at
+
+    const { client } = makeFlagClient({ storage, respond: () => undefined });
+    expect(client.getFeatureFlag("banner")).toBe("blue");
+    const details = client.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("persistence");
+    // Unprovable age: persistedAt stays absent; ttlMs is still reported.
+    expect(details.persistedAt).toBeUndefined();
+    expect("persistedAt" in details).toBe(false);
+    expect(details.ttlMs).toBe(24 * 60 * 60 * 1000);
+
+    // The exposure is stamped persistence, without a persisted-at property.
+    const fired = exposures(storage);
+    expect(fired).toHaveLength(1);
+    expect(fired[0].properties.$feature_flag_source).toBe("persistence");
+    expect("$feature_flag_persisted_at" in fired[0].properties).toBe(false);
+    expect(fired[0].properties.$feature_flag_ttl_ms).toBe(24 * 60 * 60 * 1000);
+
+    // The legacy cache is served, not removed - a successful reload is what
+    // rewrites it in the stamped format.
+    expect(storage.get("chl_flags")).toBeTruthy();
+
+    // networkFirst serves it too: no stored_at means no provable age.
+    const { client: nf } = makeFlagClient({
+      storage,
+      respond: () => undefined,
+      options: { flagPersistence: "networkFirst" },
+    });
+    expect(nf.getFeatureFlagDetails("banner").source).toBe("persistence");
+    expect(nf.getFeatureFlag("banner")).toBe("blue");
+  });
+
+  it("rewrites a legacy cache in the stamped format after a successful reload", async () => {
+    const storage = makeStorage();
+    storage.set("cohorly_distinct_id", "user-1");
+    storage.set("cohorly_anonymous", "0");
+    writeCache(storage, "user-1", undefined);
+
+    const { client } = makeFlagClient({ storage });
+    await client.reloadFeatureFlags();
+    const cached = JSON.parse(storage.get("chl_flags")!);
+    expect(typeof cached.stored_at).toBe("number");
+    expect(client.getFeatureFlagDetails("banner").source).toBe("network");
+  });
+
+  it("networkOnly never reads nor writes the persisted cache", async () => {
+    const storage = makeStorage();
+    storage.set("cohorly_distinct_id", "user-1");
+    storage.set("cohorly_anonymous", "0");
+    writeCache(storage, "user-1", Date.now());
+
+    const { client } = makeFlagClient({
+      storage,
+      options: { flagPersistence: "networkOnly" },
+    });
+    // Existing cache is ignored, not served.
+    expect(client.getFeatureFlag("banner")).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+
+    await client.reloadFeatureFlags();
+    expect(client.getFeatureFlag("banner")).toBe("blue");
+    expect(client.getFeatureFlagDetails("banner").source).toBe("network");
+    // The persisted entry is the stale pre-existing one, never rewritten.
+    const cached = JSON.parse(storage.get("chl_flags")!);
+    expect(cached.distinct_id).toBe("user-1");
+  });
+
+  it("networkFirst serves the persisted cache until a network success", async () => {
+    const storage = makeStorage();
+    const { client: c1 } = makeFlagClient({ storage });
+    await c1.reloadFeatureFlags();
+
+    let fail = true;
+    const { client: c2 } = makeFlagClient({
+      storage,
+      respond: () => (fail ? undefined : flagsResponse),
+      options: { flagPersistence: "networkFirst" },
+    });
+    // Valid cache served before any network success.
+    expect(c2.getFeatureFlagDetails("banner").source).toBe("persistence");
+    await c2.reloadFeatureFlags(); // fails
+    expect(c2.getFeatureFlagDetails("banner").source).toBe("persistence");
+
+    fail = false;
+    await c2.reloadFeatureFlags();
+    expect(c2.getFeatureFlagDetails("banner").source).toBe("network");
+  });
+
+  it("identify() removes the outgoing identity's persisted cache before reloading", async () => {
+    const storage = makeStorage();
+    let fail = false;
+    const { client } = makeFlagClient({
+      storage,
+      respond: () => (fail ? undefined : flagsResponse),
+    });
+    await client.reloadFeatureFlags(); // persists the anon identity's cache
+    expect(storage.get("chl_flags")).toBeTruthy();
+
+    // The post-identify reload fails, so the only way to serve anything would
+    // be the stale persisted entry - which must be gone.
+    fail = true;
+    await client.identify("user-42");
+    expect(storage.get("chl_flags")).toBeNull();
+    expect(client.getFeatureFlag("banner")).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+  });
+
+  it("identify()/reset() remove the persisted entry even under networkOnly", async () => {
+    const storage = makeStorage();
+    const { client } = makeFlagClient({
+      storage,
+      options: { flagPersistence: "networkOnly" },
+    });
+    // A cache left by a prior persistent-policy session for the outgoing id.
+    writeCache(storage, client.getDistinctId(), Date.now());
+    await client.identify("user-9");
+    expect(storage.get("chl_flags")).toBeNull();
+
+    writeCache(storage, "user-9", Date.now());
+    client.reset();
+    expect(storage.get("chl_flags")).toBeNull();
+  });
+
+  it("identify() clears in-memory flags even under networkOnly", async () => {
+    let fail = false;
+    const { client } = makeFlagClient({
+      respond: () => (fail ? undefined : flagsResponse),
+      options: { flagPersistence: "networkOnly" },
+    });
+    await client.reloadFeatureFlags();
+    expect(client.getFeatureFlag("banner")).toBe("blue");
+
+    // The post-identify reload fails, so only a cleared memory state (never
+    // the persisted cache, which networkOnly ignores) explains a false read.
+    fail = true;
+    await client.identify("user-9");
+    expect(client.getFeatureFlag("banner")).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+  });
+
+  it("areFeatureFlagsLoaded() tracks the served set across identity changes", async () => {
+    let fail = false;
+    const { client } = makeFlagClient({
+      respond: () => (fail ? undefined : flagsResponse),
+    });
+    expect(client.areFeatureFlagsLoaded()).toBe(false);
+
+    await client.reloadFeatureFlags();
+    expect(client.areFeatureFlagsLoaded()).toBe(true);
+
+    // Cleared synchronously by the identity switch; back to true once the
+    // new identity's evaluation lands (identify() does not await it).
+    const switch1 = client.identify("user-9");
+    expect(client.areFeatureFlagsLoaded()).toBe(false);
+    await switch1;
+    await vi.waitFor(() => expect(client.areFeatureFlagsLoaded()).toBe(true));
+
+    fail = true;
+    await client.identify("user-10");
+    // The reload failed, so the cleared set stays unloaded - subscribers
+    // must see "loading", not getter fallbacks.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(client.areFeatureFlagsLoaded()).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+  });
+
+  it("marks exposures served from persistence, without duplicating on recovery", async () => {
+    const storage = makeStorage();
+    const { client: c1 } = makeFlagClient({ storage });
+    await c1.reloadFeatureFlags();
+
+    // Restart offline: serve + expose from persistence.
+    let fail = true;
+    const { client: c2 } = makeFlagClient({
+      storage,
+      respond: () => (fail ? undefined : flagsResponse),
+    });
+    c2.getFeatureFlag("banner");
+    let fired = exposures(storage);
+    expect(fired).toHaveLength(1);
+    expect(fired[0].properties.$feature_flag_source).toBe("persistence");
+    expect(fired[0].properties.$feature_flag_persisted_at).toEqual(
+      expect.any(Number),
+    );
+    expect(fired[0].properties.$feature_flag_ttl_ms).toBe(24 * 60 * 60 * 1000);
+
+    // Network recovers: same (key, value) does not re-emit; a different value does.
+    fail = false;
+    await c2.reloadFeatureFlags();
+    c2.getFeatureFlag("banner");
+    c2.getFeatureFlag("checkout");
+    fired = exposures(storage);
+    expect(fired).toHaveLength(2);
+    expect(fired[1].properties.$feature_flag).toBe("checkout");
+    expect(fired[1].properties.$feature_flag_source).toBe("network");
+    expect("$feature_flag_persisted_at" in fired[1].properties).toBe(false);
+  });
 });
 
 describe("feature flag exposure events", () => {

@@ -1,5 +1,11 @@
 # @cohorly/node
 
+## 0.4.0
+
+### Minor Changes
+
+- 28457ed: Drop Node 18 and Node 20. Both lines are EOL and did not receive the October 2026 security releases, so `engines.node` is now `>=22`.
+
 ## 0.3.0
 
 ### Minor Changes

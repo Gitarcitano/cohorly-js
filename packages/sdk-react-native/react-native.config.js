@@ -1,5 +1,3 @@
-"use strict";
-
 // Self-describing config (see https://github.com/react-native-community/cli/blob/main/docs/dependencies.md):
 // libraries export a singular `dependency` key, not `dependencies` keyed by
 // their own name - that shape is for an *app's* react-native.config.js

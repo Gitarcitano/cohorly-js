@@ -317,3 +317,474 @@ describe("react-native feature flags", () => {
     expect(requestsTo(requests, "/flags/evaluate")).toHaveLength(0);
   });
 });
+
+describe("react-native flag persistence", () => {
+  const TTL_MS = 24 * 60 * 60 * 1000;
+
+  function writeCache(
+    storage: FakeStorage,
+    distinctId: string,
+    storedAt: number | undefined,
+  ) {
+    return storage.setItem(
+      "cohorly:flags",
+      JSON.stringify({
+        distinct_id: distinctId,
+        flags: FLAGS,
+        ...(storedAt !== undefined ? { stored_at: storedAt } : {}),
+      }),
+    );
+  }
+
+  function exposures(requests: FakeRequest[], storage: FakeStorage) {
+    const queued = JSON.parse(storage.store.get("cohorly:queue") ?? "[]") as {
+      event: string;
+      properties: Record<string, unknown>;
+    }[];
+    const sent = requestsTo(requests, "/track").flatMap(
+      (r) => (r.body as { event: string; properties: Record<string, unknown> }[]) ?? [],
+    );
+    return [...sent, ...queued].filter((e) => e.event === "$feature_flag_called");
+  }
+
+  it("serves a valid persisted cache offline and reports source persistence", async () => {
+    const storage = new FakeStorage();
+    const first = makeClient(createFlagsFetch().fetchImpl, storage);
+    await first.ready;
+    await vi.waitFor(() => expect(first.isFeatureEnabled("checkout")).toBe(true));
+    first.stop();
+
+    // Relaunch with the network down: the persisted cache answers.
+    const second = makeClient(
+      (async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch,
+      storage,
+    );
+    await second.ready;
+    second.stop();
+
+    const details = second.getFeatureFlagDetails("banner");
+    expect(details).toMatchObject({
+      key: "banner",
+      value: "blue",
+      enabled: true,
+      source: "persistence",
+      ttlMs: TTL_MS,
+    });
+    expect(typeof details.persistedAt).toBe("number");
+  });
+
+  it("flips source to network and re-persists after the first successful reload", async () => {
+    const storage = new FakeStorage();
+    const first = makeClient(createFlagsFetch().fetchImpl, storage);
+    await first.ready;
+    await vi.waitFor(() => expect(first.isFeatureEnabled("checkout")).toBe(true));
+    first.stop();
+
+    const second = makeClient(createFlagsFetch().fetchImpl, storage, {
+      loadFeatureFlags: false,
+    });
+    await second.ready;
+    expect(second.getFeatureFlagDetails("banner").source).toBe("persistence");
+
+    await second.reloadFeatureFlags();
+    second.stop();
+    const details = second.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("network");
+    expect(details.persistedAt).toBeUndefined();
+    expect(details.ttlMs).toBeUndefined();
+    expect(JSON.parse(storage.store.get("cohorly:flags") as string).stored_at).toEqual(
+      expect.any(Number),
+    );
+  });
+
+  it("serves a cache past the TTL but within 7 days under persistenceUntilNetworkSuccess, not under networkFirst", async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const storedAt = Date.now() - 2 * DAY; // past the 24 h TTL, inside 7 d
+
+    // Default policy trades freshness for offline availability: the stale
+    // cache still serves, and its real age stays observable via persistedAt.
+    const storage = new FakeStorage();
+    await storage.setItem("cohorly:distinct_id", "user-1");
+    await storage.setItem("cohorly:anonymous", "0");
+    await writeCache(storage, "user-1", storedAt);
+    const puns = makeClient(
+      (async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch,
+      storage,
+      { loadFeatureFlags: false },
+    );
+    await puns.ready;
+    puns.stop();
+    const details = puns.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("persistence");
+    expect(details.value).toBe("blue");
+    expect(details.persistedAt).toBe(storedAt);
+    expect(details.ttlMs).toBe(DAY);
+
+    // networkFirst is strict: the same expired cache is discarded.
+    const storage2 = new FakeStorage();
+    await storage2.setItem("cohorly:distinct_id", "user-1");
+    await storage2.setItem("cohorly:anonymous", "0");
+    await writeCache(storage2, "user-1", storedAt);
+    const nf = makeClient(
+      (async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch,
+      storage2,
+      { loadFeatureFlags: false, flagPersistence: "networkFirst" },
+    );
+    await nf.ready;
+    nf.stop();
+    expect(nf.getFeatureFlag("banner")).toBe(false);
+    expect(nf.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage2.store.has("cohorly:flags")).toBe(false);
+  });
+
+  it("discards a cache stale beyond the 7-day window under any persistent policy", async () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const storedAt = Date.now() - 8 * DAY;
+    const offline = (async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+
+    const storage = new FakeStorage();
+    await storage.setItem("cohorly:distinct_id", "user-1");
+    await storage.setItem("cohorly:anonymous", "0");
+    await writeCache(storage, "user-1", storedAt);
+    const puns = makeClient(offline, storage, { loadFeatureFlags: false });
+    await puns.ready;
+    puns.stop();
+    expect(puns.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage.store.has("cohorly:flags")).toBe(false);
+
+    const storage2 = new FakeStorage();
+    await storage2.setItem("cohorly:distinct_id", "user-1");
+    await storage2.setItem("cohorly:anonymous", "0");
+    await writeCache(storage2, "user-1", storedAt);
+    const nf = makeClient(offline, storage2, {
+      loadFeatureFlags: false,
+      flagPersistence: "networkFirst",
+    });
+    await nf.ready;
+    nf.stop();
+    expect(nf.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage2.store.has("cohorly:flags")).toBe(false);
+  });
+
+  it("serves a legacy cache without stored_at as persistence, under any persistent policy", async () => {
+    const { fetchImpl, requests } = createFlagsFetch();
+    const storage = new FakeStorage();
+    await storage.setItem("cohorly:distinct_id", "user-1");
+    await storage.setItem("cohorly:anonymous", "0");
+    await writeCache(storage, "user-1", undefined); // pre-TTL format
+
+    const client = makeClient(fetchImpl, storage, { loadFeatureFlags: false });
+    await client.ready;
+    expect(client.getFeatureFlag("banner")).toBe("blue");
+    const details = client.getFeatureFlagDetails("banner");
+    expect(details.source).toBe("persistence");
+    // Unprovable age: persistedAt stays absent; ttlMs is still reported.
+    expect(details.persistedAt).toBeUndefined();
+    expect("persistedAt" in details).toBe(false);
+    expect(details.ttlMs).toBe(TTL_MS);
+
+    // The exposure is stamped persistence, without a persisted-at property.
+    const fired = exposures(requests, storage);
+    expect(fired).toHaveLength(1);
+    expect(fired[0].properties.$feature_flag_source).toBe("persistence");
+    expect("$feature_flag_persisted_at" in fired[0].properties).toBe(false);
+    expect(fired[0].properties.$feature_flag_ttl_ms).toBe(TTL_MS);
+
+    // The legacy cache is served, not removed - a successful reload is what
+    // rewrites it in the stamped format.
+    expect(storage.store.has("cohorly:flags")).toBe(true);
+    client.stop();
+
+    // networkFirst serves it too: no stored_at means no provable age.
+    const nf = makeClient(
+      (async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch,
+      storage,
+      { loadFeatureFlags: false, flagPersistence: "networkFirst" },
+    );
+    await nf.ready;
+    nf.stop();
+    expect(nf.getFeatureFlagDetails("banner").source).toBe("persistence");
+    expect(nf.getFeatureFlag("banner")).toBe("blue");
+  });
+
+  it("rewrites a legacy cache in the stamped format after a successful reload", async () => {
+    const storage = new FakeStorage();
+    await storage.setItem("cohorly:distinct_id", "user-1");
+    await storage.setItem("cohorly:anonymous", "0");
+    await writeCache(storage, "user-1", undefined);
+
+    const client = makeClient(createFlagsFetch().fetchImpl, storage, {
+      loadFeatureFlags: false,
+    });
+    await client.ready;
+    await client.reloadFeatureFlags();
+    client.stop();
+    const cached = JSON.parse(storage.store.get("cohorly:flags") as string);
+    expect(typeof cached.stored_at).toBe("number");
+    expect(client.getFeatureFlagDetails("banner").source).toBe("network");
+  });
+
+  it("networkOnly never reads nor writes the persisted cache", async () => {
+    const storage = new FakeStorage();
+    await storage.setItem("cohorly:distinct_id", "user-1");
+    await storage.setItem("cohorly:anonymous", "0");
+    await writeCache(storage, "user-1", Date.now());
+
+    const client = makeClient(createFlagsFetch().fetchImpl, storage, {
+      loadFeatureFlags: false,
+      flagPersistence: "networkOnly",
+    });
+    await client.ready;
+    // The pre-existing cache is ignored, not served.
+    expect(client.getFeatureFlag("banner")).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+
+    await client.reloadFeatureFlags();
+    client.stop();
+    expect(client.getFeatureFlag("banner")).toBe("blue");
+    expect(client.getFeatureFlagDetails("banner").source).toBe("network");
+    // The persisted entry is the stale pre-existing one, never rewritten.
+    expect(JSON.parse(storage.store.get("cohorly:flags") as string).flags).toEqual(FLAGS);
+  });
+
+  it("networkFirst serves the persisted cache until a network success", async () => {
+    const storage = new FakeStorage();
+    const first = makeClient(createFlagsFetch().fetchImpl, storage);
+    await first.ready;
+    await vi.waitFor(() => expect(first.isFeatureEnabled("checkout")).toBe(true));
+    first.stop();
+
+    let offline = true;
+    const fetchImpl = (async (url: string, _init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      if (path === "/flags/evaluate") {
+        if (offline) throw new Error("offline");
+        return new Response(JSON.stringify({ flags: FLAGS }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const second = makeClient(fetchImpl, storage, {
+      loadFeatureFlags: false,
+      flagPersistence: "networkFirst",
+    });
+    await second.ready;
+    expect(second.getFeatureFlagDetails("banner").source).toBe("persistence");
+    await second.reloadFeatureFlags(); // fails
+    expect(second.getFeatureFlagDetails("banner").source).toBe("persistence");
+
+    offline = false;
+    await second.reloadFeatureFlags();
+    second.stop();
+    expect(second.getFeatureFlagDetails("banner").source).toBe("network");
+  });
+
+  it("identify() removes the outgoing identity's persisted cache before reloading", async () => {
+    const storage = new FakeStorage();
+    const requests: FakeRequest[] = [];
+    let offline = false;
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      requests.push({ path, body });
+      if (path === "/flags/evaluate") {
+        if (offline) throw new Error("offline");
+        return new Response(JSON.stringify({ flags: FLAGS }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const client = makeClient(fetchImpl, storage, { loadFeatureFlags: false });
+    await client.ready;
+    await client.reloadFeatureFlags(); // persists the anon identity's cache
+    await vi.waitFor(() => expect(storage.store.has("cohorly:flags")).toBe(true));
+
+    // The post-identify reload fails, so the only way to serve anything would
+    // be the stale persisted entry - which must be gone.
+    offline = true;
+    client.identify("user-42");
+    await vi.waitFor(() =>
+      expect(requestsTo(requests, "/flags/evaluate")).toHaveLength(2),
+    );
+    client.stop();
+    expect(client.getFeatureFlag("banner")).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+    expect(storage.store.has("cohorly:flags")).toBe(false);
+  });
+
+  it("identify()/reset() remove the persisted entry even under networkOnly", async () => {
+    const storage = new FakeStorage();
+    const client = makeClient(createFlagsFetch().fetchImpl, storage, {
+      loadFeatureFlags: false,
+      flagPersistence: "networkOnly",
+    });
+    await client.ready;
+    // A cache left by a prior persistent-policy session for the outgoing id.
+    await writeCache(storage, client.getDistinctId(), Date.now());
+    client.identify("user-9");
+    await vi.waitFor(() => expect(storage.store.has("cohorly:flags")).toBe(false));
+
+    await writeCache(storage, "user-9", Date.now());
+    client.reset();
+    await vi.waitFor(() => expect(storage.store.has("cohorly:flags")).toBe(false));
+    client.stop();
+  });
+
+  it("identify() clears in-memory flags even under networkOnly", async () => {
+    const requests: FakeRequest[] = [];
+    let offline = false;
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      requests.push({ path, body });
+      if (path === "/flags/evaluate") {
+        if (offline) throw new Error("offline");
+        return new Response(JSON.stringify({ flags: FLAGS }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const client = makeClient(fetchImpl, new FakeStorage(), {
+      loadFeatureFlags: false,
+      flagPersistence: "networkOnly",
+    });
+    await client.ready;
+    await client.reloadFeatureFlags();
+    expect(client.getFeatureFlag("banner")).toBe("blue");
+
+    // The post-identify reload fails, so only a cleared memory state (never
+    // the persisted cache, which networkOnly ignores) explains a false read.
+    offline = true;
+    client.identify("user-9");
+    client.stop();
+    expect(client.getFeatureFlag("banner")).toBe(false);
+    expect(client.getFeatureFlagDetails("banner").source).toBe("fallback");
+  });
+
+  it("fallback getters resolve unknown keys without emitting an exposure", async () => {
+    const { fetchImpl, requests } = createFlagsFetch();
+    const storage = new FakeStorage();
+    const client = makeClient(fetchImpl, storage, { loadFeatureFlags: false });
+    await client.ready;
+
+    expect(client.getFeatureFlag("nope", "control")).toBe("control");
+    expect(client.isFeatureEnabled("nope", true)).toBe(true);
+    expect(client.getFeatureFlagDetails("nope", "control")).toEqual({
+      key: "nope",
+      value: "control",
+      enabled: true,
+      payload: null,
+      source: "fallback",
+    });
+
+    await client.reloadFeatureFlags();
+    client.getFeatureFlag("banner", "red");
+    client.stop();
+    const fired = exposures(requests, storage);
+    // Only the known-flag read exposed; every fallback read emitted nothing.
+    expect(fired).toHaveLength(1);
+    expect(fired[0].properties.$feature_flag).toBe("banner");
+  });
+
+  it("marks exposures served from persistence, without duplicating on recovery", async () => {
+    const storage = new FakeStorage();
+    const first = makeClient(createFlagsFetch().fetchImpl, storage);
+    await first.ready;
+    await vi.waitFor(() => expect(first.isFeatureEnabled("checkout")).toBe(true));
+    // Drain the queue so first's own exposure is not still sitting in the
+    // shared persisted queue when the relaunched client hydrates it.
+    await first.flush();
+    first.stop();
+
+    // Relaunch offline: serve + expose from persistence.
+    const requests: FakeRequest[] = [];
+    let offline = true;
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      requests.push({ path, body });
+      if (path === "/flags/evaluate") {
+        if (offline) throw new Error("offline");
+        return new Response(JSON.stringify({ flags: FLAGS }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const second = makeClient(fetchImpl, storage, { loadFeatureFlags: false });
+    await second.ready;
+    second.getFeatureFlag("banner");
+    let fired = exposures(requests, storage);
+    expect(fired).toHaveLength(1);
+    expect(fired[0].properties.$feature_flag_source).toBe("persistence");
+    expect(fired[0].properties.$feature_flag_persisted_at).toEqual(expect.any(Number));
+    expect(fired[0].properties.$feature_flag_ttl_ms).toBe(TTL_MS);
+
+    // Network recovers: same (key, value) does not re-emit; a different
+    // key does, marked as network-sourced.
+    offline = false;
+    await second.reloadFeatureFlags();
+    second.getFeatureFlag("banner");
+    second.getFeatureFlag("checkout");
+    second.stop();
+    fired = exposures(requests, storage);
+    expect(fired).toHaveLength(2);
+    expect(fired[1].properties.$feature_flag).toBe("checkout");
+    expect(fired[1].properties.$feature_flag_source).toBe("network");
+    expect("$feature_flag_persisted_at" in fired[1].properties).toBe(false);
+  });
+
+  it("drops a network result evaluated for the transient id and adopts the real identity's cache", async () => {
+    // Hydration reads AsyncStorage asynchronously; a caller may fire
+    // reloadFeatureFlags() before `ready` resolves. That request is
+    // evaluated for the transient constructor uuid, not the persisted
+    // identity - its result must be discarded when the real distinct id
+    // resolves, and the persisted cache belonging to that identity adopted
+    // instead.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    class GatedStorage extends FakeStorage {
+      override async getItem(key: string): Promise<string | null> {
+        const value = this.store.get(key) ?? null;
+        await gate;
+        return value;
+      }
+    }
+    const storage = new GatedStorage();
+    await storage.setItem("cohorly:distinct_id", "user-1");
+    await storage.setItem("cohorly:anonymous", "0");
+    await storage.setItem(
+      "cohorly:flags",
+      JSON.stringify({
+        distinct_id: "user-1",
+        flags: { banner: { enabled: true, variant: "red", payload: null } },
+        stored_at: Date.now(),
+      }),
+    );
+
+    const { fetchImpl, requests } = createFlagsFetch();
+    const client = makeClient(fetchImpl, storage, {
+      loadFeatureFlags: false,
+    });
+    await client.reloadFeatureFlags(); // lands while hydrate() is gated
+    release();
+    await client.ready;
+    client.stop();
+    // The pre-ready request carried the transient constructor id, so its
+    // result never belongs to user-1.
+    expect(requestsTo(requests, "/flags/evaluate")[0].body.distinct_id).not.toBe(
+      "user-1",
+    );
+    expect(client.getFeatureFlag("banner")).toBe("red");
+    expect(client.getFeatureFlagDetails("banner").source).toBe("persistence");
+  });
+});

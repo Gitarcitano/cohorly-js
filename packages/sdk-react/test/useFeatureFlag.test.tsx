@@ -160,4 +160,46 @@ describe("useFeatureFlag / useFeatureFlagPayload", () => {
     expect(fired[0].properties.$feature_flag).toBe("banner");
     expect(fired[0].properties.$feature_flag_response).toBe("blue");
   });
+
+  it("returns to undefined during an identity switch instead of publishing fallbacks", async () => {
+    // The first evaluation resolves; the post-identify reload stays pending
+    // forever, so the cleared set must read as `undefined` (loading), not
+    // the getter's fallback false.
+    let resolveFlags!: () => void;
+    const gate = new Promise<void>((r) => (resolveFlags = r));
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) await gate;
+        else await new Promise(() => {});
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => flagsResponse,
+        };
+      }),
+    );
+    render("banner");
+    await act(async () => {
+      resolveFlags();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(readProbe(container).value).toBe("blue");
+
+    const { cohorly } = await import("@cohorly/web");
+    await act(async () => {
+      // identify() awaits its best-effort /alias, which the stub leaves
+      // pending - fire it and assert the synchronous clear instead.
+      void cohorly.identify("user-2");
+      await Promise.resolve();
+    });
+    expect(readProbe(container)).toEqual({
+      value: "undefined",
+      payload: "undefined",
+    });
+  });
 });

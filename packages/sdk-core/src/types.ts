@@ -47,6 +47,77 @@ export interface FlagResult {
  */
 export type FlagsFetcher = (url: string, body: unknown) => Promise<unknown>;
 
+/**
+ * How flag assignments are sourced and persisted (Mixpanel's
+ * `variantLookupPolicy` equivalent). Shared contract across every client SDK.
+ *
+ * - `"networkOnly"`: never reads or writes the persisted cache. Flags come
+ *   only from network responses in this session; a failed evaluation leaves
+ *   getters at their fallback.
+ * - `"networkFirst"`: prefers the network; until the first successful
+ *   evaluation (or whenever it fails), a still-valid persisted cache is
+ *   served - strictly within `flagCacheTtlMs` of `stored_at`. The cache
+ *   keeps being written on every success.
+ * - `"persistenceUntilNetworkSuccess"`: serves a valid persisted cache
+ *   immediately (no startup flicker); the first successful network response
+ *   takes over and re-persists. If the network keeps failing, the cache
+ *   keeps serving. This policy trades freshness for offline availability:
+ *   it serves a cache until the wider of `flagCacheTtlMs` and 7 days of
+ *   staleness, so an expired cache still serves up to a week stale.
+ *
+ * A legacy cache written by a pre-TTL SDK (no `stored_at`) has no provable
+ * age and is served indefinitely under either persistent policy, matching
+ * the pre-feature behavior it was written under.
+ */
+export type FlagPersistenceMode =
+  | "networkOnly"
+  | "networkFirst"
+  | "persistenceUntilNetworkSuccess";
+
+/**
+ * Where a served flag value came from: `"network"` is a successful
+ * evaluation this session, `"persistence"` is the identity-scoped persisted
+ * cache (within the active policy's staleness window), and `"fallback"`
+ * means the flag is unknown so the caller-supplied fallback was returned.
+ */
+export type FlagSource = "network" | "persistence" | "fallback";
+
+/**
+ * The full result of reading one flag, as returned by
+ * `getFeatureFlagDetails()`. Exists so callers can observe not just the
+ * value but its provenance: a persistence-sourced value is observably
+ * different from a fresh network evaluation during an incident or rollout.
+ */
+export interface FlagDetails {
+  key: string;
+  /**
+   * Variant key when the flag has one, else its enabled boolean. When the
+   * flag is unknown this is the fallback passed to the getter (`false` by
+   * default).
+   */
+  value: boolean | string;
+  /**
+   * The flag's enabled boolean. When the flag is unknown this is
+   * `Boolean(fallback)` - a truthy fallback is treated as "the feature is
+   * on", matching what `isFeatureEnabled(key, true)` would return.
+   */
+  enabled: boolean;
+  /** Variant payload, or `null` when the flag has none / is unknown. */
+  payload: unknown | null;
+  source: FlagSource;
+  /**
+   * Epoch ms when the persisted cache was written. Present only when
+   * `source` is `"persistence"` and the served cache was written by a
+   * TTL-aware SDK; a legacy cache without `stored_at` leaves it absent.
+   */
+  persistedAt?: number;
+  /**
+   * The TTL (ms) the served cache is valid for. Present only when `source`
+   * is `"persistence"`.
+   */
+  ttlMs?: number;
+}
+
 /** Storage abstraction injected by platform-specific SDKs (web/react-native/node). Synchronous. */
 export interface CohorlyStorage {
   get(key: string): string | null;
@@ -101,6 +172,24 @@ export interface CohorlyClientOptions {
    * identity session (cleared on identify()/reset()). Defaults to true.
    */
   sendExposureEvents?: boolean;
+  /**
+   * Flag persistence policy (see {@link FlagPersistenceMode}). Defaults to
+   * `"persistenceUntilNetworkSuccess"`, which preserves the historical
+   * behavior: a valid identity-scoped cache is served immediately until the
+   * first successful network evaluation replaces it. The cache is keyed by
+   * `distinct_id` and re-scoped on every identify()/reset().
+   */
+  flagPersistence?: FlagPersistenceMode;
+  /**
+   * How long a persisted flag cache stays valid, in ms. `networkFirst`
+   * serves the cache only within this TTL; `persistenceUntilNetworkSuccess`
+   * still serves an expired cache up to 7 days stale (the TTL bounds
+   * freshness, not availability, under that policy). A legacy cache
+   * without `stored_at` is never expired. Defaults to 86400000 (24 hours),
+   * matching the Mixpanel flag-persistence reference TTL. Non-positive or
+   * non-finite values fall back to the default.
+   */
+  flagCacheTtlMs?: number;
 }
 
 export interface PeopleProperties {

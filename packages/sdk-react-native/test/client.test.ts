@@ -17,7 +17,7 @@ describe("track payload shape", () => {
       flushAt: 1,
     });
     await client.ready;
-    client.register({ app_version: "1.0.0" });
+    client.register({ source: "signup" });
     client.track("Button Clicked", { button: "signup" });
     await client.flush();
     client.stop();
@@ -27,7 +27,7 @@ describe("track payload shape", () => {
     const [event] = requests[0].body as any[];
     expect(event.event).toBe("Button Clicked");
     expect(event.properties.button).toBe("signup");
-    expect(event.properties.app_version).toBe("1.0.0");
+    expect(event.properties.source).toBe("signup");
     expect(event.properties.$lib).toBe("react-native");
     expect(typeof event.properties.distinct_id).toBe("string");
     expect(typeof event.properties.time).toBe("number");
@@ -189,6 +189,84 @@ describe("identify() aliasing", () => {
       distinct_id: "user-42",
       token: "proj_abc123",
     });
+  });
+
+  it("aliases the persisted anonymous id when identify() runs before ready", async () => {
+    // A pre-ready identify() captures the transient constructor uuid as the
+    // alias source; hydrate() must swap in the persisted anonymous id so the
+    // user's historical events get linked, not the throwaway uuid.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    class GatedStorage extends FakeStorage {
+      override async getItem(key: string): Promise<string | null> {
+        const value = this.store.get(key) ?? null;
+        await gate;
+        return value;
+      }
+    }
+    const storage = new GatedStorage();
+    await storage.setItem("cohorly:distinct_id", "anon-old");
+    await storage.setItem("cohorly:anonymous", "1");
+
+    const { fetchImpl, requests } = createFakeFetch();
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      token: "proj_abc123",
+      storage,
+      fetch: fetchImpl,
+    });
+    client.identify("user-42"); // while hydrate() is gated
+    release();
+    await client.ready;
+    await vi.waitFor(() => expect(requestsTo(requests, "/alias")).toHaveLength(1));
+    client.stop();
+
+    expect(requestsTo(requests, "/alias")[0].body).toEqual({
+      alias: "anon-old",
+      distinct_id: "user-42",
+      token: "proj_abc123",
+    });
+    expect(client.getDistinctId()).toBe("user-42");
+  });
+
+  it("aliases the post-reset anonymous id when reset()+identify() run before ready", async () => {
+    // A pre-ready reset() followed by identify() still owes the new identity
+    // an alias - from the fresh anonymous id reset() minted, not the stale
+    // stored predecessor it just discarded.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    class GatedStorage extends FakeStorage {
+      override async getItem(key: string): Promise<string | null> {
+        const value = this.store.get(key) ?? null;
+        await gate;
+        return value;
+      }
+    }
+    const storage = new GatedStorage();
+    await storage.setItem("cohorly:distinct_id", "anon-old");
+    await storage.setItem("cohorly:anonymous", "1");
+
+    const { fetchImpl, requests } = createFakeFetch();
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      token: "proj_abc123",
+      storage,
+      fetch: fetchImpl,
+    });
+    client.reset(); // while hydrate() is gated
+    const freshAnonId = client.getDistinctId();
+    client.identify("user-42");
+    release();
+    await client.ready;
+    await vi.waitFor(() => expect(requestsTo(requests, "/alias")).toHaveLength(1));
+    client.stop();
+
+    expect(requestsTo(requests, "/alias")[0].body).toEqual({
+      alias: freshAnonId,
+      distinct_id: "user-42",
+      token: "proj_abc123",
+    });
+    expect(client.getDistinctId()).toBe("user-42");
   });
 
   it("does not alias when the previous id was already identified", async () => {
