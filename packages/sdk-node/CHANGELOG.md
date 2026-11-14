@@ -1,5 +1,21 @@
 # @cohorly/node
 
+## 0.5.0
+
+### Minor Changes
+
+- 569f902: Privacy controls for error tracking (VEL-1774). `@cohorly/core`, `@cohorly/web` and `@cohorly/react-native`: `optOutTracking()`, `optInTracking()` and `hasOptedOutTracking()` (persisted; while opted out nothing is queued or sent, `$exception` included, no feature flag request is made, breadcrumbs are cleared, and queued data is dropped). `captureExceptions: false` turns exception capture off entirely, manual calls included; on web and React Native, omitting it keeps the previous behavior. If you passed `captureExceptions: false` explicitly to mean "no automatic capture", remove it: it now also blocks manual `captureException()`. `@cohorly/core` and `@cohorly/react-native` also expose `isExceptionCaptureEnabled()` (on React Native it is `false` until the persisted state is read, with `onExceptionCaptureChange()` to follow it; the module functions do not throw before `init()`). `@cohorly/node`: `captureExceptions: false` makes `captureException()` a no-op and skips the uncaught handlers. `@cohorly/react` inherits the new `useCohorly()` methods.
+- 34aeb04: Error tracking (ADR-0019). `@cohorly/node`: `captureException()`, `captureExceptionList()`, `addBreadcrumb()`, a separate in-memory exception queue (fatal first, never evicted by ordinary events), frames relative to `projectRoot`, `captureUncaught` (uncaught exceptions and unhandled rejections, flushed with a timeout, same exit behaviour as without the SDK), the serverless flush API `withCohorly()`, `flushWithTimeout()` and `flushExceptions()` with per-invocation breadcrumbs, and the `release`, `dist`, `appVersion`, `serverName`, `projectRoot`, `flushTimeoutMs`, `beforeSendException` and `maxExceptionQueueSize` options; `release` is stamped as both `$exception_release` and `$app_version_string`. `flushWithTimeout()` aborts the request in flight at its deadline through a new optional 4th `signal` argument of `CohorlyTransport`. Now depends on `@cohorly/core`. `@cohorly/nest`: `CohorlyExceptionFilter` for HTTP (5xx and errors that are not an `HttpException`, never 4xx), registered globally with `captureExceptions: true`, and `captureException`/`addBreadcrumb`/`withCohorly`/`flushWithTimeout` on `CohorlyService`; `@nestjs/core` is now a peer dependency.
+
+### Patch Changes
+
+- Updated dependencies [2b570a9]
+- Updated dependencies [4860878]
+- Updated dependencies [569f902]
+- Updated dependencies [757925b]
+- Updated dependencies [e56c8b4]
+  - @cohorly/core@0.4.0
+
 ## 0.4.0
 
 ### Minor Changes

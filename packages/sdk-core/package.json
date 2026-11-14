@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Transport-agnostic core client for Cohorly, hosted product analytics (Mixpanel-style). Queueing, batching, flush, identity, and super properties, with storage and transport injected by platform SDKs.",
   "type": "module",
   "main": "dist/index.js",
@@ -9,12 +9,17 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./error-boundary": {
+      "types": "./dist/error-boundary.d.ts",
+      "default": "./dist/error-boundary.js"
     }
   },
   "sideEffects": false,
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -39,9 +44,18 @@
   "publishConfig": {
     "access": "public"
   },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^22.10.5",
+    "@types/react": "^19.2.0",
     "typescript": "^5.7.2",
-    "vitest": "3.2.6"
+    "vitest": "4.1.11"
   }
 }

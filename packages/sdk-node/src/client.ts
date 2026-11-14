@@ -1,4 +1,20 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import path from "node:path";
+import {
+  type Breadcrumb,
+  type BreadcrumbInput,
+  buildExceptionList,
+  type ExceptionListEntry,
+} from "@cohorly/core";
 import { FlagDefinitionsPoller } from "./definitions.js";
+import {
+  EXCEPTION_EVENT,
+  normalizeLevel,
+  pushBreadcrumb,
+  relativizeFrames,
+  snapshotBreadcrumb,
+  withoutReservedKeys,
+} from "./exceptions.js";
 import { createFlags } from "./flags.js";
 import { evaluateFlagLocally } from "./local-eval.js";
 import { createPeople } from "./people.js";
@@ -11,6 +27,7 @@ import {
 import type {
   BatchEventInput,
   Callback,
+  CaptureExceptionOptions,
   CohorlyConfig,
   CohorlyFetcher,
   CohorlyFlags,
@@ -18,9 +35,17 @@ import type {
   CohorlyTransport,
   EngagePayload,
   FlagResult,
+  FlushExceptionsOptions,
   Properties,
   TrackEvent,
+  WithCohorlyOptions,
 } from "./types.js";
+import {
+  registerUncaught,
+  type UncaughtClient,
+  type UncaughtKind,
+  unregisterUncaught,
+} from "./uncaught.js";
 import { uuid } from "./uuid.js";
 import { LIB_VERSION } from "./version.js";
 
@@ -33,6 +58,10 @@ const DEFAULT_FLAG_POLL_INTERVAL_MS = 30000;
 /** Exposure event name, matching the other Cohorly SDKs. */
 const EXPOSURE_EVENT = "$feature_flag_called";
 const BACKOFF_BASE_MS = 2000;
+const DEFAULT_MAX_EXCEPTION_QUEUE_SIZE = 50;
+const DEFAULT_FLUSH_TIMEOUT_MS = 2000;
+/** distinct_id of exceptions with no distinctId and no serverName: one fixed id, never one per error. */
+const DEFAULT_SERVER_DISTINCT_ID = "server";
 /** Server-side hard cap on events per /track request (400 above it). */
 export const SERVER_MAX_BATCH = 500;
 
@@ -45,6 +74,23 @@ function nodeify(promise: Promise<void>, callback?: Callback): Promise<void> {
     );
   }
   return promise;
+}
+
+function isFatal(event: TrackEvent): boolean {
+  return event.properties.$exception_level === "fatal";
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+/** Per-invocation state of withCohorly(), carried by AsyncLocalStorage. */
+interface InvocationScope {
+  breadcrumbs: Breadcrumb[];
 }
 
 /**
@@ -70,10 +116,40 @@ export class CohorlyNode {
   /** Definitions poller, only when a flagSecret was configured (ADR-0011). */
   private readonly definitions: FlagDefinitionsPoller | undefined;
 
+  private readonly release: string | undefined;
+  private readonly dist: string | undefined;
+  /** `appVersion ?? release`: what every event gets as `$app_version_string`. */
+  private readonly appVersionString: string | undefined;
+  private readonly beforeSendException: CohorlyConfig["beforeSendException"];
+  private readonly maxExceptionQueueSize: number;
+  private readonly serverName: string | undefined;
+  private readonly projectRoot: string;
+  private readonly flushTimeoutMs: number;
+  private readonly scope = new AsyncLocalStorage<InvocationScope>();
+  /** Set while captureUncaught listeners are registered for this client. */
+  private uncaughtClient: UncaughtClient | undefined;
+  /** `captureExceptions: false`: nothing is captured, manually or by the uncaught handlers. */
+  private readonly captureExceptionsDisabled: boolean;
+
   private queue: TrackEvent[] = [];
+  /**
+   * `$exception` events, apart from `queue` so ordinary events can never
+   * push one out. In memory only, like the event queue.
+   */
+  private exceptionQueue: TrackEvent[] = [];
+  /** Exceptions currently being sent, so a concurrent send does not repeat them. */
+  private readonly exceptionsInFlight = new Set<TrackEvent>();
+  /** Breadcrumbs recorded outside any withCohorly() invocation. */
+  private breadcrumbs: Breadcrumb[] = [];
   private flushTimer: ReturnType<typeof setInterval> | undefined;
   /** Serializes flushes so concurrent flush()/timer ticks never interleave. */
   private flushChain: Promise<void> = Promise.resolve();
+  /**
+   * Aborts the flush running right now (its transport calls get the signal).
+   * flushWithTimeout() fires it at its deadline, so a hung request never
+   * outlives the deadline nor holds every later flush behind it.
+   */
+  private runningFlushAbort: AbortController | undefined;
 
   /** Consecutive flush failures, drives exponential backoff. Reset on success. */
   private consecutiveFailures = 0;
@@ -99,6 +175,18 @@ export class CohorlyNode {
     this.transport = config.transport ?? fetchTransport;
     this.fetcher = config.fetcher ?? fetchJsonFetcher;
     this.effectiveBatchSize = this.batchSize;
+    this.release = config.release;
+    this.dist = config.dist;
+    this.appVersionString = config.appVersion ?? config.release;
+    this.beforeSendException = config.beforeSendException;
+    this.maxExceptionQueueSize = Math.max(
+      1,
+      config.maxExceptionQueueSize ?? DEFAULT_MAX_EXCEPTION_QUEUE_SIZE,
+    );
+    // An empty value (a blank env var) means "not set", not an empty distinct_id.
+    this.serverName = config.serverName || undefined;
+    this.projectRoot = path.resolve(config.projectRoot ?? process.cwd());
+    this.flushTimeoutMs = config.flushTimeoutMs ?? DEFAULT_FLUSH_TIMEOUT_MS;
 
     this.people = createPeople((payload, callback) =>
       this.sendEngage(payload, callback),
@@ -118,6 +206,8 @@ export class CohorlyNode {
       (distinctId, key, response) => this.trackExposure(distinctId, key, response),
     );
 
+    this.captureExceptionsDisabled = config.captureExceptions === false;
+
     if (this.flushIntervalMs > 0) {
       this.flushTimer = setInterval(() => {
         this.enqueueFlush(false).catch((err) =>
@@ -127,6 +217,14 @@ export class CohorlyNode {
       // Don't keep the Node process alive just for the flush timer.
       const timer = this.flushTimer as { unref?: () => void };
       timer.unref?.();
+    }
+
+    if (config.captureUncaught && config.captureExceptions !== false) {
+      this.uncaughtClient = {
+        captureUncaughtError: (error, kind) => this.captureUncaughtError(error, kind),
+        flushWithTimeout: () => this.flushWithTimeout(),
+      };
+      registerUncaught(this.uncaughtClient);
     }
   }
 
@@ -227,6 +325,10 @@ export class CohorlyNode {
       this.flushTimer = undefined;
     }
     this.definitions?.stop();
+    if (this.uncaughtClient) {
+      unregisterUncaught(this.uncaughtClient);
+      this.uncaughtClient = undefined;
+    }
     try {
       await this.enqueueFlush(true);
     } catch (err) {
@@ -246,6 +348,220 @@ export class CohorlyNode {
   /** Number of events currently queued (mainly for tests/monitoring). */
   get queueSize(): number {
     return this.queue.length;
+  }
+
+  /** Number of exceptions currently queued (mainly for tests/monitoring). */
+  get exceptionQueueSize(): number {
+    return this.exceptionQueue.length;
+  }
+
+  /**
+   * Queue a `$exception` event for anything thrown. `$exception_list` holds
+   * `error` and its `cause` chain (outermost first, at most 5, cycle-safe)
+   * with frames parsed from `error.stack`, oldest call first, paths relative
+   * to `projectRoot`. A non-Error becomes a synthetic exception. `tags` and
+   * `extra` become top-level properties (`tags` wins) but never override a
+   * reserved key. A flush starts right away (it respects retry backoff), so
+   * an exception never waits for `batchSize`.
+   *
+   * Returns the queued event, or `null` when `beforeSendException` dropped
+   * it. Never throws.
+   */
+  captureException(
+    error: unknown,
+    options: CaptureExceptionOptions = {},
+  ): TrackEvent | null {
+    try {
+      const list = buildExceptionList(error, {
+        handled: options.mechanism?.handled ?? true,
+        type: options.mechanism?.type ?? "generic",
+      });
+      return this.captureExceptionList(list, options);
+    } catch (err) {
+      this.log("captureException failed", err);
+      return null;
+    }
+  }
+
+  /**
+   * Lower-level captureException() for callers that build `$exception_list`
+   * themselves. `options.mechanism` is ignored (each entry carries its own).
+   * Returns `null` for an empty list or when `beforeSendException` dropped
+   * the event. Never throws.
+   */
+  captureExceptionList(
+    list: ExceptionListEntry[],
+    options: CaptureExceptionOptions = {},
+  ): TrackEvent | null {
+    try {
+      if (this.captureExceptionsDisabled) return null;
+      if (!Array.isArray(list) || list.length === 0) return null;
+      const exceptionProps: Properties = {
+        $exception_list: relativizeFrames(list, this.projectRoot),
+        $exception_level: normalizeLevel(options.level),
+      };
+      if (options.fingerprint) exceptionProps.$exception_fingerprint = options.fingerprint;
+      if (options.title) exceptionProps.error_title = options.title;
+      if (this.release !== undefined) exceptionProps.$exception_release = this.release;
+      if (this.dist !== undefined) exceptionProps.$exception_dist = this.dist;
+      const breadcrumbs = this.currentBreadcrumbs();
+      if (breadcrumbs.length > 0) {
+        exceptionProps.$exception_breadcrumbs = breadcrumbs.map(snapshotBreadcrumb);
+      }
+
+      const distinctId =
+        typeof options.distinctId === "string" && options.distinctId.length > 0
+          ? options.distinctId
+          : (this.serverName ?? DEFAULT_SERVER_DISTINCT_ID);
+      const built = this.buildEvent(EXCEPTION_EVENT, {
+        ...withoutReservedKeys(options.extra),
+        ...withoutReservedKeys(options.tags),
+        // Runtime context describes this process; a tag must not contradict it.
+        ...(this.serverName !== undefined ? { server_name: this.serverName } : {}),
+        runtime: "node",
+        node_version: process.version,
+        distinct_id: distinctId,
+      });
+      Object.assign(built.properties, exceptionProps);
+
+      let evt: TrackEvent | null = built;
+      if (this.beforeSendException) {
+        try {
+          evt = this.beforeSendException(built);
+        } catch (err) {
+          this.log("beforeSendException threw, dropping the exception", err);
+          return null;
+        }
+        if (!evt || typeof evt !== "object" || !evt.properties) {
+          this.log("beforeSendException dropped the exception");
+          return null;
+        }
+      }
+
+      try {
+        JSON.stringify(evt);
+      } catch (err) {
+        // A hook that adds a circular value must not wedge the queue: the transport would throw on every retry.
+        this.log("exception is not JSON serializable, dropping it", err);
+        return null;
+      }
+
+      this.exceptionQueue.push(evt);
+      this.enforceExceptionQueueCap();
+      this.enqueueFlush(false).catch((err) =>
+        this.log("exception-triggered flush failed", err),
+      );
+      return evt;
+    } catch (err) {
+      this.log("captureException failed", err);
+      return null;
+    }
+  }
+
+  /**
+   * Record a breadcrumb: a step that led up to an exception. The last 50
+   * travel with every exception as `$exception_breadcrumbs`; `message` is
+   * cut to 1000 chars. Inside withCohorly() the trail belongs to that
+   * invocation only, so concurrent invocations never see each other's.
+   */
+  addBreadcrumb(crumb: BreadcrumbInput): void {
+    try {
+      pushBreadcrumb(this.scope.getStore()?.breadcrumbs ?? this.breadcrumbs, crumb);
+    } catch (err) {
+      this.log("addBreadcrumb failed", err);
+    }
+  }
+
+  /**
+   * Wraps a serverless handler (sync or async). If it throws or rejects, the
+   * error is captured (`mechanism: serverless`, unhandled), the queues are
+   * flushed with a timeout, and the SAME error is rethrown - even when the
+   * flush times out or fails. The wrapper is always async: a sync throw
+   * comes back as a rejection, because the flush has to finish first. A
+   * handler that returns normally gets no capture and no forced flush. Each
+   * call has its own breadcrumb trail.
+   */
+  withCohorly<A extends unknown[], R>(
+    handler: (...args: A) => R,
+    options: WithCohorlyOptions<A> = {},
+  ): (...args: A) => Promise<Awaited<R>> {
+    const client = this;
+    return function wrapped(this: unknown, ...args: A): Promise<Awaited<R>> {
+      const fail = async (error: unknown): Promise<never> => {
+        let distinctId: string | undefined;
+        try {
+          distinctId = options.distinctId?.(...args);
+        } catch (err) {
+          client.log("withCohorly distinctId callback threw", err);
+        }
+        client.captureException(error, {
+          distinctId,
+          level: "error",
+          mechanism: { type: "serverless", handled: false },
+        });
+        await client.flushWithTimeout(options.flushTimeoutMs);
+        throw error;
+      };
+      return client.scope.run({ breadcrumbs: [] }, () => {
+        let result: R;
+        try {
+          result = handler.apply(this, args);
+        } catch (error) {
+          return fail(error);
+        }
+        if (isPromiseLike(result)) {
+          return Promise.resolve(result).then(
+            (value) => value as Awaited<R>,
+            fail,
+          );
+        }
+        return Promise.resolve(result as Awaited<R>);
+      });
+    };
+  }
+
+  /**
+   * Force-flush exceptions, then events, giving up after `timeoutMs`
+   * (default `flushTimeoutMs`). Resolves true when both queues drained,
+   * false on timeout or failure (nothing is lost: queued items stay for the
+   * next flush). Never rejects; its timer never keeps the process alive.
+   *
+   * At the deadline the flush in progress (this one, or the one ahead of it
+   * in the queue) is aborted through the transport's `signal`: the request
+   * fails like a network error (batch kept, backoff), and this flush, if it
+   * had not started yet, never starts.
+   */
+  async flushWithTimeout(timeoutMs: number = this.flushTimeoutMs): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new AbortController();
+    const timeout = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => {
+        const reason = new Error("cohorly: flush timed out");
+        deadline.abort(reason);
+        this.runningFlushAbort?.abort(reason);
+        resolve(false);
+      }, Math.max(0, timeoutMs));
+      (timer as { unref?: () => void }).unref?.();
+    });
+    const work = this.enqueueFlush(true, deadline.signal).then(
+      () => this.queue.length === 0 && this.exceptionQueue.length === 0,
+      () => false,
+    );
+    try {
+      return await Promise.race([work, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Send queued exceptions now, without the event queue, ignoring backoff
+   * and any flush already in flight (an exception in flight elsewhere may go
+   * twice; the server dedups by `$insert_id`). Same retry contract as
+   * flush(). Never rejects: a failed batch stays queued.
+   */
+  async flushExceptions(options: FlushExceptionsOptions = {}): Promise<void> {
+    await this.sendExceptions(options.fatalOnly ?? false, true);
   }
 
   private buildEvent(
@@ -273,8 +589,103 @@ export class CohorlyNode {
             : uuid(),
         $lib: "node",
         $lib_version: LIB_VERSION,
+        ...(this.appVersionString !== undefined &&
+        properties.$app_version_string === undefined
+          ? { $app_version_string: this.appVersionString }
+          : {}),
       },
     };
+  }
+
+  /** The trail of the current withCohorly() invocation, else the client's. */
+  private currentBreadcrumbs(): Breadcrumb[] {
+    return this.scope.getStore()?.breadcrumbs ?? this.breadcrumbs;
+  }
+
+  private captureUncaughtError(error: unknown, kind: UncaughtKind): void {
+    if (kind === "uncaughtException") {
+      this.captureException(error, {
+        level: "fatal",
+        mechanism: { type: "onuncaughtexception", handled: false },
+      });
+    } else {
+      this.captureException(error, {
+        level: "error",
+        mechanism: { type: "onunhandledrejection", handled: false },
+      });
+    }
+  }
+
+  /**
+   * Trims the exception queue to `maxExceptionQueueSize`: the OLDEST
+   * NON-FATAL exception goes first, the oldest fatal one only when every
+   * queued exception is fatal. Among equals, one that is not being sent goes
+   * first, but being in flight never saves a non-fatal exception from a
+   * fatal one: a crash report survives queue pressure.
+   */
+  private enforceExceptionQueueCap(): void {
+    let dropped = 0;
+    while (this.exceptionQueue.length > this.maxExceptionQueueSize) {
+      const idle = (evt: TrackEvent) => !this.exceptionsInFlight.has(evt);
+      const victim = [
+        (evt: TrackEvent) => idle(evt) && !isFatal(evt),
+        (evt: TrackEvent) => !isFatal(evt),
+        idle,
+        () => true,
+      ]
+        .map((match) => this.exceptionQueue.findIndex(match))
+        .find((index) => index !== -1);
+      this.exceptionQueue.splice(victim ?? 0, 1);
+      dropped += 1;
+    }
+    if (dropped > 0) this.log("exception queue cap exceeded, dropped exceptions", dropped);
+  }
+
+  /** Exceptions in send order: fatal first, stable inside each group. */
+  private orderedExceptions(fatalOnly: boolean): TrackEvent[] {
+    const fatal = this.exceptionQueue.filter(isFatal);
+    if (fatalOnly) return fatal;
+    return [...fatal, ...this.exceptionQueue.filter((evt) => !isFatal(evt))];
+  }
+
+  /**
+   * Sends queued exceptions in batches, fatal first, through the retry
+   * contract. Returns the error of the batch that stopped it, if any.
+   * Exceptions in flight on another send are skipped unless
+   * `includeInFlight` (flushExceptions() must not wait on them).
+   */
+  private async sendExceptions(
+    fatalOnly: boolean,
+    includeInFlight: boolean,
+    signal?: AbortSignal,
+  ): Promise<{ error: unknown } | undefined> {
+    for (;;) {
+      // Checked even with nothing queued, so an aborted flush stops here.
+      if (signal?.aborted) return { error: signal.reason };
+      const size = Math.max(1, Math.min(this.effectiveBatchSize, SERVER_MAX_BATCH));
+      const batch = this.orderedExceptions(fatalOnly)
+        .filter((evt) => includeInFlight || !this.exceptionsInFlight.has(evt))
+        .slice(0, size);
+      if (batch.length === 0) return undefined;
+      const removeBatch = () => {
+        const sent = new Set(batch);
+        this.exceptionQueue = this.exceptionQueue.filter((evt) => !sent.has(evt));
+      };
+      for (const evt of batch) this.exceptionsInFlight.add(evt);
+      try {
+        await this.transport(`${this.host}/track`, batch, this.headers(), signal);
+        removeBatch();
+        this.consecutiveFailures = 0;
+        this.backoffUntil = 0;
+      } catch (err) {
+        const disposition = this.handleFlushError(err, removeBatch);
+        if (disposition === "dropped") continue;
+        if (disposition === "halved" && batch.length > 1) continue;
+        return { error: err };
+      } finally {
+        for (const evt of batch) this.exceptionsInFlight.delete(evt);
+      }
+    }
   }
 
   private enqueue(events: TrackEvent[]): void {
@@ -291,18 +702,51 @@ export class CohorlyNode {
     }
   }
 
-  /** Chains a flush behind any in-flight one so flushes never interleave. */
-  private enqueueFlush(force: boolean): Promise<void> {
+  /**
+   * Chains a flush behind any in-flight one so flushes never interleave.
+   * `signal` (flushWithTimeout's deadline) cancels it before it starts and
+   * aborts its requests once it runs.
+   */
+  private enqueueFlush(force: boolean, signal?: AbortSignal): Promise<void> {
     const run = this.flushChain
       .catch(() => undefined)
-      .then(() => this.runFlush(force));
+      .then(() => this.runFlush(force, signal));
     this.flushChain = run.catch(() => undefined);
     return run;
   }
 
-  private async runFlush(force: boolean): Promise<void> {
+  private async runFlush(force: boolean, deadline?: AbortSignal): Promise<void> {
+    if (deadline?.aborted) return;
+    if (!force && Date.now() < this.backoffUntil) return;
+    const controller = new AbortController();
+    const onDeadline = () => controller.abort(deadline?.reason);
+    deadline?.addEventListener("abort", onDeadline, { once: true });
+    this.runningFlushAbort = controller;
+    try {
+      await this.drainQueues(force, controller.signal);
+    } finally {
+      deadline?.removeEventListener("abort", onDeadline);
+      if (this.runningFlushAbort === controller) this.runningFlushAbort = undefined;
+    }
+  }
+
+  /**
+   * Sends the queues in batches. The exception queue is looked at again
+   * before EVERY event batch (fatal first, then the rest), so an exception
+   * captured while an event batch is in flight goes next, not after the
+   * remaining event batches. A failed exception batch holds the event
+   * batches back in this flush.
+   */
+  private async drainQueues(force: boolean, signal: AbortSignal): Promise<void> {
     let lastError: unknown;
-    while (this.queue.length > 0) {
+    for (;;) {
+      // An aborted signal stops the flush here too: sendExceptions reports it.
+      const failed = await this.sendExceptions(false, false, signal);
+      if (failed) {
+        if (force) throw failed.error;
+        return;
+      }
+      if (this.queue.length === 0) break;
       if (!force && Date.now() < this.backoffUntil) return;
       const size = Math.max(
         1,
@@ -310,13 +754,15 @@ export class CohorlyNode {
       );
       const batch = this.queue.slice(0, size);
       try {
-        await this.transport(`${this.host}/track`, batch, this.headers());
+        await this.transport(`${this.host}/track`, batch, this.headers(), signal);
         this.queue = this.queue.slice(batch.length);
         // Success: clear failure state and backoff.
         this.consecutiveFailures = 0;
         this.backoffUntil = 0;
       } catch (err) {
-        const disposition = this.handleFlushError(err, batch.length);
+        const disposition = this.handleFlushError(err, () => {
+          this.queue = this.queue.slice(batch.length);
+        });
         if (disposition === "dropped") continue; // 400: batch removed, keep draining
         if (disposition === "halved" && batch.length > 1) continue; // retry smaller now
         lastError = err;
@@ -327,8 +773,9 @@ export class CohorlyNode {
   }
 
   /**
-   * Applies the retry contract to a failed flush. `batchLen` is how many
-   * events were in the just-attempted batch (front of the queue).
+   * Applies the retry contract to a failed flush, for the event queue and
+   * the exception queue alike (one shared backoff state). `dropBatch`
+   * removes the just-attempted batch from its queue.
    *
    * - 400: payload permanently rejected - drop that batch, do not retry it.
    * - 413: payload too big - halve the effective batch size (floor 1), keep
@@ -339,13 +786,13 @@ export class CohorlyNode {
    */
   private handleFlushError(
     err: unknown,
-    batchLen: number,
+    dropBatch: () => void,
   ): "dropped" | "halved" | "backoff" {
     const status = err instanceof TransportError ? err.status : undefined;
 
     if (status === 400) {
       this.log("dropping batch permanently rejected with 400", err);
-      this.queue = this.queue.slice(batchLen);
+      dropBatch();
       return "dropped";
     }
 

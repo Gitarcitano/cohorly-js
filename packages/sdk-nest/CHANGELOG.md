@@ -1,5 +1,17 @@
 # @cohorly/nest
 
+## 0.4.0
+
+### Minor Changes
+
+- 34aeb04: Error tracking (ADR-0019). `@cohorly/node`: `captureException()`, `captureExceptionList()`, `addBreadcrumb()`, a separate in-memory exception queue (fatal first, never evicted by ordinary events), frames relative to `projectRoot`, `captureUncaught` (uncaught exceptions and unhandled rejections, flushed with a timeout, same exit behaviour as without the SDK), the serverless flush API `withCohorly()`, `flushWithTimeout()` and `flushExceptions()` with per-invocation breadcrumbs, and the `release`, `dist`, `appVersion`, `serverName`, `projectRoot`, `flushTimeoutMs`, `beforeSendException` and `maxExceptionQueueSize` options; `release` is stamped as both `$exception_release` and `$app_version_string`. `flushWithTimeout()` aborts the request in flight at its deadline through a new optional 4th `signal` argument of `CohorlyTransport`. Now depends on `@cohorly/core`. `@cohorly/nest`: `CohorlyExceptionFilter` for HTTP (5xx and errors that are not an `HttpException`, never 4xx), registered globally with `captureExceptions: true`, and `captureException`/`addBreadcrumb`/`withCohorly`/`flushWithTimeout` on `CohorlyService`; `@nestjs/core` is now a peer dependency.
+
+### Patch Changes
+
+- Updated dependencies [569f902]
+- Updated dependencies [34aeb04]
+  - @cohorly/node@0.5.0
+
 ## 0.3.0
 
 ### Minor Changes

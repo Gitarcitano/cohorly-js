@@ -1,3 +1,5 @@
+import type { CaptureExceptionOptions as CoreCaptureExceptionOptions } from "@cohorly/core";
+
 /**
  * Ingestion contract shapes, copied from apps/server/src/types.ts to keep
  * this package standalone (see repo CLAUDE.md "Ownership" convention).
@@ -33,7 +35,7 @@ export interface EngagePayload {
   $add?: Record<string, number>;
   /**
    * Destructive: the server refuses this op unless the request also carries an
-   * admin credential (superadmin key, or a Firebase token for an org owner) in
+   * admin credential (superadmin key, or an account token for an org owner) in
    * the Authorization header, which this SDK does not send. Refused ops are
    * skipped individually and the server answers HTTP 200 with
    * `{ status: 0, ..., refused }`.
@@ -120,11 +122,18 @@ export type CohorlyGetFetcher = (
 /**
  * Transport abstraction: POSTs `body` as JSON to `url` with `headers`.
  * Must throw a TransportError on non-2xx responses. Injected in tests.
+ *
+ * `signal` aborts a /track request that outlived a flush deadline
+ * (`flushTimeoutMs`); the transport should then reject, like a network
+ * error. Optional: a transport that ignores it still works, but a hung
+ * request then keeps holding the flush queue (and the process) until it
+ * settles on its own.
  */
 export type CohorlyTransport = (
   url: string,
   body: unknown,
   headers: Record<string, string>,
+  signal?: AbortSignal,
 ) => Promise<void>;
 
 export interface CohorlyConfig {
@@ -157,6 +166,68 @@ export interface CohorlyConfig {
   flagPollIntervalMs?: number;
   /** Custom GET fetcher for flag definitions, mainly for testing. */
   definitionsFetcher?: CohorlyGetFetcher;
+  /**
+   * The release this deploy is, e.g. `"api@2026.11.3"` or a git sha. Sent as
+   * `$exception_release` on every exception AND as `$app_version_string` on
+   * every event (a value you pass wins), so crash-free users by release
+   * compares one version string (ADR-0019). Unset: neither is stamped.
+   */
+  release?: string;
+  /** Distribution inside the release (e.g. a build id), sent as `$exception_dist`. */
+  dist?: string;
+  /** Overrides `$app_version_string` only; `$exception_release` still comes from `release`. */
+  appVersion?: string;
+  /**
+   * Called with every fully built `$exception` event before it is queued.
+   * Return it (changed if needed) or `null` to drop it. Returning anything
+   * that is not an event, or throwing, drops it too: an exception is never
+   * sent unscrubbed.
+   */
+  beforeSendException?: (event: TrackEvent) => TrackEvent | null;
+  /** Capacity of the exception queue, separate from the event queue. Default 50. */
+  maxExceptionQueueSize?: number;
+  /**
+   * Sent as `server_name` on exceptions, and the `distinct_id` of exceptions
+   * captured without one (default `"server"`).
+   */
+  serverName?: string;
+  /** Frame paths inside this directory are sent relative to it. Default `process.cwd()`. */
+  projectRoot?: string;
+  /**
+   * Capture `uncaughtException` (level fatal) and `unhandledRejection`
+   * (level error), flush with a timeout, then let the process end exactly
+   * as it would without the SDK. Default false.
+   */
+  captureUncaught?: boolean;
+  /**
+   * Set to `false` to turn exception capture off: `captureException()` sends
+   * nothing and the uncaught handlers are not registered, even with
+   * `captureUncaught: true`. Default true.
+   */
+  captureExceptions?: boolean;
+  /** Deadline of the flush done by withCohorly() and the uncaught handlers, in ms. Default 2000. */
+  flushTimeoutMs?: number;
+}
+
+/** Options of `captureException()` / `captureExceptionList()`. */
+export interface CaptureExceptionOptions
+  extends Omit<CoreCaptureExceptionOptions, "properties"> {
+  /** Who hit the error. Default: `serverName`, else `"server"`. */
+  distinctId?: string;
+}
+
+/** Options of `flushExceptions()`. */
+export interface FlushExceptionsOptions {
+  /** Send only `$exception_level: "fatal"` exceptions. */
+  fatalOnly?: boolean;
+}
+
+/** Options of `withCohorly()`. */
+export interface WithCohorlyOptions<A extends unknown[]> {
+  /** Derives the exception's `distinct_id` from the handler's arguments. */
+  distinctId?: (...args: A) => string | undefined;
+  /** Overrides the client's `flushTimeoutMs` for this handler. */
+  flushTimeoutMs?: number;
 }
 
 /**

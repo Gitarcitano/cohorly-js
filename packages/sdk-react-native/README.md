@@ -75,6 +75,13 @@ to storage, so nothing is lost if the app closes before a flush.
 | `flush` | `() => Promise<void>` | Manual flush. |
 | `getDistinctId` | `() => string` | |
 | `getDeviceId` | `() => string` | Stable per-device id (`$device_id`); persisted, survives `identify()`, changes on `reset()`. |
+| `captureException` | `(error, options?) => void` | Queue a `$exception` event (level, title, tags, extra, fingerprint). Never throws; no-op before `init()`. |
+| `optOutTracking` / `optInTracking` / `hasOptedOutTracking` | `() => void` / `() => void` / `() => boolean` | Persisted opt-out (own AsyncStorage key): drops queued events, people ops, exceptions and breadcrumbs; nothing is sent (no feature flag request either) until `optInTracking()`. The stored value is applied before any send once the state is read. Before `init()` they do not throw: opt-out/opt-in are no-ops, `hasOptedOutTracking()` is `false`. |
+| `isExceptionCaptureEnabled` | `() => boolean` | `false` until the persisted state is read, and after opt-out or with `captureExceptions: false`; use it as `enabled` for a native crash reporter. `false` before `init()`. |
+| `onExceptionCaptureChange` | `(listener: (enabled: boolean) => void) => () => void` | Called when `isExceptionCaptureEnabled()` changes (end of hydration, opt-out, opt-in); not on subscribe. Re-send the native crash reporter configuration from it. Subscribe after `init()`; before it returns a no-op unsubscribe. |
+| `addBreadcrumb` | `(crumb) => void` | Step sent with the next exceptions (last 50, memory only, cleared by `reset()`). |
+| `trackNavigation` | `(navigationRef) => () => void` | `navigation` breadcrumbs (route names only) from a React Navigation / expo-router container ref. |
+| `CohorlyErrorBoundary` | component | Catches render errors, captures them (`react.errorboundary`), renders `fallback`. |
 
 You can also construct `new CohorlyClient(options)` directly instead of using the module-level
 singleton, e.g. for multiple instances or dependency injection in tests.
@@ -150,6 +157,7 @@ optional and simply omitted when absent.
 | `$wifi` | `@react-native-community/netinfo` |
 | `$os`, `$os_version`, `$screen_height`, `$screen_width` | `react-native`'s `Platform`/`Dimensions` |
 | `$lib_version` | always sent, this package's version |
+| `$release`, `$release_dist` | the release the app runs, the same values as `$exception_release`/`$exception_dist` (`release`/`dist` options, else `<bundleId>@<version>+<build>` and the downloaded `expo-updates` update id). `$release_dist` is absent on the embedded bundle; both are absent on events tracked before `ready` resolves. Powers crash-free users per release in Errors > Releases. Caller and super properties win. |
 | `$device_id` | stable per-device id, persisted (see `getDeviceId`); stamped on every event, survives `identify()`, minted anew on `reset()`. A caller-supplied `$device_id` in `track()` properties wins. |
 | `$user_id` | the current `distinct_id`, stamped only once `identify()` has been called (omitted while anonymous). A caller-supplied `$user_id` in `track()` properties wins. |
 
@@ -162,7 +170,7 @@ cd ios && pod install
 ```
 
 - **Android is a real dependency**, not vendored: `android/build.gradle` pulls
-  `com.github.cohorly-io.cohorly-android:cohorly-android:v0.1.0` straight from
+  `com.github.cohorly-io.cohorly-android:cohorly-android:v0.3.0` straight from
   JitPack (built off the public `cohorly-io/cohorly-android` mirror - see
   [docs/RELEASING.md](../../docs/RELEASING.md#sdk-releases)), so it reuses the
   same `AndroidDeviceInfo` class the standalone Cohorly Android SDK ships, no
@@ -219,6 +227,72 @@ This reuses the existing `AppState` subscription (no duplicate listeners) that
 also flushes on background. Pass `appState` to inject a custom `AppState`-like
 object (mainly for tests or non-RN environments); by default it's read lazily
 from `react-native`.
+
+## Error tracking
+
+```ts
+init({ token: "YOUR_PROJECT_TOKEN", storage: AsyncStorage, captureExceptions: true });
+```
+
+- `captureExceptions: true` chains a global handler onto `ErrorUtils` (fatal ->
+  `level: "fatal"`, written to AsyncStorage before the previous handler runs,
+  waiting at most 1.5 s), tracks unhandled promise rejections on Hermes, and
+  records `app.lifecycle` (AppState) and `fetch` (status 400+ or rejected,
+  no query or fragment, never the SDK's own requests) breadcrumbs. With the
+  default (omitted) nothing global is touched. `captureExceptions: false` also
+  blocks manual `captureException()`: no `$exception` is sent. `optOutTracking()`
+  blocks them too.
+- Exceptions have their own persisted queue (`maxExceptionQueueSize`, default
+  50) and every flush sends them before events. `beforeSendException` can
+  scrub or drop them (`null` or a throw drops).
+- `release` defaults to `<bundleId>@<version>+<build>` (bundle id from
+  `expo-application` or `react-native-device-info`, else the lowercase
+  platform); `dist` defaults to the `expo-updates` update id for a downloaded
+  OTA update. Both must equal `--release` / `--dist` of
+  `cohorly sourcemaps upload`. Frames from the app bundle are named
+  `index.android.bundle` / `main.jsbundle` with the device path in `abs_path`.
+- Native crashes (iOS) are opt-in, see below.
+
+### Native crashes (iOS)
+
+Signals, Mach exceptions, uncaught NSExceptions and C++ exceptions are recorded
+by [KSCrash](https://github.com/kstenerud/KSCrash) and sent by native code on
+the next launch, before JS starts (ADR-0020), as `$exception` events with level
+`fatal`. MetricKit crash, hang and CPU diagnostics are sent as `error` /
+`warning`. Add the config plugin and turn it on in `init`:
+
+```json
+"plugins": [["@cohorly/react-native", { "projectToken": "YOUR_PROJECT_TOKEN", "apiHost": "https://YOUR_COHORLY_API" }]]
+```
+
+```ts
+init({ token: "YOUR_PROJECT_TOKEN", storage: AsyncStorage, nativeCrashReporting: true });
+```
+
+- The plugin writes `CohorlyProjectToken` / `CohorlyApiHost` into the
+  Info.plist and calls `CohorlyNativeCrashes.start()` first thing in
+  `didFinishLaunching` (Swift or Objective-C AppDelegate). Both props are
+  required; there is no default host. Without Expo, make the same two changes
+  by hand.
+- The switch applies to the NEXT launch: JS writes `nativeCrashReporting` (and
+  the current release, dist and identity) to UserDefaults on every launch and
+  on `identify()` / `reset()`, and native code reads it before JS exists.
+  Turning it off deletes unsent reports on the following launch.
+  It is on only while `isExceptionCaptureEnabled()` is true too, and is re-sent
+  on every `onExceptionCaptureChange`: `captureExceptions: false` or
+  `optOutTracking()` turn it off, `optInTracking()` back on.
+- Never run two native crash handlers: in apps that also use Sentry, set
+  `enableNativeCrashHandling: false` in `Sentry.init` before turning this on.
+- Upload the dSYMs of every build so frames are symbolicated, with the same
+  release the SDK sends (`<bundleId>@<version>+<build>`):
+  `cohorly debug-files upload --release com.example.shop@3.8.1+415 path/to/App.app.dSYM`
+  (the `@cohorly/cli` Expo plugin does it from an Xcode build phase).
+- The plugin also forwards `application(_:handleEventsForBackgroundURLSession:completionHandler:)`
+  to `CohorlyNativeCrashes.handleEventsForBackgroundURLSession(_:completionHandler:)`
+  (into an existing handler when the AppDelegate has one), so reports delivered
+  while the app is dead are cleaned up when iOS relaunches it in the background.
+
+See the [React Native docs](https://cohorly-docs.velloalabs.com/sdks/react-native#error-tracking) for the details.
 
 ## Testing
 

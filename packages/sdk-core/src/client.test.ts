@@ -1285,3 +1285,33 @@ describe("feature flag exposure events", () => {
     expect(exposures()).toHaveLength(0);
   });
 });
+
+describe("eventProperties hook", () => {
+  it("stamps its keys on every built event without overriding the caller's, gets the event name and survives a throw", () => {
+    const seen: string[] = [];
+    let fail = false;
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      storage: makeStorage(),
+      transport: async () => {},
+      flushIntervalMs: 0,
+      eventProperties: (event) => {
+        seen.push(event);
+        if (fail) throw new Error("hook failed");
+        return { $session_id: "s-hook", plan: "from-hook" };
+      },
+    });
+
+    const tracked = client.track("Signed Up", { plan: "pro" });
+    expect(tracked.properties.$session_id).toBe("s-hook");
+    expect(tracked.properties.plan).toBe("pro");
+
+    const exception = client.captureException(new Error("boom"));
+    expect(exception?.properties.$session_id).toBe("s-hook");
+    expect(seen).toEqual(["Signed Up", "$exception"]);
+
+    fail = true;
+    const after = client.track("Still Sent");
+    expect(after.properties.$session_id).toBeUndefined();
+  });
+});

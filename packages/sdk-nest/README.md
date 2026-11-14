@@ -80,6 +80,10 @@ CohorlyModule.forRootAsync({
 
 All [`@cohorly/node` config options](../sdk-node/README.md#configuration) are accepted (`host`, `flushIntervalMs`, `batchSize`, `debug`, `maxQueueSize`, `maxRetryDelayMs`), plus `token` (required) and `isGlobal`.
 
+## Error tracking
+
+`CohorlyModule.forRoot({ token, captureExceptions: true })` registers `CohorlyExceptionFilter` globally: 5xx `HttpException`s and errors that are not an `HttpException` are reported, 4xx are not (including an `http-errors` 4xx such as body-parser's 413), and the response stays Nest's default. HTTP only: in RPC and WebSocket contexts it captures and delegates to `BaseExceptionFilter`, which answers through the HTTP adapter, so those transports are not covered in this version. Tags are only `http.method` and `http.route` (no query string, body, headers or cookies). Guide: [NestJS error tracking](https://cohorly-docs.velloalabs.com/sdks/nest#error-tracking).
+
 ## Graceful shutdown
 
 `CohorlyService` implements `OnApplicationShutdown`: when the Nest application closes it stops the SDK's flush timer and performs a final flush of queued events. To also cover process signals (SIGTERM etc), enable Nest's shutdown hooks:

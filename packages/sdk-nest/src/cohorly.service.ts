@@ -1,11 +1,15 @@
 import type {
   BatchEventInput,
+  BreadcrumbInput,
   Callback,
+  CaptureExceptionOptions,
   CohorlyFlags,
   CohorlyPeople,
   FlagCallOptions,
   FlagResult,
   Properties,
+  TrackEvent,
+  WithCohorlyOptions,
 } from "@cohorly/node";
 import { CohorlyNode } from "@cohorly/node";
 import type { OnApplicationShutdown } from "@nestjs/common";
@@ -28,7 +32,13 @@ export class CohorlyService implements OnApplicationShutdown {
     @Inject(COHORLY_MODULE_OPTIONS)
     options: CohorlyModuleOptions,
   ) {
-    const { token, isGlobal: _isGlobal, ...config } = options;
+    const {
+      token,
+      isGlobal: _isGlobal,
+      captureExceptions: _captureExceptions,
+      distinctId: _distinctId,
+      ...config
+    } = options;
     this.client = new CohorlyNode(token, config);
   }
 
@@ -106,6 +116,32 @@ export class CohorlyService implements OnApplicationShutdown {
 
   flush(callback?: Callback): Promise<void> {
     return this.client.flush(callback);
+  }
+
+  /** Queue a `$exception` event; never throws. See @cohorly/node captureException(). */
+  captureException(
+    error: unknown,
+    options?: CaptureExceptionOptions,
+  ): TrackEvent | null {
+    return this.client.captureException(error, options);
+  }
+
+  /** Record a breadcrumb sent with the next exceptions. */
+  addBreadcrumb(crumb: BreadcrumbInput): void {
+    this.client.addBreadcrumb(crumb);
+  }
+
+  /** Wrap a handler: capture, flush with a timeout and rethrow on failure. */
+  withCohorly<A extends unknown[], R>(
+    handler: (...args: A) => R,
+    options?: WithCohorlyOptions<A>,
+  ): (...args: A) => Promise<Awaited<R>> {
+    return this.client.withCohorly(handler, options);
+  }
+
+  /** Force-flush exceptions and events; false on timeout or failure, never rejects. */
+  flushWithTimeout(timeoutMs?: number): Promise<boolean> {
+    return this.client.flushWithTimeout(timeoutMs);
   }
 
   /**

@@ -1,12 +1,20 @@
+import { buildExceptionList } from "./exceptions/build.js";
+import { METRIC_EVENT, MetricsAggregator } from "./metrics.js";
 import { fetchFlagsFetcher, fetchTransport, TransportError } from "./transport.js";
 import type {
+  Breadcrumb,
+  BreadcrumbInput,
+  CaptureExceptionOptions,
   CohorlyClientOptions,
   CohorlyStorage,
   CohorlyTransport,
+  ExceptionLevel,
+  ExceptionListEntry,
   FlagDetails,
   FlagPersistenceMode,
   FlagResult,
   FlagsFetcher,
+  FlushExceptionsOptions,
   PeopleProperties,
   TrackedEvent,
 } from "./types.js";
@@ -17,12 +25,57 @@ const KEY_DEVICE_ID = "cohorly_device_id";
 const KEY_ANONYMOUS = "cohorly_anonymous";
 const KEY_SUPER_PROPS = "cohorly_super_props";
 const KEY_QUEUE = "cohorly_queue";
+const KEY_EXCEPTION_QUEUE = "cohorly_exception_queue";
 const KEY_TIMED_EVENTS = "cohorly_timed_events";
 const KEY_FLAGS = "chl_flags";
+const KEY_OPT_OUT = "cohorly_opt_out";
 
 /** Cohorly's hosted ingestion API. Used when no apiHost is supplied. */
 const DEFAULT_API_HOST = "https://cohorly-service.velloalabs.com";
 const DEFAULT_MAX_QUEUE_SIZE = 1000;
+const DEFAULT_MAX_EXCEPTION_QUEUE_SIZE = 50;
+/** Breadcrumbs kept in memory; the oldest is dropped first. */
+export const MAX_BREADCRUMBS = 50;
+/** Breadcrumb messages longer than this are cut. */
+export const MAX_BREADCRUMB_MESSAGE_LENGTH = 1000;
+
+const EXCEPTION_EVENT = "$exception";
+const EXCEPTION_LEVELS: ReadonlySet<string> = new Set<ExceptionLevel>([
+  "fatal",
+  "error",
+  "warning",
+  "info",
+]);
+/** Keys `tags`/`extra` can never set on an exception (plus every `$exception_*`). */
+const RESERVED_EXCEPTION_KEYS: ReadonlySet<string> = new Set([
+  "error_title",
+  "distinct_id",
+  "time",
+  "$insert_id",
+  "$lib",
+  "token",
+  "$device_id",
+  "$user_id",
+]);
+
+function isReservedExceptionKey(key: string): boolean {
+  return key.startsWith("$exception_") || RESERVED_EXCEPTION_KEYS.has(key);
+}
+
+function withoutReservedKeys(
+  props: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!props) return out;
+  for (const [key, value] of Object.entries(props)) {
+    if (!isReservedExceptionKey(key)) out[key] = value;
+  }
+  return out;
+}
+
+function isFatal(event: TrackedEvent): boolean {
+  return event.properties.$exception_level === "fatal";
+}
 const DEFAULT_MAX_RETRY_DELAY_MS = 10 * 60 * 1000; // 10 minutes
 const BACKOFF_BASE_MS = 2000;
 /**
@@ -78,6 +131,23 @@ export class CohorlyClient {
   private readonly token: string | undefined;
   private readonly maxQueueSize: number;
   private readonly maxRetryDelayMs: number;
+  private readonly release: string | undefined;
+  private readonly dist: string | undefined;
+  private readonly appVersion: string | undefined;
+  private readonly eventProperties: ((event: string) => Record<string, unknown>) | undefined;
+  private readonly beforeSendException:
+    | ((event: TrackedEvent) => TrackedEvent | null)
+    | undefined;
+  private readonly maxExceptionQueueSize: number;
+  private readonly captureExceptionsEnabled: boolean;
+  /** Persisted opt-out flag; see optOutTracking(). */
+  private optedOut: boolean;
+  /**
+   * Bumped by optOutTracking(). A send captures it before going on the wire
+   * and, if it changed by the time the send settles, does not touch the retry
+   * state: the batch it carried belongs to a queue that was discarded.
+   */
+  private optOutEpoch = 0;
 
   private distinctId: string;
   /**
@@ -90,6 +160,15 @@ export class CohorlyClient {
   /** Timed-event start timestamps (ms) keyed by event name. See timeEvent(). */
   private timedEvents: Record<string, number>;
   private queue: TrackedEvent[];
+  /**
+   * `$exception` events, persisted apart from `queue` so ordinary events can
+   * never evict them, and always sent before it.
+   */
+  private exceptionQueue: TrackedEvent[];
+  /** Exceptions currently being sent, so a concurrent flush does not send them twice. */
+  private readonly exceptionsInFlight = new Set<TrackedEvent>();
+  /** In memory only; see addBreadcrumb(). */
+  private breadcrumbs: Breadcrumb[] = [];
   private flushTimer: ReturnType<typeof setInterval> | undefined;
   private flushing = false;
 
@@ -120,6 +199,10 @@ export class CohorlyClient {
   /** TTL (ms) in effect for the served persisted cache (persistence source only). */
   private flagsTtlMs: number | undefined;
   private flagRequestSeq = 0;
+  /** Flag evaluations on the wire; while one runs and no flags are loaded, `$metric` events wait in the queue. */
+  private flagLoadsInFlight = 0;
+  /** stop() ran: this client must not touch the persisted queue from late callbacks. */
+  private stopped = false;
   private readonly flagListeners = new Set<
     (flags: Record<string, FlagResult>) => void
   >();
@@ -131,6 +214,8 @@ export class CohorlyClient {
   private readonly exposedFlags = new Set<string>();
 
   readonly people: PeopleProperties;
+  /** Custom metrics: `count`, `gauge`, `distribution`, aggregated into `$metric` events. */
+  readonly metrics: MetricsAggregator;
 
   constructor(options: CohorlyClientOptions) {
     this.apiHost = (options.apiHost ?? DEFAULT_API_HOST).replace(/\/$/, "");
@@ -144,6 +229,17 @@ export class CohorlyClient {
     this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
     this.effectiveBatchSize = this.batchSize;
+    this.release = options.release;
+    this.dist = options.dist;
+    this.appVersion = options.appVersion;
+    this.eventProperties = options.eventProperties;
+    this.beforeSendException = options.beforeSendException;
+    this.maxExceptionQueueSize = Math.max(
+      1,
+      options.maxExceptionQueueSize ?? DEFAULT_MAX_EXCEPTION_QUEUE_SIZE,
+    );
+    this.captureExceptionsEnabled = options.captureExceptions !== false;
+    this.optedOut = this.storage.get(KEY_OPT_OUT) === "1";
 
     const storedId = this.storage.get(KEY_DISTINCT_ID);
     if (storedId) {
@@ -181,6 +277,19 @@ export class CohorlyClient {
     this.queue = this.readJson(KEY_QUEUE, []);
     // Enforce the persisted cap on load in case an older/larger queue was stored.
     if (this.enforceQueueCap()) this.persistQueue();
+    const storedExceptions = this.readJson<unknown>(KEY_EXCEPTION_QUEUE, []);
+    this.exceptionQueue = Array.isArray(storedExceptions)
+      ? (storedExceptions as TrackedEvent[])
+      : [];
+    if (this.enforceExceptionQueueCap()) this.persistExceptionQueue();
+    // Opted out before a previous shutdown: whatever a crash left in storage
+    // must not ship once this client is flushing again.
+    if (this.optedOut) this.discardPending();
+    // Exception capture off: a queue a previous session left must not ship.
+    if (!this.captureExceptionsEnabled && this.exceptionQueue.length > 0) {
+      this.exceptionQueue = [];
+      this.persistExceptionQueue();
+    }
 
     this.people = {
       set: (props) => this.sendEngage({ $set: props }),
@@ -189,6 +298,19 @@ export class CohorlyClient {
       unset: (keys) => this.sendEngage({ $unset: keys }),
       delete: () => this.sendEngage({ $delete: true }),
     };
+
+    // After the persisted flags and the queue are loaded: the aggregator reads
+    // the kill switch flag immediately when a cached flag set was adopted.
+    this.metrics = new MetricsAggregator(
+      {
+        trackAt: (event, props, time) => this.trackAt(event, props, time),
+        onFeatureFlags: (cb) => this.onFeatureFlags(cb),
+        areFeatureFlagsLoaded: () => this.areFeatureFlagsLoaded(),
+        onDisabled: () => this.dropQueuedMetrics(),
+        log: (...args) => this.log(...args),
+      },
+      options.metrics,
+    );
 
     if (this.flushIntervalMs > 0) {
       this.flushTimer = setInterval(() => {
@@ -237,6 +359,48 @@ export class CohorlyClient {
     this.persistTimedEvents();
   }
 
+  /**
+   * Stop collecting for this device: persisted (survives a restart), drops
+   * every queued event, people operation and exception, and until
+   * optInTracking() no track, people, alias or `$exception` is queued or sent.
+   */
+  optOutTracking(): void {
+    this.optedOut = true;
+    this.optOutEpoch += 1;
+    this.storage.set(KEY_OPT_OUT, "1");
+    this.discardPending();
+    this.breadcrumbs = [];
+    this.metrics.discard();
+  }
+
+  /** Resume collecting after optOutTracking(). Discarded data is not restored. */
+  optInTracking(): void {
+    this.optedOut = false;
+    this.storage.remove(KEY_OPT_OUT);
+    // Samples recorded while opted out are not sent after opting back in.
+    this.metrics.discard();
+  }
+
+  hasOptedOutTracking(): boolean {
+    return this.optedOut;
+  }
+
+  /**
+   * Whether an exception captured now would be recorded: the app has not
+   * opted out and `captureExceptions` is not `false`. Platform SDKs pass this
+   * as `enabled` to native crash reporters.
+   */
+  isExceptionCaptureEnabled(): boolean {
+    return !this.optedOut && this.captureExceptionsEnabled;
+  }
+
+  private discardPending(): void {
+    this.queue = [];
+    this.exceptionQueue = [];
+    this.persistQueue();
+    this.persistExceptionQueue();
+  }
+
   track(event: string, properties: Record<string, unknown> = {}): TrackedEvent {
     // Timed events: if a timer was started for this name, attach $duration
     // (seconds, 3 decimals) and clear it.
@@ -248,23 +412,11 @@ export class CohorlyClient {
       this.persistTimedEvents();
     }
 
-    const props: TrackedEvent["properties"] = {
-      ...this.superProps,
+    const evt = this.buildEvent(event, {
       ...properties,
       ...(duration !== undefined ? { $duration: duration } : {}),
-      distinct_id: this.distinctId,
-      time: Date.now(),
-      $insert_id: uuid(),
-      $lib: this.lib,
-      ...(this.token !== undefined ? { token: this.token } : {}),
-    };
-    // Reserved identity fields, stamped last but never overriding a value the
-    // caller passed explicitly (mirrors Mixpanel's $device_id/$user_id).
-    if (props.$device_id === undefined) props.$device_id = this.deviceId;
-    if (!this.anonymous && props.$user_id === undefined) {
-      props.$user_id = this.distinctId;
-    }
-    const evt: TrackedEvent = { event, properties: props };
+    });
+    if (this.optedOut) return evt;
     this.queue.push(evt);
     this.enforceQueueCap();
     this.persistQueue();
@@ -274,8 +426,207 @@ export class CohorlyClient {
     return evt;
   }
 
+  /**
+   * Like track() but stamps `time` instead of Date.now(); track() never lets a
+   * property override `time`. Used for aggregated events (`$metric`) that
+   * describe a past window. No timed-event handling.
+   */
+  private trackAt(
+    event: string,
+    properties: Record<string, unknown>,
+    time: number,
+  ): TrackedEvent {
+    const evt = this.buildEvent(event, properties, time);
+    if (this.optedOut) return evt;
+    // A super prop named like a field this event omitted (`metric_bucket` on a
+    // counter) would otherwise leak into it and corrupt breakdowns.
+    for (const key of Object.keys(evt.properties)) {
+      if (key.startsWith("metric_") && !(key in properties)) {
+        delete evt.properties[key];
+      }
+    }
+    this.queue.push(evt);
+    this.enforceQueueCap();
+    this.persistQueue();
+    // No size-triggered flush here: a window is queued by metrics.flush() on
+    // teardown (pagehide, stop), where an immediate fetch would take the
+    // `flushing` slot and keep the caller's beacon flush from sending.
+    return evt;
+  }
+
+  /**
+   * The one property pipeline every queued event goes through: super props,
+   * then `properties`, then the SDK-owned fields. `$device_id`, `$user_id`
+   * and `$app_version_string` are stamped last but never override a value
+   * the caller passed explicitly (mirrors Mixpanel's $device_id/$user_id).
+   */
+  private buildEvent(
+    event: string,
+    properties: Record<string, unknown>,
+    time: number = Date.now(),
+  ): TrackedEvent {
+    const props: TrackedEvent["properties"] = {
+      ...this.superProps,
+      ...properties,
+      distinct_id: this.distinctId,
+      time,
+      $insert_id: uuid(),
+      $lib: this.lib,
+      ...(this.token !== undefined ? { token: this.token } : {}),
+    };
+    if (props.$device_id === undefined) props.$device_id = this.deviceId;
+    if (!this.anonymous && props.$user_id === undefined) {
+      props.$user_id = this.distinctId;
+    }
+    if (this.appVersion !== undefined && props.$app_version_string === undefined) {
+      props.$app_version_string = this.appVersion;
+    }
+    if (this.eventProperties) {
+      let extra: Record<string, unknown> = {};
+      try {
+        extra = this.eventProperties(event) ?? {};
+      } catch (err) {
+        this.log("eventProperties threw, ignored", err);
+      }
+      for (const [key, value] of Object.entries(extra)) {
+        if (props[key] === undefined) props[key] = value;
+      }
+    }
+    return { event, properties: props };
+  }
+
+  /**
+   * Queue a `$exception` event for anything thrown. `$exception_list` holds
+   * `error` and its `cause` chain (outermost first, at most 5 entries,
+   * cycle-safe) with frames parsed from `error.stack`, oldest call first. A
+   * non-Error becomes a synthetic exception. The event carries the current
+   * breadcrumbs, `release`/`dist`, and the same properties as `track()`;
+   * `tags` and `extra` become top-level properties but never override a
+   * reserved key. Returns the queued event, or `null` when
+   * `beforeSendException` dropped it. Never throws.
+   */
+  captureException(
+    error: unknown,
+    options: CaptureExceptionOptions = {},
+  ): TrackedEvent | null {
+    try {
+      if (!this.isExceptionCaptureEnabled()) return null;
+      const list = buildExceptionList(error, {
+        handled: options.mechanism?.handled ?? true,
+        type: options.mechanism?.type ?? "generic",
+      });
+      return this.captureExceptionList(list, options);
+    } catch (err) {
+      this.log("captureException failed", err);
+      return null;
+    }
+  }
+
+  /**
+   * Lower-level captureException() for platform SDKs that build
+   * `$exception_list` themselves (synthetic exceptions from a global
+   * handler, a native crash report). `options.mechanism` is ignored: each
+   * entry carries its own. Returns `null` for an empty list or when
+   * `beforeSendException` dropped the event. Never throws.
+   */
+  captureExceptionList(
+    list: ExceptionListEntry[],
+    options: CaptureExceptionOptions = {},
+  ): TrackedEvent | null {
+    try {
+      if (!this.isExceptionCaptureEnabled()) return null;
+      if (!Array.isArray(list) || list.length === 0) return null;
+      const level: ExceptionLevel =
+        options.level !== undefined && EXCEPTION_LEVELS.has(options.level)
+          ? options.level
+          : "error";
+      const exceptionProps: Record<string, unknown> = {
+        $exception_list: list,
+        $exception_level: level,
+      };
+      if (options.fingerprint) exceptionProps.$exception_fingerprint = options.fingerprint;
+      if (options.title) exceptionProps.error_title = options.title;
+      if (this.release !== undefined) exceptionProps.$exception_release = this.release;
+      if (this.dist !== undefined) exceptionProps.$exception_dist = this.dist;
+      if (this.breadcrumbs.length > 0) {
+        exceptionProps.$exception_breadcrumbs = this.breadcrumbs.map(snapshotBreadcrumb);
+      }
+
+      const built = this.buildEvent(EXCEPTION_EVENT, {
+        ...withoutReservedKeys(options.properties),
+        ...withoutReservedKeys(options.extra),
+        ...withoutReservedKeys(options.tags),
+      });
+      // Super properties are merged inside buildEvent; an `$exception_*` or
+      // `error_title` key from them must not leak into an exception either.
+      for (const key of Object.keys(built.properties)) {
+        if (key.startsWith("$exception_") || key === "error_title") {
+          delete built.properties[key];
+        }
+      }
+      Object.assign(built.properties, exceptionProps);
+
+      let evt: TrackedEvent | null = built;
+      if (this.beforeSendException) {
+        try {
+          evt = this.beforeSendException(built);
+        } catch (err) {
+          this.log("beforeSendException threw, dropping the exception", err);
+          return null;
+        }
+        if (!evt || typeof evt !== "object" || !evt.properties) {
+          this.log("beforeSendException dropped the exception");
+          return null;
+        }
+      }
+
+      this.exceptionQueue.push(evt);
+      this.enforceExceptionQueueCap();
+      this.persistExceptionQueue();
+      this.maybeFlush();
+      return evt;
+    } catch (err) {
+      this.log("captureException failed", err);
+      return null;
+    }
+  }
+
+  /**
+   * Record a breadcrumb: a step that led up to an exception. Kept in memory
+   * only, the last {@link MAX_BREADCRUMBS}; every exception carries a copy as
+   * `$exception_breadcrumbs`. `timestamp` defaults to now; `message` is cut
+   * to {@link MAX_BREADCRUMB_MESSAGE_LENGTH} chars. Cleared by reset().
+   */
+  addBreadcrumb(crumb: BreadcrumbInput): void {
+    if (this.optedOut) return;
+    if (!crumb || typeof crumb.category !== "string") return;
+    const entry: Breadcrumb = {
+      timestamp: crumb.timestamp ?? new Date().toISOString(),
+      category: crumb.category,
+    };
+    if (crumb.message !== undefined) {
+      const message = String(crumb.message);
+      entry.message =
+        message.length > MAX_BREADCRUMB_MESSAGE_LENGTH
+          ? message.slice(0, MAX_BREADCRUMB_MESSAGE_LENGTH)
+          : message;
+    }
+    if (crumb.level !== undefined) entry.level = crumb.level;
+    if (crumb.data !== undefined) {
+      const data = cloneJson(crumb.data);
+      if (data && typeof data === "object") entry.data = data as Record<string, unknown>;
+    }
+    this.breadcrumbs.push(snapshotBreadcrumb(entry));
+    if (this.breadcrumbs.length > MAX_BREADCRUMBS) {
+      this.breadcrumbs.splice(0, this.breadcrumbs.length - MAX_BREADCRUMBS);
+    }
+  }
+
   async identify(id: string): Promise<void> {
     if (id === this.distinctId) return;
+
+    // Samples were taken as the outgoing identity.
+    this.metrics.flush();
 
     // Switch identity first, synchronously, before any network call. An
     // offline or slow /alias POST must never block the switch: every
@@ -304,7 +655,7 @@ export class CohorlyClient {
     // is self-healing, since the server also links $device_id to $user_id
     // implicitly from any later event that carries both, so a dropped alias
     // call just delays the link rather than losing it.
-    if (wasAnonymous) {
+    if (wasAnonymous && !this.optedOut) {
       try {
         await this.transport(`${this.apiHost}/alias`, {
           alias: previousId,
@@ -317,7 +668,13 @@ export class CohorlyClient {
     }
   }
 
+  /**
+   * Starts a new anonymous identity. Exceptions already captured stay queued
+   * and still ship (they belong to the identity that hit them); breadcrumbs
+   * are cleared, since they describe the outgoing identity's session.
+   */
   reset(): void {
+    this.metrics.flush();
     this.distinctId = uuid();
     this.deviceId = this.distinctId;
     this.anonymous = true;
@@ -325,6 +682,7 @@ export class CohorlyClient {
     this.storage.set(KEY_DEVICE_ID, this.deviceId);
     this.storage.set(KEY_ANONYMOUS, "1");
     this.clearTimedEvents();
+    this.breadcrumbs = [];
     // Flags are per-identity: the previous identity's flags must not be
     // served to the new anonymous id, so drop them and remove the persisted
     // cache (under every policy) before the refresh.
@@ -342,36 +700,58 @@ export class CohorlyClient {
    * stale cache is kept and no rejection escapes.
    */
   async reloadFeatureFlags(): Promise<void> {
-    const requestedId = this.distinctId;
-    const seq = ++this.flagRequestSeq;
-    const res = await this.fetcher(`${this.apiHost}/flags/evaluate`, {
-      distinct_id: requestedId,
-      ...(this.token !== undefined ? { token: this.token } : {}),
-    });
-    // Identity changed, or a newer reload was started, while this request was
-    // in flight: these results are stale, discard them.
-    if (requestedId !== this.distinctId || seq !== this.flagRequestSeq) return;
-    const flags = (res as { flags?: unknown } | undefined)?.flags;
-    if (!flags || typeof flags !== "object") {
-      this.log("flag reload failed, keeping stale flags");
-      return;
+    // Opted out: no request at all (it would carry the distinct id). Whatever
+    // is cached stays served.
+    if (this.optedOut) return;
+    this.flagLoadsInFlight += 1;
+    try {
+      const requestedId = this.distinctId;
+      const seq = ++this.flagRequestSeq;
+      const res = await this.fetcher(`${this.apiHost}/flags/evaluate`, {
+        distinct_id: requestedId,
+        ...(this.token !== undefined ? { token: this.token } : {}),
+      });
+      // Identity changed, or a newer reload was started, while this request was
+      // in flight: these results are stale, discard them.
+      if (requestedId !== this.distinctId || seq !== this.flagRequestSeq) return;
+      const flags = (res as { flags?: unknown } | undefined)?.flags;
+      if (!flags || typeof flags !== "object") {
+        this.log("flag reload failed, keeping stale flags");
+        return;
+      }
+      this.flags = flags as Record<string, FlagResult>;
+      this.flagsLoaded = true;
+      this.flagsSource = "network";
+      this.flagsPersistedAt = undefined;
+      this.flagsTtlMs = undefined;
+      if (this.flagPersistence !== "networkOnly") {
+        this.storage.set(
+          KEY_FLAGS,
+          JSON.stringify({
+            distinct_id: requestedId,
+            flags: this.flags,
+            stored_at: Date.now(),
+          } satisfies FlagsCache),
+        );
+      }
+      this.emitFlags();
+    } finally {
+      this.flagLoadsInFlight -= 1;
     }
-    this.flags = flags as Record<string, FlagResult>;
-    this.flagsLoaded = true;
-    this.flagsSource = "network";
-    this.flagsPersistedAt = undefined;
-    this.flagsTtlMs = undefined;
-    if (this.flagPersistence !== "networkOnly") {
-      this.storage.set(
-        KEY_FLAGS,
-        JSON.stringify({
-          distinct_id: requestedId,
-          flags: this.flags,
-          stored_at: Date.now(),
-        } satisfies FlagsCache),
-      );
-    }
-    this.emitFlags();
+  }
+
+  /** `$metric` events wait for the kill switch while flags are loading and none are loaded yet. */
+  private metricsHeld(): boolean {
+    return !this.flagsLoaded && this.flagLoadsInFlight > 0;
+  }
+
+  private dropQueuedMetrics(): void {
+    // A stopped client no longer owns the persisted queue (a replacement
+    // client may have written to it since).
+    if (this.stopped) return;
+    if (!this.queue.some((evt) => evt.event === METRIC_EVENT)) return;
+    this.queue = this.queue.filter((evt) => evt.event !== METRIC_EVENT);
+    this.persistQueue();
   }
 
   /**
@@ -629,9 +1009,27 @@ export class CohorlyClient {
    * backoff (a manual flush is treated as an explicit "try now" request).
    * Auto-flush (timer) and size-triggered flushes go through the internal
    * backoff-aware path and are skipped until the backoff deadline passes.
+   * Every flush first sends the queued exceptions (fatal first, in batches),
+   * then one batch of the event queue; when an exception batch fails, the
+   * event queue waits for the next flush.
    */
   async flush(transportOverride?: CohorlyTransport): Promise<void> {
     return this.doFlush(transportOverride, true);
+  }
+
+  /**
+   * Send queued exceptions now through `transport`, without the event
+   * queue, ignoring backoff and any flush already in flight. Meant for
+   * page/app teardown, e.g. `flushExceptions(beaconTransport, { fatalOnly:
+   * true })` on `pagehide`: a crash must not wait behind a pending fetch.
+   * An exception also still in flight on another flush may be sent twice;
+   * the server dedups it by `$insert_id`. Same retry contract as flush().
+   */
+  async flushExceptions(
+    transport: CohorlyTransport,
+    options: FlushExceptionsOptions = {},
+  ): Promise<void> {
+    await this.sendExceptions(transport, options.fatalOnly ?? false, true);
   }
 
   /** Backoff-aware flush used by the auto-flush timer and size triggers. */
@@ -645,31 +1043,103 @@ export class CohorlyClient {
     transportOverride: CohorlyTransport | undefined,
     force: boolean,
   ): Promise<void> {
-    if (this.flushing || this.queue.length === 0) return;
+    if (this.flushing || this.optedOut) return;
+    if (this.queue.length === 0 && this.exceptionQueue.length === 0) return;
     if (!force && Date.now() < this.backoffUntil) return;
     this.flushing = true;
     try {
-      const size = Math.max(1, this.effectiveBatchSize);
-      const batch = this.queue.slice(0, size);
       const send = transportOverride ?? this.transport;
+      const exceptionsSent = await this.sendExceptions(send, false, false);
+      if (!exceptionsSent || this.queue.length === 0) return;
+      const size = Math.max(1, this.effectiveBatchSize);
+      const held = this.metricsHeld();
+      const batch = (
+        held ? this.queue.filter((evt) => evt.event !== METRIC_EVENT) : this.queue
+      ).slice(0, size);
+      if (batch.length === 0) return;
+      const epoch = this.optOutEpoch;
+      // By identity, not by count: an opt-out/opt-in while this send was on
+      // the wire replaced the queue, and what was tracked since must stay.
+      const removeBatch = () => {
+        const sent = new Set(batch);
+        this.queue = this.queue.filter((evt) => !sent.has(evt));
+        this.persistQueue();
+      };
       try {
         await send(`${this.apiHost}/track`, batch);
-        this.queue = this.queue.slice(batch.length);
-        this.persistQueue();
-        // Success: clear failure state and backoff.
-        this.consecutiveFailures = 0;
-        this.backoffUntil = 0;
+        removeBatch();
+        if (epoch === this.optOutEpoch) this.onFlushSuccess();
       } catch (err) {
-        this.handleFlushError(err, batch.length);
+        if (epoch === this.optOutEpoch) this.handleFlushError(err, removeBatch);
       }
     } finally {
       this.flushing = false;
     }
   }
 
+  /** Exceptions in send order: fatal first, stable inside each group. */
+  private orderedExceptions(fatalOnly: boolean): TrackedEvent[] {
+    const fatal = this.exceptionQueue.filter(isFatal);
+    if (fatalOnly) return fatal;
+    return [...fatal, ...this.exceptionQueue.filter((evt) => !isFatal(evt))];
+  }
+
   /**
-   * Applies the retry contract to a failed flush. `batchLen` is how many events
-   * were in the just-attempted batch (front of the queue).
+   * Sends queued exceptions in batches of the effective batch size, fatal
+   * first. Returns false when a batch failed (the failure already went
+   * through the retry contract). Exceptions in flight on another flush are
+   * skipped unless `includeInFlight` (teardown sends must not wait on them).
+   */
+  private async sendExceptions(
+    send: CohorlyTransport,
+    fatalOnly: boolean,
+    includeInFlight: boolean,
+  ): Promise<boolean> {
+    if (this.optedOut || !this.captureExceptionsEnabled) return true;
+    const pending = () =>
+      this.orderedExceptions(fatalOnly).filter(
+        (evt) => includeInFlight || !this.exceptionsInFlight.has(evt),
+      );
+    let budget = pending().length;
+    while (budget > 0) {
+      const batch = pending().slice(0, Math.max(1, this.effectiveBatchSize));
+      if (batch.length === 0) break;
+      budget -= batch.length;
+      const epoch = this.optOutEpoch;
+      for (const evt of batch) this.exceptionsInFlight.add(evt);
+      const removeBatch = () => {
+        const sent = new Set(batch);
+        this.exceptionQueue = this.exceptionQueue.filter((evt) => !sent.has(evt));
+        this.persistExceptionQueue();
+      };
+      try {
+        await send(`${this.apiHost}/track`, batch);
+        removeBatch();
+        if (epoch === this.optOutEpoch) this.onFlushSuccess();
+        // Opted out during the send: the rest of the queue was discarded.
+        if (this.optedOut) return true;
+      } catch (err) {
+        // Opted out during the send: the queue it belonged to is gone, so no
+        // failure state (backoff, batch halving) is carried over.
+        if (epoch !== this.optOutEpoch) return true;
+        this.handleFlushError(err, removeBatch);
+        return false;
+      } finally {
+        for (const evt of batch) this.exceptionsInFlight.delete(evt);
+      }
+    }
+    return true;
+  }
+
+  private onFlushSuccess(): void {
+    this.consecutiveFailures = 0;
+    this.backoffUntil = 0;
+  }
+
+  /**
+   * Applies the retry contract to a failed flush, for the event queue and
+   * the exception queue alike (one shared backoff state). `dropBatch`
+   * removes the just-attempted batch from its queue.
    *
    * - 400: payload permanently rejected - drop that batch, do not retry it.
    * - 413: payload too big - halve the effective batch size (floor 1), keep
@@ -678,13 +1148,12 @@ export class CohorlyClient {
    * - 429 / 5xx / network: keep queue, exponential backoff (Retry-After, when
    *   present on a 429, overrides the computed delay, still capped).
    */
-  private handleFlushError(err: unknown, batchLen: number): void {
+  private handleFlushError(err: unknown, dropBatch: () => void): void {
     const status = err instanceof TransportError ? err.status : undefined;
 
     if (status === 400) {
       this.log("dropping batch permanently rejected with 400", err);
-      this.queue = this.queue.slice(batchLen);
-      this.persistQueue();
+      dropBatch();
       return;
     }
 
@@ -736,9 +1205,44 @@ export class CohorlyClient {
   private enforceQueueCap(): boolean {
     if (this.queue.length <= this.maxQueueSize) return false;
     const overflow = this.queue.length - this.maxQueueSize;
-    this.queue.splice(0, overflow);
-    this.log("queue cap exceeded, dropped oldest events", overflow);
+    // Aggregated `$metric` events are the cheapest to lose (up to 200 per
+    // window while offline): they go first, so they can never push product
+    // events out of the queue.
+    const drop = new Set<number>();
+    for (let i = 0; i < this.queue.length && drop.size < overflow; i++) {
+      if (this.queue[i].event === METRIC_EVENT) drop.add(i);
+    }
+    for (let i = 0; drop.size < overflow; i++) drop.add(i);
+    this.queue = this.queue.filter((_, i) => !drop.has(i));
+    this.log("queue cap exceeded, dropped events", overflow);
     return true;
+  }
+
+  /**
+   * Trims the exception queue to `maxExceptionQueueSize`: the OLDEST
+   * NON-FATAL exception goes first, the oldest fatal one only when every
+   * queued exception is fatal. Returns true if anything was dropped.
+   */
+  private enforceExceptionQueueCap(): boolean {
+    let dropped = 0;
+    while (this.exceptionQueue.length > this.maxExceptionQueueSize) {
+      // An exception being sent stays: if that send fails, it must still be
+      // there to retry. Only when everything queued is in flight does it go.
+      const idle = (evt: TrackedEvent) => !this.exceptionsInFlight.has(evt);
+      const victim = [
+        (evt: TrackedEvent) => idle(evt) && !isFatal(evt),
+        idle,
+        (evt: TrackedEvent) => !isFatal(evt),
+      ]
+        .map((match) => this.exceptionQueue.findIndex(match))
+        .find((index) => index !== -1);
+      this.exceptionQueue.splice(victim ?? 0, 1);
+      dropped += 1;
+    }
+    if (dropped > 0) {
+      this.log("exception queue cap exceeded, dropped exceptions", dropped);
+    }
+    return dropped > 0;
   }
 
   /** Base URL events are sent to, e.g. for building a sendBeacon URL. */
@@ -748,10 +1252,13 @@ export class CohorlyClient {
 
   /** Stop the auto-flush timer. Useful in tests / on app teardown. */
   stop(): void {
+    this.metrics.flush();
+    this.stopped = true;
     if (this.flushTimer) clearInterval(this.flushTimer);
   }
 
   private async sendEngage(op: Record<string, unknown>): Promise<void> {
+    if (this.optedOut) return;
     try {
       await this.transport(`${this.apiHost}/engage`, {
         distinct_id: this.distinctId,
@@ -765,6 +1272,18 @@ export class CohorlyClient {
 
   private persistQueue(): void {
     this.storage.set(KEY_QUEUE, JSON.stringify(this.queue));
+  }
+
+  /**
+   * Best effort: a full or throwing storage must never stop an exception
+   * from being sent from memory.
+   */
+  private persistExceptionQueue(): void {
+    try {
+      this.storage.set(KEY_EXCEPTION_QUEUE, JSON.stringify(this.exceptionQueue));
+    } catch (err) {
+      this.log("could not persist the exception queue, keeping it in memory", err);
+    }
   }
 
   private persistTimedEvents(): void {
@@ -784,4 +1303,20 @@ export class CohorlyClient {
   private log(...args: unknown[]): void {
     if (this.debug) console.warn("[cohorly]", ...args);
   }
+}
+
+/** JSON round-trip copy; `undefined` when the value cannot be serialized. */
+function cloneJson(value: unknown): unknown {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return undefined;
+  }
+}
+
+/** An independent copy, so neither the buffer nor a captured event can mutate the other. */
+function snapshotBreadcrumb(crumb: Breadcrumb): Breadcrumb {
+  const copy: Breadcrumb = { ...crumb };
+  if (crumb.data !== undefined) copy.data = cloneJson(crumb.data) as Record<string, unknown>;
+  return copy;
 }

@@ -1,3 +1,14 @@
+import type {
+  BreadcrumbInput,
+  CaptureExceptionOptions,
+  ExceptionListEntry,
+} from "@cohorly/core";
+import {
+  TransportError as CoreTransportError,
+  ExceptionRateLimiter,
+  METRIC_EVENT,
+  MetricsAggregator,
+} from "@cohorly/core";
 import {
   deriveDeviceInfo,
   fetchNativeDeviceInfo,
@@ -6,6 +17,14 @@ import {
   resolveAppState,
   watchWifi,
 } from "./deviceInfo.js";
+import { ExceptionEngine, type Identity } from "./exceptions/engine.js";
+import { setupExceptionCapture, teardownExceptionCapture } from "./exceptions/handlers.js";
+import {
+  buildReactNativeExceptionList,
+  buildReactNativeRejectionList,
+} from "./exceptions/hermes-stack.js";
+import { buildNativeCrashConfig, writeNativeCrashConfig } from "./exceptions/native-crashes.js";
+import { readExpoUpdates, resolveRelease } from "./exceptions/release.js";
 import { InMemoryStorage } from "./storage.js";
 import type {
   AppStateLike,
@@ -32,6 +51,7 @@ const KEYS = {
   aeFirstOpen: "cohorly:ae_first_open",
   aeLastVersion: "cohorly:ae_last_version",
   flags: "cohorly:flags",
+  optOut: "cohorly:opt_out",
 } as const;
 
 /**
@@ -138,6 +158,31 @@ export class CohorlyClient {
   private platformInfo: PlatformInfo;
   private wifi: boolean | undefined;
   private appStateModule: AppStateLike | undefined;
+  /** Prefix of the default release; see resolveRelease(). */
+  private bundleId: string | undefined;
+  /** Exception queue, breadcrumbs and capture (see exceptions/engine.ts). */
+  private readonly exceptions: ExceptionEngine;
+  /** At most 10 exceptions per local fingerprint per minute, like the web SDK; per client, so init() starts it afresh. */
+  private readonly exceptionRateLimiter = new ExceptionRateLimiter();
+  /** Undoes the global handlers installed by `captureExceptions`. */
+  private teardownCapture: (() => void) | undefined;
+  /** `captureExceptions !== false`; see isExceptionCaptureEnabled(). */
+  private readonly captureExceptionsEnabled: boolean;
+  /** Persisted opt-out flag; see optOutTracking(). */
+  private optedOut = false;
+  /** optOutTracking()/optInTracking() ran, so hydrate() must not restore the stored flag over it. */
+  private optOutTouched = false;
+  /**
+   * Bumped by optOutTracking(). A flush or engage send captures it before it
+   * goes on the wire; if it changed when the send fails, the batch belongs to
+   * a queue that was discarded and is NOT put back.
+   */
+  private optOutEpoch = 0;
+  /** The persisted opt-out flag was read (end of the hydration reads). */
+  private optOutResolved = false;
+  private readonly captureListeners = new Set<(enabled: boolean) => void>();
+  /** Last value passed to the listeners; false until hydration resolves. */
+  private lastCaptureEnabled = false;
 
   private distinctId: string;
   /**
@@ -202,6 +247,14 @@ export class CohorlyClient {
   /** Monotonic request counter, guards against a stale reload overwriting a
    * newer one that resolved first. */
   private flagRequestSeq = 0;
+  /** Flag evaluations on the wire; while one runs and no flags are loaded, `$metric` events wait in the queue. */
+  private flagLoadsInFlight = 0;
+  /** stop() ran: this client must not touch the persisted queue from late callbacks. */
+  private stopped = false;
+  /** Bumped by identify() and reset(); a deferred `$metric` replay uses it to notice an identity change. */
+  private identityEpoch = 0;
+  /** The evaluation scheduled by the constructor has not finished yet (only when `loadFeatureFlags` is not false). */
+  private initialFlagsPending = false;
   private readonly flagListeners = new Set<
     (flags: Record<string, FlagResult>) => void
   >();
@@ -214,6 +267,12 @@ export class CohorlyClient {
   /** Resolves once persisted state (distinct id, super props, queued events)
    * has been loaded from storage. Tests can await this for determinism. */
   readonly ready: Promise<void>;
+  /** Custom metrics: `count`, `gauge`, `distribution`, aggregated into `$metric` events. */
+  readonly metrics: MetricsAggregator;
+  /** Resolves once the exception engine exists (after `ready`): captures
+   * made before it are replayed into it, and persisted exceptions from a
+   * previous launch have started sending. Tests can await this. */
+  readonly exceptionsReady: Promise<void>;
   /** True once hydrate() has loaded the persisted distinct_id/queues. */
   private hydrated = false;
   /**
@@ -225,6 +284,19 @@ export class CohorlyClient {
    * reset(), which cleared and persisted them itself).
    */
   private preReadyIdentityOp: "identify" | "reset" | null = null;
+  /** The constructor's distinct id: the anonymous id of a fresh install until hydrate() persists it. */
+  private readonly transientId: string;
+  /**
+   * Identity of each epoch an identify()/reset() opened before hydrate()
+   * finished, for exceptions captured in it (see identityAtCapture()).
+   * `deviceId` undefined: the device of the epoch before (identify keeps it).
+   */
+  private readonly preReadyEpochs = new Map<
+    number,
+    { distinctId: string; anonymous: boolean; deviceId?: string }
+  >();
+  /** Identity of epoch 0 (before any identify()/reset()), resolved by hydrate() from storage. */
+  private epochZero: Identity | undefined;
   /**
    * /alias source deferred by a pre-ready identify(): the outgoing distinct
    * id captured at call time may still be the transient constructor uuid,
@@ -232,14 +304,33 @@ export class CohorlyClient {
    * stored snapshot resolves with one.
    */
   private pendingAliasFrom: string | undefined;
+  /** `CohorlyReactNative` native module, for `configureNativeCrashes`. */
+  // biome-ignore lint/suspicious/noExplicitAny: untyped native bridge module.
+  private nativeModule: any;
+  private readonly nativeCrashReporting: boolean | undefined;
+  /** Release/dist for the native crash config, known once `ready` resolved. */
+  private nativeCrashRelease: { release?: string; dist?: string } | undefined;
+  /**
+   * The one release/dist this client runs (resolveRelease() + options.dist ??
+   * downloaded update id), computed once after `ready`. Stamped as
+   * `$release`/`$release_dist` on every event and handed to the exception
+   * engine and the native crash config, so the shared release key and
+   * `$exception_release` can never disagree. Undefined before `ready`: events
+   * go out without the key rather than with a guess.
+   */
+  private releaseDefaults: { release?: string; dist?: string } | undefined;
 
   constructor(options: CohorlyOptions) {
+    // Before reading globalThis.fetch: a previous client's fetch wrapper
+    // must not become this client's transport.
+    if (options.captureExceptions) teardownExceptionCapture();
     this.apiHost = (options.apiHost ?? DEFAULT_API_HOST).replace(/\/$/, "");
     this.storage = options.storage ?? new InMemoryStorage();
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     this.flushInterval = options.flushInterval ?? DEFAULT_FLUSH_INTERVAL;
     this.flushAt = options.flushAt ?? DEFAULT_FLUSH_AT;
     this.disabled = options.disabled ?? false;
+    this.captureExceptionsEnabled = options.captureExceptions !== false;
     this.token = options.token;
     this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
@@ -250,13 +341,24 @@ export class CohorlyClient {
     this.flagCacheTtlMs = normalizeFlagCacheTtlMs(options.flagCacheTtlMs);
     this.effectiveBatchSize = this.flushAt;
     this.distinctId = uuid();
+    this.transientId = this.distinctId;
     // Transient until hydrate() resolves the persisted/derived value.
     this.deviceId = this.distinctId;
 
     const mods = loadNativeModules();
+    try {
+      this.nativeModule = mods.rn?.NativeModules?.CohorlyReactNative;
+    } catch {
+      this.nativeModule = undefined;
+    }
+    this.nativeCrashReporting = options.nativeCrashReporting;
+    // The native config follows isExceptionCaptureEnabled(): re-sent on
+    // every change (hydration turning it on, optOutTracking/optInTracking).
+    this.captureListeners.add(() => this.syncNativeCrashConfig());
     const derived = deriveDeviceInfo(mods);
     this.appVersion = options.appVersion ?? derived.appVersion;
     this.appBuild = options.appBuild ?? derived.appBuild;
+    this.bundleId = derived.bundleId;
     this.platformInfo = mergePlatformInfo(derived.platformInfo, options.platformInfo);
     this.wifi = this.platformInfo.wifi;
     if (this.wifi === undefined) {
@@ -273,6 +375,7 @@ export class CohorlyClient {
     const nativeReady = fetchNativeDeviceInfo(mods.rn).then((native) => {
       this.appVersion = options.appVersion ?? native.appVersion ?? derived.appVersion;
       this.appBuild = options.appBuild ?? native.appBuild ?? derived.appBuild;
+      this.bundleId = derived.bundleId ?? native.bundleId;
       const withNative = mergePlatformInfo(derived.platformInfo, native.platformInfo);
       this.platformInfo = mergePlatformInfo(withNative, options.platformInfo);
       if (this.platformInfo.wifi !== undefined) this.wifi = this.platformInfo.wifi;
@@ -284,11 +387,207 @@ export class CohorlyClient {
     // never rejects. `ready` deliberately does NOT await it: callers must be
     // able to track immediately, offline, without waiting on a flags request.
     const loadFlags = options.loadFeatureFlags !== false;
+    this.initialFlagsPending = loadFlags;
+    const expoUpdates = readExpoUpdates(mods.expoUpdates);
     this.ready = Promise.all([this.hydrate(), nativeReady]).then(() => {
-      if (loadFlags) void this.reloadFeatureFlags();
+      // The release is fixed here, before `ready` resolves, so every event
+      // tracked after `await ready` carries it.
+      this.resolveReleaseDefaults(options, expoUpdates.dist);
+      if (loadFlags) {
+        void this.reloadFeatureFlags().finally(() => {
+          this.initialFlagsPending = false;
+        });
+      }
     });
+    // A failed hydration never schedules the evaluation: nothing to wait for.
+    this.ready.catch(() => {
+      this.initialFlagsPending = false;
+    });
+
+    this.metrics = new MetricsAggregator(
+      {
+        trackAt: (event, props, time) => this.trackAt(event, props, time),
+        onFeatureFlags: (cb) => this.onFeatureFlags(cb),
+        areFeatureFlagsLoaded: () => this.areFeatureFlagsLoaded(),
+        onDisabled: () => this.dropQueuedMetrics(),
+        log: () => {},
+      },
+      options.metrics,
+    );
+
+    this.exceptions = new ExceptionEngine({
+      apiHost: this.apiHost,
+      token: this.token,
+      lib: LIB_NAME,
+      storage: this.storage,
+      send: (path, body) => this.send(path, body),
+      toCoreError: (err) =>
+        err instanceof TransportError ? new CoreTransportError(err.status, err.retryAfterMs) : err,
+      isDisabled: () => this.disabled,
+      identity: () => this.currentIdentity(),
+      identityAtCapture: () => this.identityAtCapture(),
+      eventProperties: () => ({ ...this.getDeviceDefaultProperties(), ...this.superProps }),
+    });
+    // release/dist are construction options of the engine, so it is built
+    // once the version from the native module is known.
+    this.exceptionsReady = this.ready
+      .catch(() => {})
+      .then(() =>
+        this.exceptions.start({
+          ...this.resolveReleaseDefaults(options, expoUpdates.dist),
+          appVersion: this.appVersion,
+          beforeSendException: options.beforeSendException,
+          maxExceptionQueueSize: options.maxExceptionQueueSize,
+          captureExceptions: this.captureExceptionsEnabled,
+          properties: expoUpdates.properties,
+        }),
+      );
+    // Native crash config for the next launch, once identity and release are known.
+    void this.ready
+      .catch(() => {})
+      .then(() => {
+        this.nativeCrashRelease = { ...this.resolveReleaseDefaults(options, expoUpdates.dist) };
+        this.syncNativeCrashConfig();
+      });
+    if (options.captureExceptions) {
+      this.teardownCapture = setupExceptionCapture({
+        apiHost: this.apiHost,
+        appState: this.appStateModule,
+        addBreadcrumb: (crumb) => this.addBreadcrumb(crumb),
+        onUnhandledRejection: (reason) =>
+          this.captureList(() => buildReactNativeRejectionList(reason, this.platformInfo.os), {
+            level: "error",
+          }),
+        onGlobalError: async (error, isFatal) => {
+          this.captureException(error, {
+            level: isFatal ? "fatal" : "error",
+            mechanism: { type: "onerror", handled: false },
+          });
+          await this.exceptions.started;
+          // The persisted copy is the guarantee; this send is a bonus that
+          // may not finish before the app dies (the server dedups retries).
+          if (isFatal) this.exceptions.flushFatal();
+          await this.exceptions.storage.persisted();
+        },
+      });
+    }
+
     this.startTimer();
     watchAppState(this.appStateModule, (state) => this.handleAppStateChange(state));
+  }
+
+  /**
+   * Queues a `$exception` event for anything thrown: the error and its
+   * `cause` chain with frames parsed from the Hermes/JSC stack, the current
+   * breadcrumbs, the release, and the same default and super properties as
+   * track(). Before the client is ready it is held in memory and queued
+   * once it is. Never throws.
+   */
+  captureException(error: unknown, options: CaptureExceptionOptions = {}): void {
+    this.captureList(
+      () =>
+        buildReactNativeExceptionList(
+          error,
+          {
+            handled: options.mechanism?.handled ?? true,
+            type: options.mechanism?.type ?? "generic",
+          },
+          this.platformInfo.os,
+        ),
+      options,
+    );
+  }
+
+  /** The single path of every exception: opt-out, the local rate limit, then the engine. */
+  private captureList(
+    build: () => ExceptionListEntry[],
+    options: CaptureExceptionOptions,
+  ): void {
+    try {
+      // Not isExceptionCaptureEnabled(): that is false until hydration, and a
+      // capture made before it must still be held (the engine drops it if the
+      // persisted flag then says opted out).
+      if (this.optedOut || !this.captureExceptionsEnabled) return;
+      const list = build();
+      // A render loop or a timer throwing every frame must not fill the queue.
+      if (!this.exceptionRateLimiter.allow(list)) return;
+      this.exceptions.capture(list, options);
+    } catch {
+      // Capturing must never become a second error.
+    }
+  }
+
+  private currentIdentity(): Identity {
+    return {
+      distinctId: this.distinctId,
+      deviceId: this.deviceId,
+      ...(this.anonymous ? {} : { userId: this.distinctId }),
+    };
+  }
+
+  /**
+   * The identity an exception captured now belongs to, resolved when the
+   * engine replays it. Before hydration the current fields are not the
+   * persisted identity yet, so the capture keeps its identity epoch instead:
+   * an identify() made during the hydration must not claim an error captured
+   * before it.
+   */
+  private identityAtCapture(): () => Identity {
+    if (this.hydrated) {
+      const identity = this.currentIdentity();
+      return () => identity;
+    }
+    const epoch = this.identityEpoch;
+    return () => this.identityOfEpoch(epoch);
+  }
+
+  private identityOfEpoch(epoch: number): Identity {
+    const zero = this.epochZero;
+    // The hydration failed: nothing better than the identity in memory.
+    if (!zero) return this.currentIdentity();
+    if (epoch === 0) return zero;
+    const record = this.preReadyEpochs.get(epoch);
+    if (!record) return this.currentIdentity();
+    let deviceId: string | undefined;
+    for (let e = epoch; e > 0 && deviceId === undefined; e--) {
+      deviceId = this.preReadyEpochs.get(e)?.deviceId;
+    }
+    return {
+      distinctId: record.distinctId,
+      deviceId: deviceId ?? zero.deviceId,
+      ...(record.anonymous ? {} : { userId: record.distinctId }),
+    };
+  }
+
+  /** Records a breadcrumb; the last 50 travel with every exception. Never throws. */
+  addBreadcrumb(crumb: BreadcrumbInput): void {
+    try {
+      if (this.optedOut) return;
+      this.exceptions.addBreadcrumb(crumb);
+    } catch {
+      // Same contract as captureException().
+    }
+  }
+
+  /** Memoized: the first caller after `ready` fixes the release for the
+   * client's lifetime (see `releaseDefaults`). */
+  private resolveReleaseDefaults(
+    options: Pick<CohorlyOptions, "release" | "dist">,
+    updateDist: string | undefined,
+  ): { release?: string; dist?: string } {
+    if (!this.releaseDefaults) {
+      this.releaseDefaults = {
+        release: resolveRelease({
+          explicit: options.release,
+          bundleId: this.bundleId,
+          version: this.appVersion,
+          build: this.appBuild,
+          os: this.platformInfo.os,
+        }),
+        dist: options.dist ?? updateDist,
+      };
+    }
+    return this.releaseDefaults;
   }
 
   /** Merges device/app default properties into every tracked event, on top
@@ -307,6 +606,11 @@ export class CohorlyClient {
     if (this.wifi !== undefined) props.$wifi = this.wifi;
     if (this.appVersion !== undefined) props.$app_version_string = this.appVersion;
     if (this.appBuild !== undefined) props.$app_build_number = this.appBuild;
+    // Shared release key (ADR-0019 Limits, amendment 2026-11-14): absent
+    // until `ready`, `$release_dist` absent for the embedded bundle.
+    const rel = this.releaseDefaults;
+    if (rel?.release !== undefined) props.$release = rel.release;
+    if (rel?.dist !== undefined) props.$release_dist = rel.dist;
     return props;
   }
 
@@ -360,6 +664,7 @@ export class CohorlyClient {
             $ae_total_app_session_length: lengthSec,
           });
         }
+        this.metrics.flush();
         this.maybeFlush();
       };
       if (this.hydrated) finish();
@@ -396,6 +701,7 @@ export class CohorlyClient {
   }
 
   private async hydrate(): Promise<void> {
+    const epochAtRead = this.optOutEpoch;
     const [
       storedId,
       storedAnon,
@@ -404,6 +710,7 @@ export class CohorlyClient {
       storedQueue,
       storedEngageQueue,
       storedFlags,
+      storedOptOut,
     ] = await Promise.all([
       this.storage.getItem(KEYS.distinctId),
       this.storage.getItem(KEYS.anonymous),
@@ -412,7 +719,29 @@ export class CohorlyClient {
       this.storage.getItem(KEYS.queue),
       this.storage.getItem(KEYS.engageQueue),
       this.storage.getItem(KEYS.flags),
+      this.storage.getItem(KEYS.optOut),
     ]);
+
+    // The identity before any identify()/reset(), for exceptions captured
+    // before hydration in that epoch. A fresh install keeps the constructor's
+    // anonymous id, and so does its device id even when an identify() came
+    // first (identify() keeps the device).
+    const epochZeroId = storedId || this.transientId;
+    const epochZeroAnonymous = storedId ? storedAnon !== "0" : true;
+    const resolvedDevice =
+      storedDevice || (epochZeroAnonymous ? epochZeroId : uuid());
+    this.epochZero = {
+      distinctId: epochZeroId,
+      deviceId: resolvedDevice,
+      ...(epochZeroAnonymous ? {} : { userId: epochZeroId }),
+    };
+
+    // Opt-out first, before any decision to send (deferred alias, flush,
+    // flags). A call made while the reads above were in flight wins.
+    if (!this.optOutTouched) this.optedOut = storedOptOut === "1";
+    this.optOutResolved = true;
+    if (this.optedOut) this.exceptions.setOptedOut(true);
+    this.emitCaptureChange();
 
     // An identity switch that ran while the reads above were in flight wins
     // over this snapshot: identify()/reset() already applied and persisted
@@ -455,7 +784,7 @@ export class CohorlyClient {
             ? storedId
             : null
           : pending;
-      if (aliasFrom !== null && !this.disabled) {
+      if (aliasFrom !== null && !this.disabled && !this.optedOut) {
         this.sendIdentifyAlias(aliasFrom, this.distinctId);
       }
     }
@@ -464,13 +793,11 @@ export class CohorlyClient {
       // Device id: persisted separately so it survives identify(). A fresh
       // or migrating anonymous install reuses the anon distinct id
       // (Mixpanel's `$device:<uuid>` convention); an identified install
-      // (anonymous flag "0") mints a fresh one.
-      if (storedDevice) {
-        this.deviceId = storedDevice;
-      } else {
-        this.deviceId = this.anonymous ? this.distinctId : uuid();
-        await this.storage.setItem(KEYS.deviceId, this.deviceId);
-      }
+      // (anonymous flag "0") mints a fresh one. Resolved from the stored
+      // snapshot above, not from the current identity: a pre-ready
+      // identify() keeps the device of the identity it replaced.
+      this.deviceId = resolvedDevice;
+      if (!storedDevice) await this.storage.setItem(KEYS.deviceId, this.deviceId);
       if (storedSuper) {
         try {
           this.superProps = JSON.parse(storedSuper);
@@ -478,7 +805,10 @@ export class CohorlyClient {
           this.superProps = {};
         }
       }
-      if (storedQueue) {
+      // An opt-out while the reads were in flight discarded these queues:
+      // the snapshot is stale even if an opt-in followed.
+      const discarded = this.optOutEpoch !== epochAtRead;
+      if (storedQueue && !discarded) {
         try {
           this.queue = JSON.parse(storedQueue);
         } catch {
@@ -487,7 +817,7 @@ export class CohorlyClient {
         // Enforce the persisted cap on load in case a larger queue was stored.
         if (this.enforceQueueCap()) this.persistQueue();
       }
-      if (storedEngageQueue) {
+      if (storedEngageQueue && !discarded) {
         try {
           this.engageQueue = JSON.parse(storedEngageQueue);
         } catch {
@@ -495,6 +825,10 @@ export class CohorlyClient {
         }
       }
     }
+
+    // Opted out (flag applied above): whatever a crash left in the queues
+    // was just restored from storage and must not ship.
+    if (this.optedOut) this.discardPendingData();
 
     // Flags evaluated for an identity other than the one resolved above
     // (e.g. a reload that completed against the transient constructor id
@@ -584,12 +918,47 @@ export class CohorlyClient {
     t.unref?.();
   }
 
-  /** Stops the auto-flush timer. Useful for tests and clean shutdown. */
+  /**
+   * Writes the native crash reporter's config (read on the NEXT launch, see
+   * `nativeCrashReporting`): `enabled` is `nativeCrashReporting` and
+   * isExceptionCaptureEnabled(), with the current identity. Runs once the
+   * client is ready, after identify()/reset(), and on every
+   * onExceptionCaptureChange. Never before the persisted opt-out was read, so
+   * the transient `false` of isExceptionCaptureEnabled() at startup is never
+   * written. A no-op without the native module.
+   * @internal
+   */
+  syncNativeCrashConfig(): void {
+    if (!this.nativeCrashRelease || !this.optOutResolved) return;
+    writeNativeCrashConfig(
+      this.nativeModule,
+      buildNativeCrashConfig({
+        // `disabled` means no network at all, and the native reporter sends
+        // on its own: it stays off.
+        nativeCrashReporting: this.nativeCrashReporting && !this.disabled,
+        captureEnabled: this.isExceptionCaptureEnabled(),
+        release: this.nativeCrashRelease.release,
+        dist: this.nativeCrashRelease.dist,
+        distinctId: this.distinctId,
+        deviceId: this.deviceId,
+        build: this.appBuild,
+      }),
+    );
+  }
+
+  /** Stops the auto-flush timer and removes the `captureExceptions`
+   * handlers (restoring the previous ones while ours are still installed).
+   * Useful for tests and clean shutdown. */
   stop(): void {
+    this.metrics.flush();
+    this.stopped = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.teardownCapture?.();
+    this.teardownCapture = undefined;
+    this.exceptions.retire();
   }
 
   private persistQueue(): void {
@@ -651,7 +1020,88 @@ export class CohorlyClient {
     return { $duration: durationSec };
   }
 
+  /**
+   * Stop collecting on this device: persisted (survives a restart), drops
+   * every queued event, people operation and exception, and until
+   * optInTracking() no track, people, alias or `$exception` is queued or sent.
+   */
+  optOutTracking(): void {
+    this.optedOut = true;
+    this.optOutTouched = true;
+    this.optOutEpoch += 1;
+    void this.storage.setItem(KEYS.optOut, "1");
+    this.discardPendingData();
+    this.metrics.discard();
+    this.exceptions.setOptedOut(true);
+    this.emitCaptureChange();
+  }
+
+  /** Resume collecting after optOutTracking(). Discarded data is not restored. */
+  optInTracking(): void {
+    this.optedOut = false;
+    this.optOutTouched = true;
+    void this.storage.removeItem(KEYS.optOut);
+    // Samples recorded while opted out are not sent after opting back in.
+    this.metrics.discard();
+    this.exceptions.setOptedOut(false);
+    this.emitCaptureChange();
+  }
+
+  hasOptedOutTracking(): boolean {
+    return this.optedOut;
+  }
+
+  /**
+   * Whether an exception captured now would be recorded: the persisted
+   * opt-out was read and says "in", and `captureExceptions` is not `false`.
+   * `false` until the hydration of the persisted state finishes, so a device
+   * with a saved opt-out never reads `true` at startup. Pass it as `enabled`
+   * to a native crash reporter, and re-send that configuration whenever it
+   * changes (see onExceptionCaptureChange()).
+   */
+  isExceptionCaptureEnabled(): boolean {
+    return this.optOutResolved && !this.optedOut && this.captureExceptionsEnabled;
+  }
+
+  /**
+   * Calls `listener(enabled)` whenever the value of
+   * isExceptionCaptureEnabled() changes: when the hydration finishes (only if
+   * it turns `true`), and on optOutTracking() / optInTracking() (only if they
+   * flip it). It is not called with the current value on subscribe. A native
+   * crash reporter configured from isExceptionCaptureEnabled() must be
+   * reconfigured (enabled or disabled) from this listener, or a crash after
+   * an opt-out would still be reported by the native side. A throwing
+   * listener is contained. Returns the unsubscribe.
+   */
+  onExceptionCaptureChange(listener: (enabled: boolean) => void): () => void {
+    this.captureListeners.add(listener);
+    return () => {
+      this.captureListeners.delete(listener);
+    };
+  }
+
+  private emitCaptureChange(): void {
+    const enabled = this.isExceptionCaptureEnabled();
+    if (enabled === this.lastCaptureEnabled) return;
+    this.lastCaptureEnabled = enabled;
+    for (const listener of [...this.captureListeners]) {
+      try {
+        listener(enabled);
+      } catch {
+        // A throwing listener must not break the opt-out.
+      }
+    }
+  }
+
+  private discardPendingData(): void {
+    this.queue = [];
+    this.engageQueue = [];
+    this.persistQueue();
+    this.persistEngageQueue();
+  }
+
   track(event: string, properties: Properties = {}): void {
+    if (this.optedOut) return;
     const props: TrackEvent["properties"] = {
       ...this.getDeviceDefaultProperties(),
       ...this.consumeTimedEvent(event),
@@ -679,6 +1129,68 @@ export class CohorlyClient {
   }
 
   /**
+   * Like track() but stamps `time` instead of Date.now(), never consumes a
+   * timed event, and drops `metric_*` super props the event did not set. Used
+   * for aggregated events (`$metric`) that describe a past window.
+   */
+  private trackAt(event: string, properties: Properties, time: number): void {
+    // Before the hydration the identity is the constructor's transient one and
+    // the persisted queue has not been merged in: build the event afterwards.
+    if (!this.hydrated) {
+      const epoch = this.identityEpoch;
+      void this.ready.then(
+        () => {
+          // The window was taken before this client knew its own state: it is
+          // dropped when the kill switch loaded off, the client stopped, or the
+          // identity changed meanwhile (the samples cannot be attributed).
+          if (this.stopped || !this.metrics.isEnabled() || this.identityEpoch !== epoch) return;
+          this.trackAt(event, properties, time);
+        },
+        () => {},
+      );
+      return;
+    }
+    if (this.optedOut) return;
+    const props: TrackEvent["properties"] = {
+      ...this.getDeviceDefaultProperties(),
+      ...this.superProps,
+      ...properties,
+      distinct_id: this.distinctId,
+      time,
+      $insert_id: uuid(),
+      $lib: LIB_NAME,
+      ...(this.token !== undefined ? { token: this.token } : {}),
+    };
+    for (const key of Object.keys(props)) {
+      if (key.startsWith("metric_") && !(key in properties)) delete props[key];
+    }
+    if (props.$device_id === undefined) props.$device_id = this.deviceId;
+    if (!this.anonymous && props.$user_id === undefined) {
+      props.$user_id = this.distinctId;
+    }
+    this.queue.push({ event, properties: props });
+    this.enforceQueueCap();
+    this.persistQueue();
+    // No size-triggered flush: a window is queued by metrics.flush() right
+    // before the caller's own flush (background, stop), and an auto flush
+    // here would take the in-flight slot with only part of the window.
+  }
+
+  /** `$metric` events wait for the kill switch while flags are loading and none are loaded yet. */
+  private metricsHeld(): boolean {
+    return !this.flagsLoaded && (this.flagLoadsInFlight > 0 || this.initialFlagsPending);
+  }
+
+  private dropQueuedMetrics(): void {
+    // A stopped client no longer owns the persisted queue (a replacement
+    // client may have written to it since).
+    if (this.stopped) return;
+    if (!this.queue.some((evt) => evt.event === METRIC_EVENT)) return;
+    this.queue = this.queue.filter((evt) => evt.event !== METRIC_EVENT);
+    this.persistQueue();
+  }
+
+  /**
    * Switches identity to `distinctId`. No-op when it already is the current
    * id. The switch is applied synchronously, before any network call.
    *
@@ -692,10 +1204,16 @@ export class CohorlyClient {
    */
   identify(distinctId: string): void {
     if (distinctId === this.distinctId) return;
+    // Samples were taken as the outgoing identity.
+    this.metrics.flush();
+    this.identityEpoch += 1;
     const previousId = this.distinctId;
     const wasAnonymous = this.anonymous;
     this.distinctId = distinctId;
     this.anonymous = false;
+    if (!this.hydrated) {
+      this.preReadyEpochs.set(this.identityEpoch, { distinctId, anonymous: false });
+    }
     // Marker for hydrate(): if its storage reads are still in flight, the
     // snapshot they resolve with is stale and must not restore identity.
     // An earlier reset() wins - it cleared more than an identify() does.
@@ -711,9 +1229,10 @@ export class CohorlyClient {
     this.exposedFlags.clear();
     void this.storage.removeItem(KEYS.flags);
     void this.reloadFeatureFlags();
+    this.syncNativeCrashConfig();
     // `disabled` is enforced in doFlush() for the queued paths; this post
     // does not go through the queue, so it has to check for itself.
-    if (!wasAnonymous || this.disabled) return;
+    if (!wasAnonymous || this.disabled || this.optedOut) return;
     if (!this.hydrated) {
       // The outgoing id may still be the transient constructor uuid while
       // hydrate() reads storage: the real anonymous predecessor is only
@@ -742,10 +1261,21 @@ export class CohorlyClient {
    * pending timed events, then assigns a fresh anonymous distinct id (and a
    * matching new device id). Mirrors mixpanel's `reset()`. */
   reset(): void {
+    // The queue is cleared below, so the pending window is dropped with it
+    // instead of being queued and erased, or attributed to the new identity.
+    this.metrics.discard();
+    this.identityEpoch += 1;
     this.distinctId = uuid();
     // New anon identity: the device id follows the fresh anon distinct id.
     this.deviceId = this.distinctId;
     this.anonymous = true;
+    if (!this.hydrated) {
+      this.preReadyEpochs.set(this.identityEpoch, {
+        distinctId: this.distinctId,
+        anonymous: true,
+        deviceId: this.deviceId,
+      });
+    }
     // Marker for hydrate(): everything it could restore from a stale
     // snapshot was just cleared and re-persisted, so it must skip all
     // identity-scoped restores.
@@ -757,6 +1287,9 @@ export class CohorlyClient {
     this.queue = [];
     this.engageQueue = [];
     this.timedEvents.clear();
+    // Breadcrumbs describe the outgoing identity's session; queued
+    // exceptions stay and still ship.
+    this.exceptions.clearBreadcrumbs();
     void this.storage.setItem(KEYS.distinctId, this.distinctId);
     void this.storage.setItem(KEYS.deviceId, this.deviceId);
     void this.storage.setItem(KEYS.anonymous, "1");
@@ -770,6 +1303,7 @@ export class CohorlyClient {
     this.exposedFlags.clear();
     void this.storage.removeItem(KEYS.flags);
     void this.reloadFeatureFlags();
+    this.syncNativeCrashConfig();
   }
 
   /**
@@ -780,50 +1314,60 @@ export class CohorlyClient {
    * (network, non-2xx, bad JSON) the stale cache is kept.
    */
   async reloadFeatureFlags(): Promise<void> {
-    if (this.disabled || !this.fetchImpl) return;
-    const requestedId = this.distinctId;
-    const seq = ++this.flagRequestSeq;
-
-    let parsed: unknown;
+    this.flagLoadsInFlight += 1;
     try {
-      const res = await this.fetchImpl(`${this.apiHost}/flags/evaluate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          distinct_id: requestedId,
-          ...(this.token !== undefined ? { token: this.token } : {}),
-        }),
-      });
-      if (!res.ok) return;
-      parsed = await res.json();
-    } catch {
-      // Swallowed by contract: a failed reload keeps the stale flag cache.
-      return;
-    }
+      // Opted out: no request (it would carry the distinct id); whatever is
+      // cached stays served.
+      // Before the hydration the in-memory opt-out is provisional: a saved
+      // opt-out must be read before a request carries the distinct id.
+      if (!this.optOutResolved) await this.ready.catch(() => {});
+      if (this.disabled || !this.fetchImpl || this.optedOut) return;
+      const requestedId = this.distinctId;
+      const seq = ++this.flagRequestSeq;
 
-    // Identity changed, or a newer reload started, while this request was in
-    // flight: these results are stale, discard them.
-    if (requestedId !== this.distinctId || seq !== this.flagRequestSeq) return;
-    const flags = (parsed as { flags?: unknown } | null | undefined)?.flags;
-    if (!flags || typeof flags !== "object") return;
+      let parsed: unknown;
+      try {
+        const res = await this.fetchImpl(`${this.apiHost}/flags/evaluate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            distinct_id: requestedId,
+            ...(this.token !== undefined ? { token: this.token } : {}),
+          }),
+        });
+        if (!res.ok) return;
+        parsed = await res.json();
+      } catch {
+        // Swallowed by contract: a failed reload keeps the stale flag cache.
+        return;
+      }
 
-    this.flags = flags as Record<string, FlagResult>;
-    this.flagsLoaded = true;
-    this.flagsSource = "network";
-    this.flagsPersistedAt = undefined;
-    this.flagsTtlMs = undefined;
-    this.flagsIdentity = requestedId;
-    if (this.flagPersistence !== "networkOnly") {
-      void this.storage.setItem(
-        KEYS.flags,
-        JSON.stringify({
-          distinct_id: requestedId,
-          flags: this.flags,
-          stored_at: Date.now(),
-        } satisfies FlagsCache),
-      );
+      // Identity changed, or a newer reload started, while this request was in
+      // flight: these results are stale, discard them.
+      if (requestedId !== this.distinctId || seq !== this.flagRequestSeq) return;
+      const flags = (parsed as { flags?: unknown } | null | undefined)?.flags;
+      if (!flags || typeof flags !== "object") return;
+
+      this.flags = flags as Record<string, FlagResult>;
+      this.flagsLoaded = true;
+      this.flagsSource = "network";
+      this.flagsPersistedAt = undefined;
+      this.flagsTtlMs = undefined;
+      this.flagsIdentity = requestedId;
+      if (this.flagPersistence !== "networkOnly") {
+        void this.storage.setItem(
+          KEYS.flags,
+          JSON.stringify({
+            distinct_id: requestedId,
+            flags: this.flags,
+            stored_at: Date.now(),
+          } satisfies FlagsCache),
+        );
+      }
+      this.emitFlags();
+    } finally {
+      this.flagLoadsInFlight -= 1;
     }
-    this.emitFlags();
   }
 
   /**
@@ -1020,6 +1564,7 @@ export class CohorlyClient {
   }
 
   private queueEngage(payload: EngagePayload): void {
+    if (this.optedOut) return;
     this.engageQueue.push(
       this.token !== undefined ? { ...payload, token: this.token } : payload,
     );
@@ -1055,7 +1600,7 @@ export class CohorlyClient {
 
   private flushPromise: Promise<void> | null = null;
 
-  /** Flushes queued events/engage payloads. Safe to call concurrently: if a
+  /** Flushes queued exceptions, then events/engage payloads. Safe to call concurrently: if a
    * flush is already in flight (e.g. triggered automatically by `track()`
    * reaching `flushAt` while a caller also calls `flush()` manually), later
    * callers await that same in-flight operation instead of racing it.
@@ -1084,34 +1629,57 @@ export class CohorlyClient {
   }
 
   private async doFlush(force: boolean): Promise<void> {
-    if (this.disabled) return;
+    if (this.disabled || this.optedOut) return;
+
+    // Exceptions first, on their own retry state (not the events' backoff).
+    // Like the core, events wait for the next flush when the exceptions could
+    // not be delivered (same endpoint, so most likely the same outage).
+    if (this.exceptions.isStarted && this.exceptions.storage.hasQueuedExceptions()) {
+      const delivered = await this.exceptions.flush(force);
+      if (!delivered) return;
+    }
+
     if (!force && Date.now() < this.backoffUntil) return;
 
-    if (this.queue.length > 0) {
-      const size = Math.max(1, this.effectiveBatchSize);
-      const batch = this.queue.slice(0, size);
-      this.queue = this.queue.slice(batch.length);
+    const size = Math.max(1, this.effectiveBatchSize);
+    const batch = (
+      this.metricsHeld()
+        ? this.queue.filter((evt) => evt.event !== METRIC_EVENT)
+        : this.queue
+    ).slice(0, size);
+    if (batch.length > 0) {
+      const epoch = this.optOutEpoch;
+      const sent = new Set(batch);
+      this.queue = this.queue.filter((evt) => !sent.has(evt));
       this.persistQueue();
       try {
         await this.send("/track", batch);
         // Success: clear failure state and backoff.
-        this.consecutiveFailures = 0;
-        this.backoffUntil = 0;
+        if (epoch === this.optOutEpoch) {
+          this.consecutiveFailures = 0;
+          this.backoffUntil = 0;
+        }
       } catch (err) {
-        this.handleFlushError(err, batch);
+        // Opted out while it was on the wire: the batch is not put back (nor
+        // persisted) and no backoff is carried over.
+        if (epoch === this.optOutEpoch && !this.optedOut) this.handleFlushError(err, batch);
         return; // stop; don't attempt engage while backing off.
       }
     }
 
+    if (this.optedOut) return;
     if (this.engageQueue.length > 0) {
       const batch = this.engageQueue;
+      const epoch = this.optOutEpoch;
       this.engageQueue = [];
       this.persistEngageQueue();
       try {
         await this.send("/engage", batch);
       } catch {
-        this.engageQueue = [...batch, ...this.engageQueue];
-        this.persistEngageQueue();
+        if (epoch === this.optOutEpoch && !this.optedOut) {
+          this.engageQueue = [...batch, ...this.engageQueue];
+          this.persistEngageQueue();
+        }
       }
     }
   }
@@ -1134,8 +1702,12 @@ export class CohorlyClient {
       return;
     }
 
-    // Re-queue at the front for the next attempt.
-    this.queue = [...batch, ...this.queue];
+    // Re-queue at the front for the next attempt. A kill switch that turned
+    // metrics off while the batch was on the wire must not get them back.
+    const requeue = this.metrics.isEnabled()
+      ? batch
+      : batch.filter((evt) => evt.event !== METRIC_EVENT);
+    this.queue = [...requeue, ...this.queue];
     this.persistQueue();
 
     if (status === 413) {
@@ -1165,11 +1737,19 @@ export class CohorlyClient {
     return Math.max(0, Math.round(capped + jitter));
   }
 
-  /** Trims the queue to `maxQueueSize`, dropping the OLDEST events. */
+  /**
+   * Trims the queue to `maxQueueSize`, dropping the OLDEST events; aggregated
+   * `$metric` events go first, so they never push product events out.
+   */
   private enforceQueueCap(): boolean {
     if (this.queue.length <= this.maxQueueSize) return false;
     const overflow = this.queue.length - this.maxQueueSize;
-    this.queue.splice(0, overflow);
+    const drop = new Set<number>();
+    for (let i = 0; i < this.queue.length && drop.size < overflow; i++) {
+      if (this.queue[i].event === METRIC_EVENT) drop.add(i);
+    }
+    for (let i = 0; drop.size < overflow; i++) drop.add(i);
+    this.queue = this.queue.filter((_, i) => !drop.has(i));
     return true;
   }
 

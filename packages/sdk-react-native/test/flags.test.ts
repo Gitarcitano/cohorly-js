@@ -743,13 +743,12 @@ describe("react-native flag persistence", () => {
     expect("$feature_flag_persisted_at" in fired[1].properties).toBe(false);
   });
 
-  it("drops a network result evaluated for the transient id and adopts the real identity's cache", async () => {
+  it("holds a reload fired before the hydration until the persisted identity (and opt-out) is read", async () => {
     // Hydration reads AsyncStorage asynchronously; a caller may fire
-    // reloadFeatureFlags() before `ready` resolves. That request is
-    // evaluated for the transient constructor uuid, not the persisted
-    // identity - its result must be discarded when the real distinct id
-    // resolves, and the persisted cache belonging to that identity adopted
-    // instead.
+    // reloadFeatureFlags() before `ready` resolves. That request waits for
+    // the hydration, so it is evaluated for the persisted identity and never
+    // for the transient constructor uuid (nor sent at all when the stored
+    // choice is an opt-out).
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     class GatedStorage extends FakeStorage {
@@ -762,29 +761,20 @@ describe("react-native flag persistence", () => {
     const storage = new GatedStorage();
     await storage.setItem("cohorly:distinct_id", "user-1");
     await storage.setItem("cohorly:anonymous", "0");
-    await storage.setItem(
-      "cohorly:flags",
-      JSON.stringify({
-        distinct_id: "user-1",
-        flags: { banner: { enabled: true, variant: "red", payload: null } },
-        stored_at: Date.now(),
-      }),
-    );
 
     const { fetchImpl, requests } = createFlagsFetch();
     const client = makeClient(fetchImpl, storage, {
       loadFeatureFlags: false,
     });
-    await client.reloadFeatureFlags(); // lands while hydrate() is gated
+    const reload = client.reloadFeatureFlags(); // fired while hydrate() is gated
+    await Promise.resolve();
+    expect(requestsTo(requests, "/flags/evaluate")).toEqual([]);
     release();
     await client.ready;
+    await reload;
     client.stop();
-    // The pre-ready request carried the transient constructor id, so its
-    // result never belongs to user-1.
-    expect(requestsTo(requests, "/flags/evaluate")[0].body.distinct_id).not.toBe(
-      "user-1",
-    );
-    expect(client.getFeatureFlag("banner")).toBe("red");
-    expect(client.getFeatureFlagDetails("banner").source).toBe("persistence");
+    const evaluated = requestsTo(requests, "/flags/evaluate");
+    expect(evaluated).toHaveLength(1);
+    expect(evaluated[0].body.distinct_id).toBe("user-1");
   });
 });

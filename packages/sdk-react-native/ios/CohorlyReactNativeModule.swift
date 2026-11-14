@@ -15,4 +15,11 @@ class CohorlyReactNativeModule: NSObject {
     ) {
         resolve(CohorlyDeviceInfo.asDictionary())
     }
+
+    /// Writes the native crash reporter config (`cohorly.crash.config`), see
+    /// `CohorlyNativeCrashes.configure(json:)`.
+    @objc(configureNativeCrashes:)
+    func configureNativeCrashes(_ json: String) {
+        CohorlyNativeCrashes.configure(json: json)
+    }
 }

@@ -45,13 +45,15 @@ export function parseRetryAfterMs(
 /**
  * Default transport: POST JSON via the global fetch (Node 18+). Throws a
  * {@link TransportError} on a non-2xx response (carrying status + parsed
- * Retry-After); network failures reject with the underlying fetch error.
+ * Retry-After); network failures and an aborted `signal` reject with the
+ * underlying fetch error.
  */
-export const fetchTransport: CohorlyTransport = async (url, body, headers) => {
+export const fetchTransport: CohorlyTransport = async (url, body, headers, signal) => {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
+    signal,
   });
   if (!res.ok) {
     throw new TransportError(

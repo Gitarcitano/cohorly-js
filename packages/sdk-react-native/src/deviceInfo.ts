@@ -32,6 +32,8 @@ export interface NativeModuleBag {
   expoApplication?: any;
   // biome-ignore lint/suspicious/noExplicitAny: untyped `expo-device` module.
   expoDevice?: any;
+  // biome-ignore lint/suspicious/noExplicitAny: untyped `expo-updates` module.
+  expoUpdates?: any;
 }
 
 /** Loads every optional module this package knows how to use, each guarded
@@ -66,6 +68,11 @@ export function loadNativeModules(): NativeModuleBag {
   } catch {
     // Optional module absent - field stays undefined.
   }
+  try {
+    bag.expoUpdates = unwrap(require("expo-updates"));
+  } catch {
+    // Optional module absent - field stays undefined.
+  }
   return bag;
 }
 
@@ -92,6 +99,8 @@ export function deriveDeviceInfo(mods: NativeModuleBag): {
   platformInfo: PlatformInfo;
   appVersion?: string;
   appBuild?: string;
+  /** Application id / bundle identifier, the prefix of the default release. */
+  bundleId?: string;
 } {
   const { rn, rnDeviceInfo, expoApplication, expoDevice } = mods;
   const Platform = rn?.Platform;
@@ -133,7 +142,11 @@ export function deriveDeviceInfo(mods: NativeModuleBag): {
     carrier,
   };
 
-  return { platformInfo, appVersion, appBuild };
+  const bundleId =
+    nonEmpty(safe(() => expoApplication?.applicationId)) ??
+    nonEmpty(safe(() => rnDeviceInfo?.getBundleId?.()));
+
+  return { platformInfo, appVersion, appBuild, ...(bundleId !== undefined ? { bundleId } : {}) };
 }
 
 /** Field-level merge: any explicitly-injected field wins over the derived
@@ -165,6 +178,8 @@ export function mergePlatformInfo(derived: PlatformInfo, injected: PlatformInfo 
 export async function fetchNativeDeviceInfo(rn: NativeModuleBag["rn"]): Promise<{
   appVersion?: string;
   appBuild?: string;
+  /** Only when the linked native module reports one (current versions do not). */
+  bundleId?: string;
   platformInfo: PlatformInfo;
 }> {
   try {
@@ -173,9 +188,11 @@ export async function fetchNativeDeviceInfo(rn: NativeModuleBag["rn"]): Promise<
     if (typeof native?.getDeviceInfo !== "function") return { platformInfo: {} };
     // biome-ignore lint/suspicious/noExplicitAny: untyped native bridge result.
     const info: any = await native.getDeviceInfo();
+    const bundleId = nonEmpty(info?.bundleId);
     return {
       appVersion: nonEmpty(info?.appVersion),
       appBuild: nonEmpty(info?.appBuild),
+      ...(bundleId !== undefined ? { bundleId } : {}),
       platformInfo: {
         model: nonEmpty(info?.model),
         manufacturer: nonEmpty(info?.manufacturer),

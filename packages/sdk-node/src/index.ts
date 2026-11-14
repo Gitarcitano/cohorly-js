@@ -16,8 +16,18 @@ export {
   TransportError,
 } from "./transport.js";
 export type {
+  Breadcrumb,
+  BreadcrumbInput,
+  ExceptionLevel,
+  ExceptionListEntry,
+  ExceptionMechanism,
+  ExceptionStackFrame,
+  ExceptionStacktrace,
+} from "@cohorly/core";
+export type {
   BatchEventInput,
   Callback,
+  CaptureExceptionOptions,
   CohorlyConfig,
   CohorlyFetcher,
   CohorlyFlags,
@@ -31,8 +41,10 @@ export type {
   FlagRule,
   FlagsCallback,
   FlagVariant,
+  FlushExceptionsOptions,
   Properties,
   TrackEvent,
+  WithCohorlyOptions,
 } from "./types.js";
 export { LIB_VERSION } from "./version.js";
 

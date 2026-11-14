@@ -1,5 +1,35 @@
 # @cohorly/web
 
+## 0.5.0
+
+### Minor Changes
+
+- 650c3c7: Custom metrics in the web SDK (VEL-1806). `cohorly.metrics.count()`, `gauge()`, `distribution()` and `flush()` send the same `$metric` events as `@cohorly/core`, and `init({ metrics: { flagKey } })` picks the kill switch flag (default `cohorly_metrics`). Unlike the rest of `cohorly`, `metrics` is a no-op before `init()` and never throws. The pending window is queued on `pagehide` and when the page becomes hidden, and sent by beacon when the queue allows it; what stays behind goes out on the next visit. `@cohorly/react`'s `useCohorly()` returns the same object, so it exposes `metrics` too.
+
+## 0.4.0
+
+### Minor Changes
+
+- 569f902: Privacy controls for error tracking (VEL-1774). `@cohorly/core`, `@cohorly/web` and `@cohorly/react-native`: `optOutTracking()`, `optInTracking()` and `hasOptedOutTracking()` (persisted; while opted out nothing is queued or sent, `$exception` included, no feature flag request is made, breadcrumbs are cleared, and queued data is dropped). `captureExceptions: false` turns exception capture off entirely, manual calls included; on web and React Native, omitting it keeps the previous behavior. If you passed `captureExceptions: false` explicitly to mean "no automatic capture", remove it: it now also blocks manual `captureException()`. `@cohorly/core` and `@cohorly/react-native` also expose `isExceptionCaptureEnabled()` (on React Native it is `false` until the persisted state is read, with `onExceptionCaptureChange()` to follow it; the module functions do not throw before `init()`). `@cohorly/node`: `captureExceptions: false` makes `captureException()` a no-op and skips the uncaught handlers. `@cohorly/react` inherits the new `useCohorly()` methods.
+- fde6f0d: `@cohorly/web`: `captureExceptions` now records `xhr` breadcrumbs for failed XMLHttpRequests, and sends an error once when a global handler and `captureException()` both report it within 1 second (same type, message and crashing frame; e.g. React 18 dev re-reporting a caught render error).
+- 757925b: Error tracking (ADR-0019). `@cohorly/core`: `captureException()`, `captureExceptionList()`, `addBreadcrumb()` and `flushExceptions()`, a separate persisted exception queue (fatal first, never evicted by ordinary events), Chrome/Firefox/Safari stack parsing, and the `release`, `dist`, `appVersion`, `beforeSendException` and `maxExceptionQueueSize` options. `@cohorly/web`: `captureExceptions` (global error and unhandled rejection handlers, automatic breadcrumbs, local rate limit, fatal exceptions sent through `sendBeacon` on `pagehide`), `captureException()`/`addBreadcrumb()` on the singleton, and `release` stamped as both `$exception_release` and `$app_version_string`. `@cohorly/react`: `<CohorlyErrorBoundary>`.
+
+### Patch Changes
+
+- 4860878: `$metric` events are held in the queue while a flag evaluation is in flight and no flags are loaded, so a window sent before the first flag set no longer escapes a disabled `cohorly_metrics`: a disabled flag drops them (new `MetricsHost.onDisabled` hook), an enabled or missing flag releases them, a failed evaluation releases them too. The client `@cohorly/web` creates also queues the pending metric window on `pagehide` and when the page becomes hidden (the web `cohorly` object does not expose `metrics` yet).
+- e56c8b4: `@cohorly/core`: the local exception rate limit (`ExceptionRateLimiter`, 10 per fingerprint per minute), the unhandled rejection builder (`buildRejectionList`, `UnhandledRejection` for non-Error reasons) and the React error boundary (`@cohorly/core/error-boundary`, `react` as an optional peer) now live in core and are shared by the client SDKs.
+
+  `@cohorly/react-native`: the same error is sent at most 10 times per minute, a promise rejected with something that is not an Error is reported as `UnhandledRejection` like on the web, and an exception captured before the stored identity was read keeps the identity of the moment it was captured (an `identify()` or `reset()` made during startup no longer claims it).
+
+  `@cohorly/web` and `@cohorly/react`: no behavior change; they use the shared implementations.
+
+- Updated dependencies [2b570a9]
+- Updated dependencies [4860878]
+- Updated dependencies [569f902]
+- Updated dependencies [757925b]
+- Updated dependencies [e56c8b4]
+  - @cohorly/core@0.4.0
+
 ## 0.3.0
 
 ### Minor Changes

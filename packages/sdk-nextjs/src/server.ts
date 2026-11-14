@@ -37,13 +37,14 @@ export interface CohorlyProxyOptions {
   apiHost?: string;
   /**
    * Upstream paths allowed to be forwarded. Defaults to
-   * track/engage/alias/flags/evaluate. Multi-segment paths (like
+   * track/engage/alias/flags/evaluate/replay. Multi-segment paths (like
    * `flags/evaluate`) are matched on their full slash-joined form.
    */
   allowedPaths?: string[];
   /**
    * Project token injected server-side into every forwarded /track event's
-   * properties and every /engage, /alias or /flags/evaluate body. Use this to
+   * properties and every /engage, /alias or /flags/evaluate body, and sent as
+   * the `X-Cohorly-Token` header of every /replay chunk. Use this to
    * keep the token out of client bundles instead of passing it to the client
    * SDK's `init`.
    */
@@ -63,7 +64,7 @@ const DEFAULT_API_HOST = "https://cohorly-service.velloalabs.com";
 export function createCohorlyProxy(options: CohorlyProxyOptions = {}): CohorlyProxyHandlers {
   const apiHost = (options.apiHost ?? DEFAULT_API_HOST).replace(/\/$/, "");
   const allowed = new Set(
-    options.allowedPaths ?? ["track", "engage", "alias", "flags/evaluate"],
+    options.allowedPaths ?? ["track", "engage", "alias", "flags/evaluate", "replay"],
   );
 
   async function POST(request: Request, context?: RouteContext): Promise<Response> {
@@ -80,17 +81,12 @@ export function createCohorlyProxy(options: CohorlyProxyOptions = {}): CohorlyPr
       });
     }
 
-    let body = await request.text();
-    if (options.token) {
-      body = injectToken(body, target, options.token);
-    }
     let upstream: Response;
     try {
-      upstream = await fetch(`${apiHost}/${target}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
-      });
+      upstream =
+        target === "replay"
+          ? await forwardReplay(request, `${apiHost}/${target}`, options.token)
+          : await forwardJson(request, `${apiHost}/${target}`, target, options.token);
     } catch {
       return new Response(JSON.stringify({ error: "cohorly upstream unreachable" }), {
         status: 502,
@@ -99,15 +95,60 @@ export function createCohorlyProxy(options: CohorlyProxyOptions = {}): CohorlyPr
     }
 
     const text = await upstream.text();
-    return new Response(text, {
-      status: upstream.status,
-      headers: {
-        "content-type": upstream.headers.get("content-type") ?? "application/json",
-      },
-    });
+    const headers: Record<string, string> = {
+      "content-type": upstream.headers.get("content-type") ?? "application/json",
+    };
+    // The SDK honors Retry-After on 429/5xx (replay quota, rate limits).
+    const retryAfter = upstream.headers.get("retry-after");
+    if (retryAfter !== null) headers["retry-after"] = retryAfter;
+    return new Response(text, { status: upstream.status, headers });
   }
 
   return { POST };
+}
+
+async function forwardJson(
+  request: Request,
+  url: string,
+  target: string,
+  token: string | undefined,
+): Promise<Response> {
+  let body = await request.text();
+  if (token) body = injectToken(body, target, token);
+  return fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+}
+
+/**
+ * A session replay chunk (`@cohorly/web` sessionReplay) is forwarded as
+ * bytes: it is usually gzip, so it is never decoded or rewritten here. The
+ * token and compression travel as headers or, for `keepalive` sends, as the
+ * `token` / `compression` query parameters; both are passed through. A
+ * server-side `token` is sent as the `X-Cohorly-Token` header.
+ */
+async function forwardReplay(
+  request: Request,
+  url: string,
+  token: string | undefined,
+): Promise<Response> {
+  const body = await request.arrayBuffer();
+  const headers: Record<string, string> = {};
+  for (const name of ["content-type", "content-encoding", "x-cohorly-token"]) {
+    const value = request.headers.get(name);
+    if (value !== null) headers[name] = value;
+  }
+  if (token) headers["x-cohorly-token"] = token;
+  const incoming = new URL(request.url).searchParams;
+  const query = new URLSearchParams();
+  for (const name of ["token", "compression"]) {
+    const value = incoming.get(name);
+    if (value !== null && !(name === "token" && token)) query.set(name, value);
+  }
+  const search = query.toString();
+  return fetch(search ? `${url}?${search}` : url, { method: "POST", headers, body });
 }
 
 /**

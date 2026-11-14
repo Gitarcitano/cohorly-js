@@ -56,7 +56,13 @@ await client.people.set({ name: "Ada Lovelace" });
 | `timeEvent` | `(event: string) => void` | Starts a timer; the next `track(event)` of the same name attaches `$duration` (seconds, 3 decimals) and clears it. Persisted across reloads. |
 | `clearTimedEvent` / `clearTimedEvents` | `(event) => void` / `() => void` | Cancel one / all pending timers. |
 | `people.set/setOnce/increment/unset/delete` | see `PeopleProperties` | Profile updates sent to `/engage`. `unset`/`delete` are destructive and refused by the server on the project token alone (see note below the table). |
-| `flush` | `(transportOverride?) => Promise<void>` | Manually flush the queue. |
+| `flush` | `(transportOverride?) => Promise<void>` | Manually flush: queued exceptions first (fatal first), then one batch of events. |
+| `captureException` | `(error: unknown, options?: CaptureExceptionOptions) => TrackedEvent \| null` | Queues a `$exception` event (ADR-0019 wire shape). `null` when `beforeSendException` dropped it. Never throws. |
+| `captureExceptionList` | `(list: ExceptionListEntry[], options?) => TrackedEvent \| null` | Same, for platform SDKs that build `$exception_list` themselves (synthetic exceptions, native crash reports). |
+| `optOutTracking` / `optInTracking` / `hasOptedOutTracking` | `() => void` / `() => void` / `() => boolean` | Opt-out is persisted in the injected storage and drops every queued event, people op and exception; while opted out nothing is queued or sent (track, people, alias, `$exception`) and `reloadFeatureFlags()` makes no request; breadcrumbs are cleared and ignored meanwhile. Opting back in does not restore what was dropped. |
+| `isExceptionCaptureEnabled` | `() => boolean` | `!hasOptedOutTracking() && captureExceptions !== false`. Pass it as `enabled` to a native crash reporter. |
+| `addBreadcrumb` | `(crumb: BreadcrumbInput) => void` | In-memory trail, last 50, copied onto every exception; cleared by `reset()`. |
+| `flushExceptions` | `(transport, { fatalOnly? }?) => Promise<void>` | Sends queued exceptions only, ignoring backoff and an in-flight flush. For teardown (e.g. `sendBeacon` on `pagehide`). |
 | `getDistinctId` / `getDeviceId` / `isAnonymous` / `getApiHost` | - | Accessors. |
 | `stop` | `() => void` | Stops the auto-flush timer. |
 
@@ -89,6 +95,32 @@ When `options.token` is set, it is:
 
 Omit it if you don't use per-project tokens.
 
+## Error tracking
+
+Options: `release` (`$exception_release`), `dist` (`$exception_dist`),
+`appVersion` (`$app_version_string` on every event unless passed),
+`beforeSendException` (return the event, a modified one, or `null` to drop;
+a throwing hook drops), `maxExceptionQueueSize` (default 50).
+
+`captureException(error, { level, fingerprint, title, tags, extra, mechanism,
+properties })` builds `$exception_list` from the error and its `cause` chain
+(outermost first, at most 5, cycle-safe), parsing `error.stack` (Chrome/V8,
+Firefox and Safari formats) into frames ordered oldest call first. Non-Error
+values become synthetic exceptions. `tags`/`extra` never override a reserved
+key (`$exception_*`, `error_title`, `distinct_id`, `time`, `$insert_id`,
+`$lib`, `token`, `$device_id`, `$user_id`). The helpers `parseStackTrace`,
+`buildExceptionList`, `createStackFrame` and `stringifyValue` are exported for
+platform SDKs.
+
+Exceptions live in their own persisted queue (`cohorly_exception_queue`):
+ordinary events never evict them; on overflow the oldest non-fatal exception
+is dropped first. Every flush sends exceptions first, fatal before non-fatal,
+in batches of the current batch size; if an exception batch fails, the event
+queue waits. Both queues share the retry contract and backoff below.
+`reset()` keeps queued exceptions and clears breadcrumbs.
+
+The `captureExceptions: false` option turns exception capture off: `captureException()` and `captureExceptionList()` queue nothing and return `null`, while ordinary events are unaffected (default `true`).
+
 ## Delivery and retries
 
 The client is built to never lose events. Non-2xx responses surface as a
@@ -113,6 +145,14 @@ size-triggered flushes are skipped; a manual `flush()` always forces an attempt.
 The persisted queue is bounded at `maxQueueSize` (default 1000). On overflow the
 **oldest** events are dropped (logged via `debug`). Both `maxQueueSize` and
 `maxRetryDelayMs` are optional `CohorlyClientOptions` fields.
+
+## Custom metrics
+
+`client.metrics.count|gauge|distribution(name, value, tagsOrOptions?)` aggregates
+samples in the client and sends one `$metric` event per metric name and tag
+combination per 60 second window (never one per sample). It is switched off
+remotely by deactivating the `cohorly_metrics` feature flag. `$metric` events
+count toward the event quota. Details in the docs: Core SDK, "Custom metrics".
 
 ## Testing
 

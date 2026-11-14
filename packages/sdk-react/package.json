@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/react",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "React bindings for Cohorly, hosted product analytics (Mixpanel-style). <CohorlyProvider> and useCohorly() on top of @cohorly/web.",
   "type": "module",
   "main": "dist/index.js",
@@ -14,7 +14,8 @@
   "sideEffects": false,
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -40,6 +41,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@cohorly/core": "workspace:*",
     "@cohorly/web": "workspace:*"
   },
   "peerDependencies": {
@@ -51,6 +53,6 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "typescript": "^5.7.2",
-    "vitest": "3.2.6"
+    "vitest": "4.1.11"
   }
 }

@@ -4,7 +4,7 @@ Server-side Node.js SDK for [Cohorly](https://github.com/Gitarcitano/cohorly-js)
 
 **Documentation:** [Node.js SDK reference](https://cohorly-docs.velloalabs.com/sdks/node) · [Quickstart](https://cohorly-docs.velloalabs.com/quickstart) · [HTTP API](https://cohorly-docs.velloalabs.com/api/ingestion)
 
-Requires Node 22+. Zero runtime dependencies.
+Requires Node 22+. One runtime dependency, `@cohorly/core`.
 
 ## Installation
 
@@ -82,6 +82,7 @@ const cohorly = Cohorly.init(token, {
   debug: false,                  // console.warn SDK activity
   maxQueueSize: 1000,            // in-memory queue cap (drop oldest)
   maxRetryDelayMs: 600000,       // retry backoff ceiling (10 min)
+  captureExceptions: true,       // false: captureException() sends nothing, no uncaught handlers
 });
 ```
 
@@ -137,6 +138,10 @@ cohorly.alias("user-13793", "anonymous-abc"); // POST /alias { alias, distinct_i
 - `people.append`, `people.union`, `people.track_charge`, `people.clear_charges` are not implemented - the Cohorly server has no `$append`/`$union`/revenue engage ops.
 - No `geolocate`/`ip` modifiers (the Cohorly server geo-enriches from the request IP), no `secret` (`import` uses the regular `/track` endpoint, which accepts any timestamp), no `protocol`/`keepAlive` knobs (`host` is a full base URL).
 - The project token travels as an `X-Cohorly-Token` header rather than inside the payload.
+
+## Error tracking
+
+`captureException(error, { distinctId, level, tags, extra })` sends a `$exception` event; `captureUncaught: true` also reports uncaught exceptions and unhandled rejections and then lets the process end as Node would. For serverless (Firebase / Cloud Functions, Cloud Run, Lambda), wrap handlers in `cohorly.withCohorly(handler)`: a failure is captured, flushed with a timeout (`flushTimeoutMs`, default 2000) and rethrown unchanged. Set `release` for crash-free users by release, and run Node with `--enable-source-maps` for `.ts` stack frames. Full guide: [Error tracking](https://cohorly-docs.velloalabs.com/sdks/node#error-tracking).
 
 ## Related packages
 

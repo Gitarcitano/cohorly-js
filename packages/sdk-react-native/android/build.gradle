@@ -37,7 +37,7 @@ repositories {
     mavenCentral()
     // Real (non-vendored) dependency on the Cohorly Android SDK, published via
     // JitPack from https://github.com/cohorly-io/cohorly-android (see that
-    // repo's tag v0.1.0 - confirmed built successfully on JitPack).
+    // repo's tag v0.3.0, which adds native crash reporting).
     maven { url 'https://jitpack.io' }
 }
 
@@ -45,5 +45,5 @@ dependencies {
     implementation 'com.facebook.react:react-native:+'
     // Brings AndroidDeviceInfo (app version/build/model/manufacturer/brand/
     // carrier reads) - transitively pulls cohorly-android-core.
-    implementation 'com.github.cohorly-io.cohorly-android:cohorly-android:v0.1.0'
+    implementation 'com.github.cohorly-io.cohorly-android:cohorly-android:v0.3.0'
 }

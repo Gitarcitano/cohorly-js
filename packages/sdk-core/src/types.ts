@@ -19,7 +19,7 @@ export interface EngageOp {
   $add?: Record<string, number>;
   /**
    * Destructive: the server refuses this op unless the request also carries an
-   * admin credential (superadmin key, or a Firebase token for an org owner) in
+   * admin credential (superadmin key, or an account token for an org owner) in
    * the Authorization header. Refused ops are skipped individually; the server
    * still answers HTTP 200 with `{ status: 0, ..., refused }`, so from a
    * client-only SDK this is a silent no-op.
@@ -118,6 +118,106 @@ export interface FlagDetails {
   ttlMs?: number;
 }
 
+/**
+ * Severity of an exception event (`$exception_level`). `"fatal"` means the
+ * app or page could not continue; it is the numerator of crash-free users.
+ */
+export type ExceptionLevel = "fatal" | "error" | "warning" | "info";
+
+/**
+ * How an exception was captured. `handled` is false for errors nothing in the
+ * app caught (global handlers); `synthetic` is true when the SDK built the
+ * exception itself because what was thrown was not an Error.
+ */
+export interface ExceptionMechanism {
+  handled: boolean;
+  type: string;
+  synthetic: boolean;
+}
+
+/**
+ * One stack frame of `$exception_list[].stacktrace.frames` (ADR-0019 "Event
+ * format", copied shape). JS SDKs fill `filename`/`abs_path`/`function`/
+ * `lineno`/`colno`; native SDKs fill `module` and the addresses.
+ */
+export interface ExceptionStackFrame {
+  platform: string;
+  filename?: string;
+  abs_path?: string;
+  function?: string;
+  module?: string;
+  lineno?: number;
+  colno?: number;
+  in_app: boolean;
+  instruction_addr?: string;
+  image_addr?: string;
+}
+
+/** Frames ordered oldest call first, crashing frame last. SDKs always send `"raw"`. */
+export interface ExceptionStacktrace {
+  type: "raw" | "resolved";
+  frames: ExceptionStackFrame[];
+}
+
+/**
+ * One entry of `$exception_list`: index 0 is the reported exception, the rest
+ * its cause chain, outermost first.
+ */
+export interface ExceptionListEntry {
+  type: string;
+  value: string;
+  mechanism: ExceptionMechanism;
+  stacktrace?: ExceptionStacktrace;
+}
+
+/** A trail entry sent with every exception as `$exception_breadcrumbs`. */
+export interface Breadcrumb {
+  /** ISO 8601. */
+  timestamp: string;
+  category: string;
+  message?: string;
+  level?: string;
+  data?: Record<string, unknown>;
+}
+
+/** What `addBreadcrumb()` takes: `timestamp` defaults to now. */
+export type BreadcrumbInput = Omit<Breadcrumb, "timestamp"> & {
+  timestamp?: string;
+};
+
+export interface CaptureExceptionOptions {
+  /** `$exception_level`. Defaults to `"error"`. */
+  level?: ExceptionLevel;
+  /**
+   * Client-side grouping override, sent as `$exception_fingerprint`. The
+   * server always derives the final fingerprint from it; it never stores
+   * this value as sent.
+   */
+  fingerprint?: string;
+  /** Sent as `error_title`: the display title, and a fingerprint prefix. */
+  title?: string;
+  /** Top-level properties; override `extra`, never a reserved key. */
+  tags?: Record<string, string | number | boolean>;
+  /** Top-level properties; never override a reserved key. */
+  extra?: Record<string, unknown>;
+  /**
+   * Mechanism of the reported exception. Defaults to
+   * `{ handled: true, type: "generic" }`.
+   */
+  mechanism?: { type?: string; handled?: boolean };
+  /**
+   * Properties a platform SDK adds the way `track()` does (`$os`,
+   * `$browser`, `$current_url`, ...). Applied below `extra` and `tags`.
+   */
+  properties?: Record<string, unknown>;
+}
+
+/** Options of `flushExceptions()`. */
+export interface FlushExceptionsOptions {
+  /** Send only `$exception_level: "fatal"` exceptions. */
+  fatalOnly?: boolean;
+}
+
 /** Storage abstraction injected by platform-specific SDKs (web/react-native/node). Synchronous. */
 export interface CohorlyStorage {
   get(key: string): string | null;
@@ -190,6 +290,63 @@ export interface CohorlyClientOptions {
    * non-finite values fall back to the default.
    */
   flagCacheTtlMs?: number;
+  /**
+   * Release the app is running, stamped as `$exception_release` on every
+   * exception (omitted when unset). Must be the release at crash time.
+   */
+  release?: string;
+  /**
+   * Distribution inside the release (OTA update id, build flavor), stamped
+   * as `$exception_dist` on every exception (omitted when unset).
+   */
+  dist?: string;
+  /**
+   * App version stamped as `$app_version_string` on EVERY event, exceptions
+   * included, unless the caller passed one. It is the denominator of
+   * crash-free users, so it should come from the same version source as
+   * `release`.
+   */
+  appVersion?: string;
+  /**
+   * Called with every fully built `$exception` event right before it is
+   * queued. Return the event (possibly modified, e.g. scrubbed of PII) to
+   * send it, or `null` to drop it. A hook that throws drops the exception:
+   * an exception is never sent unscrubbed.
+   */
+  beforeSendException?: (event: TrackedEvent) => TrackedEvent | null;
+  /**
+   * Capacity of the exception queue, separate from the event queue. On
+   * overflow the oldest non-fatal exception is dropped first. Defaults to 50.
+   */
+  maxExceptionQueueSize?: number;
+  /**
+   * Custom metrics (`client.metrics`). `flagKey` names the Cohorly feature
+   * flag used as the remote kill switch (default `cohorly_metrics`).
+   * `windowMs` and `maxSeries` exist for tests and tuning only: another
+   * `windowMs` changes `metric_window_ms`, and the "1-minute" wording and the
+   * cost estimate in the docs no longer hold.
+   */
+  metrics?: CohorlyMetricsOptions;
+  /**
+   * Set to `false` to turn exception capture off: `captureException()` and
+   * `captureExceptionList()` queue nothing and return `null`. Ordinary events
+   * are unaffected. Defaults to `true`.
+   */
+  captureExceptions?: boolean;
+  /**
+   * Called each time an event is built (every `track()`, internal events
+   * such as `$feature_flag_called` and `$metric`, and `$exception`). Its keys
+   * are stamped on the event unless the caller passed them. Used by platform
+   * SDKs for per-event state such as the web `$session_id`. Receives the
+   * event name. A hook that throws is ignored.
+   */
+  eventProperties?: (event: string) => Record<string, unknown>;
+}
+
+export interface CohorlyMetricsOptions {
+  flagKey?: string;
+  windowMs?: number;
+  maxSeries?: number;
 }
 
 export interface PeopleProperties {

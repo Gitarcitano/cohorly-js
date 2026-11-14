@@ -1,3 +1,5 @@
+import type { CohorlyMetricsOptions, TrackedEvent } from "@cohorly/core";
+
 export type Properties = Record<string, unknown>;
 
 /** Minimal AsyncStorage-compatible interface. Matches
@@ -102,6 +104,12 @@ export interface CohorlyOptions {
    */
   loadFeatureFlags?: boolean;
   /**
+   * Custom metrics (`metrics.count/gauge/distribution`). `flagKey` names the
+   * feature flag used as the remote kill switch (default `cohorly_metrics`);
+   * `windowMs` and `maxSeries` exist for tests and tuning only.
+   */
+  metrics?: CohorlyMetricsOptions;
+  /**
    * Track a `$feature_flag_called` event the first time each flag key/value is
    * read via `getFeatureFlag()`/`isFeatureEnabled()`. Deduped in memory per
    * identity session (cleared on identify()/reset()). Default true.
@@ -125,6 +133,50 @@ export interface CohorlyOptions {
    * non-finite values fall back to the default.
    */
   flagCacheTtlMs?: number;
+  /**
+   * Error tracking switch, three states:
+   * - `true`: capture uncaught JS errors (`ErrorUtils` global handler: fatal
+   *   ones as `level: "fatal"`), unhandled promise rejections (Hermes), and
+   *   record AppState and failed-fetch breadcrumbs.
+   * - omitted: nothing global is touched; manual `captureException()` works.
+   * - `false`: nothing global, and no `$exception` is sent, not even from a
+   *   manual `captureException()`.
+   * `optOutTracking()` blocks exceptions whatever this says.
+   */
+  captureExceptions?: boolean;
+  /**
+   * Release stamped as `$exception_release`, used exactly as given. Defaults
+   * to `<bundleId>@<appVersion>+<appBuild>` (bundle id from
+   * `expo-application` or `react-native-device-info`, else the lowercase
+   * platform). Must equal the `--release` of `cohorly sourcemaps upload`.
+   */
+  release?: string;
+  /**
+   * Distribution inside the release, stamped as `$exception_dist`. Defaults
+   * to the running `expo-updates` update id when the bundle is a downloaded
+   * update (none for the embedded bundle). Must equal `--dist` of the upload.
+   */
+  dist?: string;
+  /**
+   * Called with every `$exception` event right before it is queued. Return
+   * it (possibly scrubbed) to send it, or `null` to drop it; a hook that
+   * throws drops the exception.
+   */
+  beforeSendException?: (event: TrackedEvent) => TrackedEvent | null;
+  /** Capacity of the persisted exception queue (separate from events). Default 50. */
+  maxExceptionQueueSize?: number;
+  /**
+   * Native crash reporting (iOS, ADR-0020): signals, Mach exceptions,
+   * NSExceptions and C++ exceptions recorded by KSCrash and sent by native
+   * code on the next launch, plus MetricKit diagnostics. Needs the config
+   * plugin (`["@cohorly/react-native", { projectToken, apiHost }]`). The
+   * choice is written for the NEXT launch: turning it on takes effect from
+   * the launch after the one that set it, and so does turning it off.
+   * `captureExceptions: false` keeps it off. Never enable it alongside
+   * another native crash handler (Sentry's `enableNativeCrashHandling`).
+   * Default false.
+   */
+  nativeCrashReporting?: boolean;
 }
 
 /**

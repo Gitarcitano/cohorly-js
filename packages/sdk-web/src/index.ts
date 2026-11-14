@@ -1,21 +1,38 @@
 import type {
+  BreadcrumbInput,
+  CaptureExceptionOptions,
+  ExceptionListEntry,
   FlagDetails,
   FlagPersistenceMode,
   FlagResult,
+  MetricOptions,
+  MetricTags,
   PeopleProperties,
+  TrackedEvent,
 } from "@cohorly/core";
-import { CohorlyClient, fetchTransport } from "@cohorly/core";
+import { buildExceptionList, CohorlyClient, fetchTransport } from "@cohorly/core";
 import { getAttributionProperties, initAttribution } from "./attribution.js";
 import type { AutocaptureConfig, AutocaptureOption } from "./autocapture.js";
 import { setupAutocapture } from "./autocapture.js";
 import { beaconTransport } from "./beacon.js";
 import { getDefaultProperties } from "./defaults.js";
+import type { ErrorSource } from "./exceptions.js";
+import {
+  allowException,
+  isCrossSourceDuplicate,
+  isGlobalRepeatInSameRun,
+  markExceptionQueued,
+  resetExceptionRateLimit,
+  setupExceptionCapture,
+} from "./exceptions.js";
 import {
   getPageviewProperties,
   PAGEVIEW_EVENT,
   setupPageviewAutotrack,
 } from "./pageview.js";
-import { localStorageAdapter } from "./storage.js";
+import type { ReplayController, SessionReplayOptions } from "./replay/session.js";
+import { replayWanted, startSessionReplay } from "./replay/session.js";
+import { localStorageAdapter, sessionStorageAdapter } from "./storage.js";
 
 export interface CohorlyWebOptions {
   /**
@@ -75,9 +92,72 @@ export interface CohorlyWebOptions {
   maxQueueSize?: number;
   /** Upper bound on retry backoff delay, in ms. Default 600000 (10 min). */
   maxRetryDelayMs?: number;
+  /**
+   * Error tracking switch, three states:
+   * - `true`: unhandled errors and promise rejections are captured as fatal
+   *   `$exception` events, with automatic breadcrumbs (navigation, clicks,
+   *   `console.error`, failed fetches and XHRs). An error with the same type,
+   *   message and crashing frame seen by a global handler and by
+   *   `captureException()` within 1 second is sent once (React 18 in dev
+   *   re-reports a caught render error to `window`; the global one is kept).
+   * - omitted: no global handlers; manual `captureException()` works.
+   * - `false`: no global handlers and no `$exception` leaves the page, not
+   *   even from a manual `captureException()`.
+   * Opting out with `optOutTracking()` blocks exceptions whatever this says.
+   */
+  captureExceptions?: boolean;
+  /**
+   * The release this build is, e.g. `"web@2026.11.3"`. Stamped as
+   * `$exception_release` on every exception AND as `$app_version_string`
+   * on every event, so crash-free users by release compares one version
+   * source on both sides.
+   */
+  release?: string;
+  /** Distribution inside the release (e.g. the build hash), sent as `$exception_dist`. */
+  dist?: string;
+  /**
+   * Called with every `$exception` event before it is queued: return it
+   * (possibly scrubbed) to send it, or `null` to drop it. A hook that throws
+   * drops the exception.
+   */
+  beforeSendException?: (event: TrackedEvent) => TrackedEvent | null;
+  /** Capacity of the exception queue (oldest non-fatal dropped first). Default 50. */
+  maxExceptionQueueSize?: number;
+  /**
+   * Custom metrics options. `flagKey` is the feature flag that works as the
+   * kill switch (default `"cohorly_metrics"`): inactive or 0% turns metrics
+   * off and drops the pending window; a missing flag means on.
+   */
+  metrics?: { flagKey?: string };
+  /**
+   * Session replay with rrweb (loaded on demand, only when this session
+   * records). `sampleRate` records whole sessions; `onErrorSampleRate` keeps
+   * the last 30 to 60 seconds in memory and sends them when an exception is
+   * captured (needs `captureExceptions` or `captureException()`). Inputs are always masked, `[data-cohorly-mask]` text is masked
+   * and `[data-cohorly-block]` elements are never recorded. When set (with a
+   * rate above 0), every event carries `$session_id`.
+   */
+  sessionReplay?: SessionReplayOptions;
+}
+
+/**
+ * Custom metrics (see `CohorlyClient.metrics`): samples are aggregated into one
+ * `$metric` event per metric and tag combination per window. Unlike the rest of
+ * `cohorly`, these are no-ops before `init()` and never throw. The pending
+ * window is queued on `pagehide` and when the page becomes hidden, and sent by
+ * beacon when the queue allows it; what stays behind goes out on the next visit.
+ */
+export interface CohorlyMetrics {
+  count(name: string, value?: number, tagsOrOptions?: MetricTags | MetricOptions): void;
+  gauge(name: string, value: number, tagsOrOptions?: MetricTags | MetricOptions): void;
+  distribution(name: string, value: number, tagsOrOptions?: MetricTags | MetricOptions): void;
+  /** Queues the pending window now; `flush()` sends it. */
+  flush(): void;
 }
 
 export interface Cohorly {
+  /** Custom metrics. No-op before `init()`, never throws. */
+  metrics: CohorlyMetrics;
   track(event: string, properties?: Record<string, unknown>): void;
   identify(id: string): Promise<void>;
   reset(): void;
@@ -128,6 +208,23 @@ export interface Cohorly {
    * are already loaded. Returns an unsubscribe function.
    */
   onFeatureFlags(cb: (flags: Record<string, FlagResult>) => void): () => void;
+  /**
+   * Queue a `$exception` event for anything thrown, with the same default
+   * properties as `track()` plus the current breadcrumbs. Returns the queued
+   * event, or `null` when it was dropped (`beforeSendException`, or more
+   * than 10 identical exceptions within 60s).
+   */
+  captureException(error: unknown, options?: CaptureExceptionOptions): TrackedEvent | null;
+  /** Record a breadcrumb; the last 50 travel with every exception. */
+  addBreadcrumb(crumb: BreadcrumbInput): void;
+  /**
+   * Stop collecting on this browser: persisted, drops everything queued, and
+   * nothing (events, people, alias, exceptions) is sent until optInTracking().
+   */
+  optOutTracking(): void;
+  /** Resume after optOutTracking(). Discarded data is not restored. */
+  optInTracking(): void;
+  hasOptedOutTracking(): boolean;
 }
 
 /**
@@ -150,6 +247,9 @@ export function getProfileDefaults(): Record<string, unknown> {
 }
 
 let activeClient: CohorlyClient | null = null;
+let debugEnabled = false;
+let exceptionTeardown: (() => void) | null = null;
+let replayController: ReplayController | null = null;
 
 function ensureClient(): CohorlyClient {
   if (!activeClient) {
@@ -160,8 +260,58 @@ function ensureClient(): CohorlyClient {
   return activeClient;
 }
 
+/**
+ * The single path every web exception takes: the cross-source dedup, the local rate limit, then the
+ * same default properties as track(), then the core client.
+ */
+function captureExceptionList(
+  list: ExceptionListEntry[],
+  options: CaptureExceptionOptions = {},
+  source: ErrorSource = "manual",
+): TrackedEvent | null {
+  const client = ensureClient();
+  // Before the rate limit: a duplicate must not use up the quota of 10.
+  if (
+    (source === "global" && isGlobalRepeatInSameRun(list)) ||
+    isCrossSourceDuplicate(list, source)
+  ) {
+    if (debugEnabled) {
+      console.warn("[cohorly] dropping an exception just captured from the other source");
+    }
+    return null;
+  }
+  if (!allowException(list)) {
+    if (debugEnabled) {
+      console.warn("[cohorly] dropping a repeated exception (local rate limit)");
+    }
+    return null;
+  }
+  const queued = client.captureExceptionList(list, {
+    ...options,
+    properties: {
+      ...getDefaultProperties(),
+      ...getAttributionProperties(localStorageAdapter),
+      ...options.properties,
+    },
+  });
+  // Only what was really queued anchors the window: an exception dropped by
+  // beforeSendException must not swallow the same error from the other source.
+  if (queued) {
+    markExceptionQueued(list, source);
+    replayController?.onException();
+  }
+  return queued;
+}
+
 /** Named singleton, usable as `import { cohorly } from "@cohorly/web"` after init(). */
 export const cohorly: Cohorly = {
+  metrics: {
+    count: (name, value, tagsOrOptions) => activeClient?.metrics.count(name, value, tagsOrOptions),
+    gauge: (name, value, tagsOrOptions) => activeClient?.metrics.gauge(name, value, tagsOrOptions),
+    distribution: (name, value, tagsOrOptions) =>
+      activeClient?.metrics.distribution(name, value, tagsOrOptions),
+    flush: () => activeClient?.metrics.flush(),
+  },
   track(event, properties = {}) {
     ensureClient().track(event, {
       ...getDefaultProperties(),
@@ -173,7 +323,10 @@ export const cohorly: Cohorly = {
     return ensureClient().identify(id);
   },
   reset() {
-    ensureClient().reset();
+    const client = ensureClient();
+    // Replay first: its pending chunk still belongs to the outgoing identity.
+    replayController?.reset();
+    client.reset();
   },
   register(props) {
     ensureClient().register(props);
@@ -229,23 +382,71 @@ export const cohorly: Cohorly = {
   onFeatureFlags(cb) {
     return ensureClient().onFeatureFlags(cb);
   },
+  captureException(error, options = {}) {
+    ensureClient();
+    let list: ExceptionListEntry[];
+    try {
+      list = buildExceptionList(error, {
+        handled: options.mechanism?.handled ?? true,
+        type: options.mechanism?.type ?? "generic",
+      });
+    } catch {
+      return null;
+    }
+    return captureExceptionList(list, options, "manual");
+  },
+  addBreadcrumb(crumb) {
+    ensureClient().addBreadcrumb(crumb);
+  },
+  optOutTracking() {
+    ensureClient().optOutTracking();
+    // Recording does not resume on optInTracking(), only on the next init().
+    replayController?.optOut();
+    replayController = null;
+  },
+  optInTracking() {
+    ensureClient().optInTracking();
+  },
+  hasOptedOutTracking() {
+    return ensureClient().hasOptedOutTracking();
+  },
 };
 
-function setupUnloadFlush(client: CohorlyClient): void {
-  if (typeof window === "undefined") return;
+let unloadTeardown: (() => void) | null = null;
+
+function setupUnloadFlush(client: CohorlyClient): () => void {
+  if (typeof window === "undefined") return () => {};
   const flushWithBeacon = () => {
+    // Fatal exceptions first, past any fetch flush still in flight: a crash
+    // that just happened is the one thing a closing page must not lose.
+    client.flushExceptions(beaconTransport, { fatalOnly: true }).catch(() => {
+      /* best effort during teardown */
+    });
+    client.metrics.flush();
     client.flush(beaconTransport).catch(() => {
       /* best effort during teardown */
     });
   };
-  window.addEventListener("pagehide", flushWithBeacon);
-  document.addEventListener("visibilitychange", () => {
+  const onVisibilityChange = () => {
     if (document.visibilityState === "hidden") flushWithBeacon();
-  });
+  };
+  window.addEventListener("pagehide", flushWithBeacon);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  return () => {
+    window.removeEventListener("pagehide", flushWithBeacon);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+  };
 }
 
 /** Initialize the web SDK. Safe to call during SSR (falls back to no-op browser APIs). */
 export function init(options: CohorlyWebOptions): Cohorly {
+  // A second init() replaces the client: the old one must stop flushing and
+  // unloading, or it would overwrite the queues the new client persisted.
+  activeClient?.stop();
+  unloadTeardown?.();
+  unloadTeardown = null;
+  replayController?.stop();
+  replayController = null;
   activeClient = new CohorlyClient({
     apiHost: options.apiHost,
     storage: localStorageAdapter,
@@ -260,7 +461,17 @@ export function init(options: CohorlyWebOptions): Cohorly {
     sendExposureEvents: options.sendExposureEvents,
     flagPersistence: options.flagPersistence,
     flagCacheTtlMs: options.flagCacheTtlMs,
+    release: options.release,
+    appVersion: options.release,
+    dist: options.dist,
+    beforeSendException: options.beforeSendException,
+    maxExceptionQueueSize: options.maxExceptionQueueSize,
+    captureExceptions: options.captureExceptions,
+    metrics: options.metrics,
+    // $session_id while session replay is on (the controller of THIS init).
+    eventProperties: (event) => replayController?.eventProperties(event) ?? {},
   });
+  debugEnabled = options.debug ?? false;
 
   if (options.superProperties) {
     activeClient.register(options.superProperties);
@@ -273,7 +484,40 @@ export function init(options: CohorlyWebOptions): Cohorly {
     setOnce: (props) => activeClient?.people.setOnce(props),
   });
 
-  setupUnloadFlush(activeClient);
+  unloadTeardown = setupUnloadFlush(activeClient);
+
+  exceptionTeardown?.();
+  exceptionTeardown = null;
+  resetExceptionRateLimit();
+  if (options.captureExceptions === true) {
+    exceptionTeardown = setupExceptionCapture({
+      capture: (list, captureOptions) => {
+        captureExceptionList(list, captureOptions, "global");
+      },
+      addBreadcrumb: (crumb) => activeClient?.addBreadcrumb(crumb),
+      apiHost: activeClient.getApiHost(),
+    });
+  }
+
+  // After the exception capture: both share one fetch/XHR wrapper (network.ts).
+  // Opted out at init: rrweb is never loaded.
+  if (replayWanted(options.sessionReplay) && !activeClient.hasOptedOutTracking()) {
+    const client = activeClient;
+    replayController = startSessionReplay(options.sessionReplay ?? {}, {
+      apiHost: client.getApiHost(),
+      token: options.token,
+      localStorage: localStorageAdapter,
+      sessionStorage: sessionStorageAdapter,
+      maxRetryDelayMs: options.maxRetryDelayMs ?? 600_000,
+      getDistinctId: () => client.getDistinctId(),
+      log: (...args) => {
+        if (debugEnabled) console.warn("[cohorly]", ...args);
+      },
+      random: Math.random,
+      // replay.ts, the sender and rrweb load only when a session records.
+      loadReplay: () => import("./replay/replay.js"),
+    });
+  }
 
   const autocapture = setupAutocapture(
     (event, props) => cohorly.track(event, props),
@@ -302,15 +546,27 @@ export function init(options: CohorlyWebOptions): Cohorly {
 }
 
 export type {
+  Breadcrumb,
+  BreadcrumbInput,
+  CaptureExceptionOptions,
   CohorlyClientOptions,
   CohorlyStorage,
   CohorlyTransport,
   EngageOp,
+  ExceptionLevel,
+  ExceptionListEntry,
+  ExceptionMechanism,
+  ExceptionStackFrame,
+  ExceptionStacktrace,
   FlagDetails,
   FlagPersistenceMode,
   FlagResult,
   FlagSource,
   FlagsFetcher,
+  FlushExceptionsOptions,
+  MetricOptions,
+  MetricTags,
+  MetricType,
   PeopleProperties,
   TrackedEvent,
 } from "@cohorly/core";
@@ -324,5 +580,11 @@ export {
   UTM_PARAMS,
 } from "./attribution.js";
 export { getDefaultProperties } from "./defaults.js";
+export {
+  CROSS_SOURCE_DEDUP_WINDOW_MS,
+  EXCEPTION_DEDUP_WINDOW_MS,
+  MAX_EXCEPTIONS_PER_FINGERPRINT,
+} from "./exceptions.js";
 export { getPageviewProperties, PAGEVIEW_EVENT } from "./pageview.js";
+export type { SessionReplayOptions } from "./replay/session.js";
 export type { AutocaptureConfig, AutocaptureOption };

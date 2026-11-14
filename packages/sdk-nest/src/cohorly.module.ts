@@ -1,11 +1,22 @@
-import type { DynamicModule } from "@nestjs/common";
+import type { DynamicModule, Provider } from "@nestjs/common";
 import { Module } from "@nestjs/common";
+import { APP_FILTER } from "@nestjs/core";
+import { CohorlyExceptionFilter } from "./cohorly-exception.filter.js";
 import { COHORLY_MODULE_OPTIONS } from "./cohorly.constants.js";
 import { CohorlyService } from "./cohorly.service.js";
 import type {
   CohorlyModuleAsyncOptions,
   CohorlyModuleOptions,
 } from "./interfaces.js";
+
+/** The global exception filter, when `captureExceptions` is on. */
+function exceptionFilterProviders(captureExceptions: boolean | undefined): Provider[] {
+  if (!captureExceptions) return [];
+  return [
+    CohorlyExceptionFilter,
+    { provide: APP_FILTER, useExisting: CohorlyExceptionFilter },
+  ];
+}
 
 /**
  * Cohorly NestJS module. Register once at the application root:
@@ -37,6 +48,7 @@ export class CohorlyModule {
       providers: [
         { provide: COHORLY_MODULE_OPTIONS, useValue: options },
         CohorlyService,
+        ...exceptionFilterProviders(options.captureExceptions),
       ],
       exports: [CohorlyService],
     };
@@ -54,6 +66,7 @@ export class CohorlyModule {
           inject: options.inject ?? [],
         },
         CohorlyService,
+        ...exceptionFilterProviders(options.captureExceptions),
       ],
       exports: [CohorlyService],
     };

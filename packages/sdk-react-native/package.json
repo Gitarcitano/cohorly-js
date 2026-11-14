@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/react-native",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "Standalone React Native SDK for Cohorly, hosted product analytics (Mixpanel-style). No hard dependency on react-native; works out of the box with in-memory storage and upgrades to AsyncStorage when injected. Ships an autolinked native module for device-info auto-capture.",
   "type": "module",
   "main": "dist/index.js",
@@ -9,7 +9,11 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./app.plugin": "./app.plugin.cjs",
+    "./app.plugin.js": "./app.plugin.cjs",
+    "./app.plugin.cjs": "./app.plugin.cjs",
+    "./package.json": "./package.json"
   },
   "sideEffects": false,
   "files": [
@@ -17,13 +21,16 @@
     "ios",
     "android",
     "CohorlyReactNative.podspec",
+    "app.plugin.cjs",
     "react-native.config.js",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepublishOnly": "pnpm run build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "sync:crash": "node scripts/sync-crash-core.mjs"
   },
   "keywords": [
     "analytics",
@@ -44,6 +51,8 @@
     "access": "public"
   },
   "peerDependencies": {
+    "react": "*",
+    "expo-updates": "*",
     "react-native": "*",
     "react-native-device-info": "*",
     "@react-native-community/netinfo": "*",
@@ -51,6 +60,9 @@
     "expo-device": "*"
   },
   "peerDependenciesMeta": {
+    "expo-updates": {
+      "optional": true
+    },
     "react-native": {
       "optional": true
     },
@@ -67,8 +79,13 @@
       "optional": true
     }
   },
+  "dependencies": {
+    "@cohorly/core": "workspace:*"
+  },
   "devDependencies": {
+    "@types/react": "^19.2.0",
+    "react": "^19.2.0",
     "typescript": "^5.6.0",
-    "vitest": "3.2.6"
+    "vitest": "4.1.11"
   }
 }

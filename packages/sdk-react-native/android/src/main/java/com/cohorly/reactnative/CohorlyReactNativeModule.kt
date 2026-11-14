@@ -1,6 +1,7 @@
 package com.cohorly.reactnative
 
 import com.cohorly.android.AndroidDeviceInfo
+import com.cohorly.android.crash.CohorlyCrashReporter
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -27,5 +28,17 @@ class CohorlyReactNativeModule(private val reactContext: ReactApplicationContext
         (props["\$brand"] as? String)?.let { map.putString("brand", it) }
         (props["\$carrier"] as? String)?.let { map.putString("carrier", it) }
         promise.resolve(map)
+    }
+
+    /** Writes the native crash reporter's config (VEL-1770). Takes effect on
+     * the next launch; updates a reporter already running. Never throws to JS. */
+    @ReactMethod
+    fun configureNativeCrashes(json: String) {
+        try {
+            CohorlyCrashReporter.configure(reactContext.applicationContext, json)
+        } catch (e: Throwable) {
+            // Crash reporting must never break the app. (No `_` here: the
+            // host app may compile this module with Kotlin 1.9.)
+        }
     }
 }
