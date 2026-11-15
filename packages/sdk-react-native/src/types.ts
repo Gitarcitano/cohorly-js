@@ -166,17 +166,44 @@ export interface CohorlyOptions {
   /** Capacity of the persisted exception queue (separate from events). Default 50. */
   maxExceptionQueueSize?: number;
   /**
-   * Native crash reporting (iOS, ADR-0020): signals, Mach exceptions,
-   * NSExceptions and C++ exceptions recorded by KSCrash and sent by native
-   * code on the next launch, plus MetricKit diagnostics. Needs the config
-   * plugin (`["@cohorly/react-native", { projectToken, apiHost }]`). The
-   * choice is written for the NEXT launch: turning it on takes effect from
-   * the launch after the one that set it, and so does turning it off.
-   * `captureExceptions: false` keeps it off. Never enable it alongside
-   * another native crash handler (Sentry's `enableNativeCrashHandling`).
-   * Default false.
+   * Native crash reporting (ADR-0020): on iOS, signals, Mach exceptions,
+   * NSExceptions and C++ exceptions recorded by KSCrash (in-process signal
+   * handlers) and sent by native code on the next launch; on Android, the
+   * native reporter. Needs the config plugin
+   * (`["@cohorly/react-native", { projectToken, apiHost }]`). On iOS it also
+   * turns on MetricKit diagnostics unless `metricKitDiagnostics` says
+   * otherwise. The choice is written for the NEXT launch: turning it on takes
+   * effect from the launch after the one that set it, and so does turning it
+   * off. Change it after init with `setNativeCrashReporting()`.
+   * `disabled`, `optOutTracking()` and `captureExceptions: false` keep it
+   * off. Never enable it alongside another native crash handler (Sentry's
+   * `enableNativeCrashHandling`). Default false.
    */
   nativeCrashReporting?: boolean;
+  /**
+   * MetricKit crash, hang and CPU diagnostics (iOS only; Android ignores it,
+   * there `nativeCrashReporting` alone decides). Defaults to the value of
+   * `nativeCrashReporting`, so both are off when neither is set.
+   * - `nativeCrashReporting: false, metricKitDiagnostics: true`: MetricKit
+   *   only. No signal handler is installed, so it can run alongside another
+   *   native crash reporter (Sentry with `enableNativeCrashHandling: true`).
+   *   Crashes KSCrash recorded on earlier launches are still sent.
+   * - `nativeCrashReporting: true, metricKitDiagnostics: false`: KSCrash
+   *   without MetricKit.
+   * Written for the NEXT launch, like `nativeCrashReporting`, and kept off by
+   * the same `disabled` / opt-out / `captureExceptions: false`. Change it
+   * after init with `setNativeCrashReporting()`.
+   */
+  metricKitDiagnostics?: boolean;
+}
+
+/**
+ * Argument of `setNativeCrashReporting()`. An omitted (or `undefined`) key
+ * keeps the current value; see `CohorlyOptions` for what each one means.
+ */
+export interface NativeCrashReportingOptions {
+  nativeCrashReporting?: boolean;
+  metricKitDiagnostics?: boolean;
 }
 
 /**

@@ -5,7 +5,15 @@
  * JSON. The shape is a cross-platform contract: do not add fields lightly.
  */
 export interface NativeCrashConfig {
+  /** KSCrash (in-process signal handlers), iOS; the native reporter on Android. */
   enabled: boolean;
+  /**
+   * MetricKit diagnostics (iOS only, Android ignores it), independent of
+   * `enabled`: `enabled: false, metricKit: true` sends MetricKit without
+   * installing any handler. Always written; native code reads a config
+   * without it (written by 1.4.0) as `metricKit == enabled`.
+   */
+  metricKit: boolean;
   /** `<bundleId>@<version>+<build>`, from the same resolveRelease() as JS errors. */
   release: string | null;
   /** OTA update id; native code only uses it while the binary's release still equals `release`. */
@@ -22,6 +30,8 @@ export interface NativeCrashConfig {
 
 export interface NativeCrashInputs {
   nativeCrashReporting?: boolean;
+  /** Omitted: follows `nativeCrashReporting`. */
+  metricKitDiagnostics?: boolean;
   /** CohorlyClient.isExceptionCaptureEnabled(): hydrated, not opted out, `captureExceptions` not `false`. */
   captureEnabled: boolean;
   release: string | undefined;
@@ -31,10 +41,16 @@ export interface NativeCrashInputs {
   build: string | undefined;
 }
 
-/** On only when asked for and while exception capture is enabled (no opt-out, no `captureExceptions: false`). */
+/**
+ * Each part is on only when asked for and while exception capture is enabled
+ * (no opt-out, no `captureExceptions: false`). MetricKit defaults to the
+ * `nativeCrashReporting` choice.
+ */
 export function buildNativeCrashConfig(input: NativeCrashInputs): NativeCrashConfig {
+  const metricKit = input.metricKitDiagnostics ?? input.nativeCrashReporting === true;
   return {
     enabled: input.nativeCrashReporting === true && input.captureEnabled,
+    metricKit: metricKit === true && input.captureEnabled,
     release: input.release ?? null,
     dist: input.dist ?? null,
     distinctId: input.distinctId,

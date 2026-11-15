@@ -43,7 +43,7 @@ final class CrashReporter: CrashBackend {
         lock.lock()
         if installed {
             lock.unlock()
-            if case let .install(_, userInfo) = decision { setUserInfo(userInfo) }
+            if case let .install(_, userInfo, _) = decision { setUserInfo(userInfo) }
             return true
         }
         self.lib = lib
@@ -115,6 +115,12 @@ final class CrashReporter: CrashBackend {
         }
     }
 
+    func setMetricKitUserInfo(_ userInfo: CrashUserInfo) {
+        lock.lock()
+        self.userInfo = userInfo
+        lock.unlock()
+    }
+
     func sendPendingReports(endpoint: CrashEndpoint) {
         let uploader = makeUploader(endpoint: endpoint)
         let sending = CrashSendingLaunch.current(lib: lib, infoDictionary: Bundle.main.infoDictionary ?? [:])
@@ -174,10 +180,8 @@ final class CrashReporter: CrashBackend {
 
     func deletePendingReports() {
         // Never create KSCrash's directories on an app that never had it on.
-        let installPath = (NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first ?? "")
-            + "/KSCrash"
         let outbox = CrashUploader.defaultDirectory()
-        let hasKSCrash = FileManager.default.fileExists(atPath: installPath)
+        let hasKSCrash = FileManager.default.fileExists(atPath: Self.kscrashInstallPath)
         let hasOutbox = FileManager.default.fileExists(atPath: outbox.path)
         guard hasKSCrash || hasOutbox else { return }
         DispatchQueue.global(qos: .utility).async {
@@ -210,10 +214,19 @@ final class CrashReporter: CrashBackend {
         return uploader
     }
 
-    /// KSCrash's store, or the same on-disk store opened directly when the
-    /// install failed this launch (its reports still need sending).
+    /// KSCrash's default install directory.
+    private static var kscrashInstallPath: String {
+        (NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first ?? "") + "/KSCrash"
+    }
+
+    /// KSCrash's store, or the same on-disk store opened directly when KSCrash
+    /// is not installed this launch (install failed, or MetricKit-only mode):
+    /// its reports still need sending. Opening the store installs no handler;
+    /// it is not opened when KSCrash never ran on this app, so its
+    /// directories are never created for nothing.
     private static func reportStore() -> CrashReportStore? {
         if let store = KSCrash.shared.reportStore { return store }
+        guard FileManager.default.fileExists(atPath: kscrashInstallPath) else { return nil }
         let configuration = CrashReportStoreConfiguration()
         configuration.maxReportCount = maxReportCount
         return try? CrashReportStore(configuration: configuration)

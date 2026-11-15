@@ -11,6 +11,7 @@ vi.mock("../src/deviceInfo.js", async (importOriginal) => {
 
 import { CohorlyClient } from "../src/client.js";
 import { buildNativeCrashConfig, writeNativeCrashConfig } from "../src/exceptions/native-crashes.js";
+import { init, setNativeCrashReporting } from "../src/index.js";
 import type { CohorlyOptions } from "../src/types.js";
 import { createFakeFetch, FakeStorage } from "./helpers.js";
 
@@ -55,12 +56,13 @@ async function makeClient(options: Partial<CohorlyOptions> = {}) {
 }
 
 describe("native crash config", () => {
-  it("writes enabled:false on every launch when nativeCrashReporting is not set", async () => {
+  it("writes enabled:false and metricKit:false on every launch when neither option is set", async () => {
     const mod = linkNativeModule();
     const client = await makeClient();
     await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
     expect(mod.configs()[0]).toEqual({
       enabled: false,
+      metricKit: false,
       release: "com.example.shop@3.8.1+415",
       dist: null,
       distinctId: client.getDistinctId(),
@@ -69,12 +71,13 @@ describe("native crash config", () => {
     });
   });
 
-  it("writes enabled:true with release, OTA dist and identity when turned on", async () => {
+  it("writes enabled:true, metricKit:true by default, with release, OTA dist and identity when turned on", async () => {
     const mod = linkNativeModule({ expoUpdates: { updateId: "update-7", isEmbeddedLaunch: false } });
     const client = await makeClient({ nativeCrashReporting: true });
     await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
     expect(mod.configs()[0]).toEqual({
       enabled: true,
+      metricKit: true,
       release: "com.example.shop@3.8.1+415",
       dist: "update-7",
       distinctId: client.getDistinctId(),
@@ -90,18 +93,154 @@ describe("native crash config", () => {
     expect(mod.configs()[0]).toMatchObject({ release: "shop-rt-7", dist: "hotfix-2" });
   });
 
+  it("writes the MetricKit-only mode: nativeCrashReporting false, metricKitDiagnostics true", async () => {
+    const mod = linkNativeModule();
+    await makeClient({ nativeCrashReporting: false, metricKitDiagnostics: true });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: true });
+  });
+
+  it("writes KSCrash without MetricKit: nativeCrashReporting true, metricKitDiagnostics false", async () => {
+    const mod = linkNativeModule();
+    await makeClient({ nativeCrashReporting: true, metricKitDiagnostics: false });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    expect(mod.configs()[0]).toMatchObject({ enabled: true, metricKit: false });
+  });
+
   it("is off with captureExceptions: false even when asked for", async () => {
     const mod = linkNativeModule();
-    await makeClient({ nativeCrashReporting: true, captureExceptions: false });
+    await makeClient({ nativeCrashReporting: true, metricKitDiagnostics: true, captureExceptions: false });
     await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalled());
-    expect(mod.configs()[0].enabled).toBe(false);
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: false });
   });
 
   it("is off with disabled: true, which forbids every network call", async () => {
     const mod = linkNativeModule();
-    await makeClient({ nativeCrashReporting: true, disabled: true });
+    await makeClient({ nativeCrashReporting: true, metricKitDiagnostics: true, disabled: true });
     await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalled());
-    expect(mod.configs()[0].enabled).toBe(false);
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: false });
+  });
+
+  it("optOutTracking() turns MetricKit off too, even with metricKitDiagnostics: true", async () => {
+    const mod = linkNativeModule();
+    const client = await makeClient({ nativeCrashReporting: false, metricKitDiagnostics: true });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    expect(mod.configs()[0].metricKit).toBe(true);
+    client.optOutTracking();
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: false });
+    client.optInTracking();
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: true });
+  });
+
+  it("setNativeCrashReporting() after ready rewrites the config with the new value, keeping an omitted key", async () => {
+    const mod = linkNativeModule();
+    const client = await makeClient({ nativeCrashReporting: false, metricKitDiagnostics: true });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    const distinctId = client.getDistinctId();
+
+    client.setNativeCrashReporting({ nativeCrashReporting: true });
+    expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(2);
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: true, metricKit: true, distinctId });
+
+    // Kill switch: KSCrash off on the next launch, MetricKit kept.
+    client.setNativeCrashReporting({ nativeCrashReporting: false, metricKitDiagnostics: undefined });
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: true });
+
+    client.setNativeCrashReporting({ metricKitDiagnostics: false });
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: false });
+    // The new values survive the next rewrite (identify).
+    client.identify("user-42");
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: false, distinctId: "user-42" });
+  });
+
+  it("setNativeCrashReporting() keeps metricKit derived from nativeCrashReporting while it was never set", async () => {
+    const mod = linkNativeModule();
+    const client = await makeClient();
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    client.setNativeCrashReporting({ nativeCrashReporting: true });
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: true, metricKit: true });
+    client.setNativeCrashReporting({ nativeCrashReporting: false });
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: false });
+  });
+
+  it("setNativeCrashReporting() before ready writes nothing, and the first write carries its value", async () => {
+    const mod = linkNativeModule();
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      token: "proj_test",
+      storage: new FakeStorage(),
+      fetch: createFakeFetch().fetchImpl,
+      flushInterval: 60_000,
+      loadFeatureFlags: false,
+      appVersion: "3.8.1",
+      appBuild: "415",
+      platformInfo: { os: "iOS" },
+      nativeCrashReporting: true,
+    });
+    clients.push(client);
+    client.setNativeCrashReporting({ nativeCrashReporting: false, metricKitDiagnostics: true });
+    expect(mod.configureNativeCrashes).not.toHaveBeenCalled();
+    await client.exceptionsReady;
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalled());
+    expect(mod.configs().map((c) => [c.enabled, c.metricKit])).toEqual([[false, true]]);
+  });
+
+  it("the next launch starts from the persisted setter choice, so a launch dying before its flags never writes the init default", async () => {
+    const storage = new FakeStorage();
+    let mod = linkNativeModule();
+    const first = await makeClient({ storage });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    first.setNativeCrashReporting({ nativeCrashReporting: true, metricKitDiagnostics: true });
+    first.stop();
+
+    mod = linkNativeModule();
+    await makeClient({ storage });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    expect(mod.configs()[0]).toMatchObject({ enabled: true, metricKit: true });
+
+    // Kill switch persisted too, keeping the other key.
+    const second = clients.at(-1) as CohorlyClient;
+    second.setNativeCrashReporting({ nativeCrashReporting: false });
+    second.stop();
+    mod = linkNativeModule();
+    await makeClient({ storage });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: true });
+  });
+
+  it("an explicit init option wins over the persisted choice, and a setter call before ready is persisted with the stored keys", async () => {
+    const storage = new FakeStorage();
+    await storage.setItem("cohorly:native_crash", JSON.stringify({ nativeCrashReporting: true, metricKitDiagnostics: true }));
+    let mod = linkNativeModule();
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      token: "proj_test",
+      storage,
+      fetch: createFakeFetch().fetchImpl,
+      flushInterval: 60_000,
+      loadFeatureFlags: false,
+      appVersion: "3.8.1",
+      appBuild: "415",
+      platformInfo: { os: "iOS" },
+      metricKitDiagnostics: false,
+    });
+    clients.push(client);
+    client.setNativeCrashReporting({ nativeCrashReporting: false });
+    await client.exceptionsReady;
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalled());
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: false });
+    await vi.waitFor(() =>
+      expect(JSON.parse(storage.store.get("cohorly:native_crash") as string)).toEqual({
+        nativeCrashReporting: false,
+        metricKitDiagnostics: true,
+      }),
+    );
+    client.stop();
+
+    mod = linkNativeModule();
+    await makeClient({ storage });
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: true });
   });
 
   it("rewrites the config with the new identity on identify and reset", async () => {
@@ -193,6 +332,20 @@ describe("native crash config", () => {
 describe("buildNativeCrashConfig", () => {
   const base = { captureEnabled: true, release: "r", dist: "d", distinctId: "a", deviceId: "b", build: "415" };
 
+  it("derives metricKit from nativeCrashReporting unless metricKitDiagnostics is given", () => {
+    const pick = (input: Partial<Parameters<typeof buildNativeCrashConfig>[0]>) => {
+      const config = buildNativeCrashConfig({ ...base, ...input });
+      return [config.enabled, config.metricKit];
+    };
+    expect(pick({})).toEqual([false, false]);
+    expect(pick({ nativeCrashReporting: true })).toEqual([true, true]);
+    expect(pick({ nativeCrashReporting: false })).toEqual([false, false]);
+    expect(pick({ nativeCrashReporting: false, metricKitDiagnostics: true })).toEqual([false, true]);
+    expect(pick({ metricKitDiagnostics: true })).toEqual([false, true]);
+    expect(pick({ nativeCrashReporting: true, metricKitDiagnostics: false })).toEqual([true, false]);
+    expect(pick({ nativeCrashReporting: true, metricKitDiagnostics: true, captureEnabled: false })).toEqual([false, false]);
+  });
+
   it("is enabled only with nativeCrashReporting: true while exception capture is enabled", () => {
     expect(buildNativeCrashConfig({ ...base, nativeCrashReporting: true }).enabled).toBe(true);
     expect(buildNativeCrashConfig({ ...base }).enabled).toBe(false);
@@ -203,6 +356,31 @@ describe("buildNativeCrashConfig", () => {
   it("uses null for a missing release, dist or build", () => {
     expect(
       buildNativeCrashConfig({ ...base, release: undefined, dist: undefined, build: undefined, nativeCrashReporting: true }),
-    ).toEqual({ enabled: true, release: null, dist: null, distinctId: "a", deviceId: "b", build: null });
+    ).toEqual({ enabled: true, metricKit: true, release: null, dist: null, distinctId: "a", deviceId: "b", build: null });
+  });
+});
+
+describe("setNativeCrashReporting module function", () => {
+  it("is a no-op before init() and drives the shared client after it", async () => {
+    const mod = linkNativeModule();
+    expect(() => setNativeCrashReporting({ nativeCrashReporting: true })).not.toThrow();
+    const client = init({
+      apiHost: "http://localhost:4000",
+      token: "proj_test",
+      storage: new FakeStorage(),
+      fetch: createFakeFetch().fetchImpl,
+      flushInterval: 60_000,
+      loadFeatureFlags: false,
+      appVersion: "3.8.1",
+      appBuild: "415",
+      platformInfo: { os: "iOS" },
+    });
+    clients.push(client);
+    await client.exceptionsReady;
+    await vi.waitFor(() => expect(mod.configureNativeCrashes).toHaveBeenCalledTimes(1));
+    // The call before init() did not leak into the new client.
+    expect(mod.configs()[0]).toMatchObject({ enabled: false, metricKit: false });
+    setNativeCrashReporting({ metricKitDiagnostics: true });
+    expect(mod.configs().at(-1)).toMatchObject({ enabled: false, metricKit: true });
   });
 });

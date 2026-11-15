@@ -67,26 +67,56 @@ struct CrashLibInfo: Equatable {
 /// reset and opt-out) under UserDefaults `cohorly.crash.config`, read by native
 /// code on the NEXT launch. Android writes the same JSON shape (VEL-1770):
 ///
-///     { "enabled": bool, "release": string|null, "dist": string|null,
-///       "distinctId": string, "deviceId": string, "build": string|null }
+///     { "enabled": bool, "metricKit": bool, "release": string|null,
+///       "dist": string|null, "distinctId": string, "deviceId": string,
+///       "build": string|null }
+///
+/// `enabled` turns on KSCrash (in-process signal handlers). `metricKit`
+/// (iOS only, Android ignores it) turns on MetricKit diagnostics, with or
+/// without KSCrash: `enabled: false, metricKit: true` is the MetricKit-only
+/// mode, which installs no handler and so can share the process with another
+/// native crash reporter. A config without `metricKit` (written by
+/// @cohorly/react-native 1.4.0) means `metricKit == enabled`.
 ///
 /// `build` is the build number (CFBundleVersion, Android versionCode) of the
 /// launch that wrote the config; Android also accepts it as a number.
 ///
 /// Parsing is tolerant: anything that is not a JSON object with
-/// `enabled: true` means "off".
+/// `enabled: true` (or `metricKit: true`) means "off".
 struct CrashConfig: Equatable {
     static let defaultsKey = "cohorly.crash.config"
 
     var enabled: Bool
+    var metricKit: Bool
     var release: String?
     var dist: String?
     var distinctId: String?
     var deviceId: String?
     var build: String?
 
+    /// `metricKit` nil means "same as `enabled`", the rule for a config
+    /// written before the field existed.
+    init(
+        enabled: Bool,
+        metricKit: Bool? = nil,
+        release: String?,
+        dist: String?,
+        distinctId: String?,
+        deviceId: String?,
+        build: String? = nil
+    ) {
+        self.enabled = enabled
+        self.metricKit = metricKit ?? enabled
+        self.release = release
+        self.dist = dist
+        self.distinctId = distinctId
+        self.deviceId = deviceId
+        self.build = build
+    }
+
     /// nil when `raw` is absent or not a JSON object. Wrong-typed fields are
-    /// dropped; a non-boolean `enabled` is `false`.
+    /// dropped; a non-boolean `enabled` or `metricKit` is `false`, an absent
+    /// `metricKit` follows `enabled`.
     static func parse(_ raw: String?) -> CrashConfig? {
         guard let raw, let data = raw.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data),
@@ -103,9 +133,14 @@ struct CrashConfig: Equatable {
         if build == nil, let number = dict["build"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
             build = number.stringValue
         }
-        let enabled = (dict["enabled"] as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } ?? false
+        func strictBool(_ value: Any) -> Bool {
+            guard let number = value as? NSNumber else { return false }
+            return CFGetTypeID(number) == CFBooleanGetTypeID() && number.boolValue
+        }
+        let enabled = dict["enabled"].map(strictBool) ?? false
         return CrashConfig(
             enabled: enabled,
+            metricKit: dict["metricKit"].map(strictBool),
             release: string("release"),
             dist: string("dist"),
             distinctId: string("distinctId"),
@@ -116,7 +151,7 @@ struct CrashConfig: Equatable {
 
     /// Serialized form, used by tests and by native callers that write the key.
     func jsonString() -> String {
-        var dict: [String: Any] = ["enabled": enabled]
+        var dict: [String: Any] = ["enabled": enabled, "metricKit": metricKit]
         dict["release"] = release ?? NSNull()
         dict["dist"] = dist ?? NSNull()
         if let distinctId { dict["distinctId"] = distinctId }
@@ -177,25 +212,34 @@ enum CrashRelease {
 /// the previous launch and the app's Info.plist. Pure, so it is tested
 /// without KSCrash.
 enum CrashLaunchDecision: Equatable {
-    /// Install KSCrash, send pending reports and subscribe to MetricKit.
-    case install(endpoint: CrashEndpoint, userInfo: CrashUserInfo)
+    /// Install KSCrash, send pending reports and, when `metricKit`, subscribe
+    /// to MetricKit.
+    case install(endpoint: CrashEndpoint, userInfo: CrashUserInfo, metricKit: Bool)
+    /// MetricKit only: no KSCrash and no handler installed in this process.
+    /// Pending reports of earlier launches (KSCrash reports recorded while
+    /// `enabled` was on, MetricKit files in the outbox) are still sent, and
+    /// MetricKit events carry `userInfo.deviceId`.
+    case metricKitOnly(endpoint: CrashEndpoint, userInfo: CrashUserInfo)
     /// Reporting is off: delete pending reports, send nothing, no MetricKit.
     case disable
-    /// Reporting is on but the Info.plist lacks `CohorlyProjectToken` or
-    /// `CohorlyApiHost`: nothing is installed and pending reports are kept.
+    /// Reporting (KSCrash or MetricKit) is on but the Info.plist lacks
+    /// `CohorlyProjectToken` or `CohorlyApiHost`: nothing is installed and
+    /// pending reports are kept.
     case misconfigured
 
     static let tokenKey = "CohorlyProjectToken"
     static let hostKey = "CohorlyApiHost"
 
     static func decide(storedConfig: String?, infoDictionary: [String: Any]) -> CrashLaunchDecision {
-        guard let config = CrashConfig.parse(storedConfig), config.enabled else { return .disable }
+        guard let config = CrashConfig.parse(storedConfig), config.enabled || config.metricKit else { return .disable }
         guard let endpoint = CrashEndpoint(
             token: infoDictionary[tokenKey] as? String,
             host: infoDictionary[hostKey] as? String
         ) else { return .misconfigured }
         let release = CrashRelease.fromInfoDictionary(infoDictionary)
         let build = infoDictionary["CFBundleVersion"] as? String
-        return .install(endpoint: endpoint, userInfo: config.userInfo(binaryRelease: release, binaryBuild: build))
+        let userInfo = config.userInfo(binaryRelease: release, binaryBuild: build)
+        guard config.enabled else { return .metricKitOnly(endpoint: endpoint, userInfo: userInfo) }
+        return .install(endpoint: endpoint, userInfo: userInfo, metricKit: config.metricKit)
     }
 }

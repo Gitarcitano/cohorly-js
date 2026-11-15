@@ -1,5 +1,11 @@
 # @cohorly/react-native
 
+## 1.5.0
+
+### Minor Changes
+
+- 97d8fd8: Add `metricKitDiagnostics` (iOS) to turn MetricKit on or off apart from KSCrash, including a MetricKit-only mode that installs no signal handler, and `setNativeCrashReporting()` to change either option after init for the next launch (persisted, so the next launch starts from the last choice).
+
 ## 1.4.0
 
 ### Minor Changes

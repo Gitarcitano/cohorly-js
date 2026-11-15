@@ -259,7 +259,8 @@ Signals, Mach exceptions, uncaught NSExceptions and C++ exceptions are recorded
 by [KSCrash](https://github.com/kstenerud/KSCrash) and sent by native code on
 the next launch, before JS starts (ADR-0020), as `$exception` events with level
 `fatal`. MetricKit crash, hang and CPU diagnostics are sent as `error` /
-`warning`. Add the config plugin and turn it on in `init`:
+`warning`; they come with `nativeCrashReporting` unless `metricKitDiagnostics`
+says otherwise. Add the config plugin and turn it on in `init`:
 
 ```json
 "plugins": [["@cohorly/react-native", { "projectToken": "YOUR_PROJECT_TOKEN", "apiHost": "https://YOUR_COHORLY_API" }]]
@@ -281,8 +282,21 @@ init({ token: "YOUR_PROJECT_TOKEN", storage: AsyncStorage, nativeCrashReporting:
   It is on only while `isExceptionCaptureEnabled()` is true too, and is re-sent
   on every `onExceptionCaptureChange`: `captureExceptions: false` or
   `optOutTracking()` turn it off, `optInTracking()` back on.
+- `metricKitDiagnostics` (iOS only, default: the value of
+  `nativeCrashReporting`) turns MetricKit on or off on its own.
+  `nativeCrashReporting: false, metricKitDiagnostics: true` is MetricKit only:
+  no signal handler is installed, so it can run alongside Sentry with
+  `enableNativeCrashHandling: true`, and crashes KSCrash recorded on earlier
+  launches are still sent. On Android `nativeCrashReporting` alone decides.
+- `setNativeCrashReporting({ nativeCrashReporting?, metricKitDiagnostics? })`
+  changes either one after init (e.g. once feature flags load); an omitted key
+  keeps its value. It applies to the NEXT launch and is persisted: the next
+  launch starts from it for every key `init()` leaves out, so a launch that
+  ends before its flags arrive never writes the default. Leave a key you drive
+  with the setter out of `init()` and call the setter on every launch.
 - Never run two native crash handlers: in apps that also use Sentry, set
-  `enableNativeCrashHandling: false` in `Sentry.init` before turning this on.
+  `enableNativeCrashHandling: false` in `Sentry.init` before turning
+  `nativeCrashReporting` on, or use the MetricKit-only mode.
 - Upload the dSYMs of every build so frames are symbolicated, with the same
   release the SDK sends (`<bundleId>@<version>+<build>`):
   `cohorly debug-files upload --release com.example.shop@3.8.1+415 path/to/App.app.dSYM`

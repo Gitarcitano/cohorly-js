@@ -11,6 +11,7 @@ import type {
   CohorlyOptions,
   FlagDetails,
   FlagResult,
+  NativeCrashReportingOptions,
   Properties,
 } from "./types.js";
 
@@ -45,6 +46,7 @@ export type {
   FlagPersistenceMode,
   FlagResult,
   FlagSource,
+  NativeCrashReportingOptions,
   PlatformInfo,
   Properties,
   TrackEvent,
@@ -247,6 +249,16 @@ export function isExceptionCaptureEnabled(): boolean {
  */
 export function onExceptionCaptureChange(listener: (enabled: boolean) => void): () => void {
   return sharedInstance?.onExceptionCaptureChange(listener) ?? (() => {});
+}
+
+/**
+ * Changes `nativeCrashReporting` / `metricKitDiagnostics` for the NEXT
+ * launch, e.g. after feature flags load; an omitted key keeps its value. See
+ * `CohorlyClient.setNativeCrashReporting`. A no-op before init(), so call it
+ * after init().
+ */
+export function setNativeCrashReporting(options: NativeCrashReportingOptions): void {
+  sharedInstance?.setNativeCrashReporting(options);
 }
 
 /** Record a breadcrumb sent with the next exceptions. A no-op before init(); never throws. */

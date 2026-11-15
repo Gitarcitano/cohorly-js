@@ -34,6 +34,7 @@ import type {
   FlagDetails,
   FlagPersistenceMode,
   FlagResult,
+  NativeCrashReportingOptions,
   PlatformInfo,
   Properties,
   TrackEvent,
@@ -52,6 +53,7 @@ const KEYS = {
   aeLastVersion: "cohorly:ae_last_version",
   flags: "cohorly:flags",
   optOut: "cohorly:opt_out",
+  nativeCrash: "cohorly:native_crash",
 } as const;
 
 /**
@@ -307,7 +309,18 @@ export class CohorlyClient {
   /** `CohorlyReactNative` native module, for `configureNativeCrashes`. */
   // biome-ignore lint/suspicious/noExplicitAny: untyped native bridge module.
   private nativeModule: any;
-  private readonly nativeCrashReporting: boolean | undefined;
+  /**
+   * The native crash choice comes from three layers, first defined wins:
+   * setNativeCrashReporting() in this launch, the init options, then the
+   * last setNativeCrashReporting() of an earlier launch (persisted under
+   * KEYS.nativeCrash, loaded once `ready` resolved). The persisted layer
+   * keeps a launch that dies before its feature flags arrive from writing
+   * the init default over the choice the previous launch made.
+   */
+  private readonly nativeCrashInit: NativeCrashReportingOptions;
+  private nativeCrashSet: NativeCrashReportingOptions = {};
+  /** Undefined until read from storage. */
+  private nativeCrashStored: NativeCrashReportingOptions | undefined;
   /** Release/dist for the native crash config, known once `ready` resolved. */
   private nativeCrashRelease: { release?: string; dist?: string } | undefined;
   /**
@@ -351,7 +364,10 @@ export class CohorlyClient {
     } catch {
       this.nativeModule = undefined;
     }
-    this.nativeCrashReporting = options.nativeCrashReporting;
+    this.nativeCrashInit = {
+      nativeCrashReporting: options.nativeCrashReporting,
+      metricKitDiagnostics: options.metricKitDiagnostics,
+    };
     // The native config follows isExceptionCaptureEnabled(): re-sent on
     // every change (hydration turning it on, optOutTracking/optInTracking).
     this.captureListeners.add(() => this.syncNativeCrashConfig());
@@ -445,7 +461,10 @@ export class CohorlyClient {
     // Native crash config for the next launch, once identity and release are known.
     void this.ready
       .catch(() => {})
-      .then(() => {
+      .then(async () => {
+        this.nativeCrashStored = await this.loadNativeCrashChoice();
+        // A setter call made before the stored choice was read is persisted now.
+        if (Object.keys(this.nativeCrashSet).length > 0) this.persistNativeCrashChoice();
         this.nativeCrashRelease = { ...this.resolveReleaseDefaults(options, expoUpdates.dist) };
         this.syncNativeCrashConfig();
       });
@@ -921,8 +940,9 @@ export class CohorlyClient {
   /**
    * Writes the native crash reporter's config (read on the NEXT launch, see
    * `nativeCrashReporting`): `enabled` is `nativeCrashReporting` and
-   * isExceptionCaptureEnabled(), with the current identity. Runs once the
-   * client is ready, after identify()/reset(), and on every
+   * isExceptionCaptureEnabled(), `metricKit` is `metricKitDiagnostics`
+   * (default: `nativeCrashReporting`) and the same, with the current
+   * identity. Runs once the client is ready, on setNativeCrashReporting(), after identify()/reset(), and on every
    * onExceptionCaptureChange. Never before the persisted opt-out was read, so
    * the transient `false` of isExceptionCaptureEnabled() at startup is never
    * written. A no-op without the native module.
@@ -935,7 +955,8 @@ export class CohorlyClient {
       buildNativeCrashConfig({
         // `disabled` means no network at all, and the native reporter sends
         // on its own: it stays off.
-        nativeCrashReporting: this.nativeCrashReporting && !this.disabled,
+        nativeCrashReporting: this.nativeCrashChoice("nativeCrashReporting") && !this.disabled,
+        metricKitDiagnostics: this.disabled ? false : this.nativeCrashChoice("metricKitDiagnostics"),
         captureEnabled: this.isExceptionCaptureEnabled(),
         release: this.nativeCrashRelease.release,
         dist: this.nativeCrashRelease.dist,
@@ -944,6 +965,63 @@ export class CohorlyClient {
         build: this.appBuild,
       }),
     );
+  }
+
+  /**
+   * Changes `nativeCrashReporting` and/or `metricKitDiagnostics` after init,
+   * e.g. once feature flags are loaded. An omitted (or `undefined`) key keeps
+   * its current value; `metricKitDiagnostics` keeps following
+   * `nativeCrashReporting` while it was never set.
+   *
+   * Takes effect on the NEXT launch: the config native code reads at startup
+   * is rewritten, but nothing is installed or removed in this process.
+   *
+   * The choice is persisted: on the next launch it is the starting value of
+   * each key the init options leave out, so a launch that ends before its
+   * feature flags arrive never rewrites the config with the init default.
+   * Leave the option out of `init()` for a key you drive with this setter
+   * (an explicit init value wins over the persisted one until the setter
+   * runs again). A value set here in this launch wins over both.
+   * Before `ready` it only records the values, and the first write already
+   * carries them. `disabled`, opt-out and `captureExceptions: false` still
+   * keep both off.
+   */
+  setNativeCrashReporting(options: NativeCrashReportingOptions): void {
+    if (typeof options.nativeCrashReporting === "boolean") {
+      this.nativeCrashSet.nativeCrashReporting = options.nativeCrashReporting;
+    }
+    if (typeof options.metricKitDiagnostics === "boolean") {
+      this.nativeCrashSet.metricKitDiagnostics = options.metricKitDiagnostics;
+    }
+    if (this.nativeCrashStored) this.persistNativeCrashChoice();
+    this.syncNativeCrashConfig();
+  }
+
+  private nativeCrashChoice(key: keyof NativeCrashReportingOptions): boolean | undefined {
+    return this.nativeCrashSet[key] ?? this.nativeCrashInit[key] ?? this.nativeCrashStored?.[key];
+  }
+
+  /** The persisted choice of earlier setNativeCrashReporting() calls; `{}` when none or unreadable. */
+  private async loadNativeCrashChoice(): Promise<NativeCrashReportingOptions> {
+    try {
+      const raw = await this.storage.getItem(KEYS.nativeCrash);
+      const parsed: unknown = raw ? JSON.parse(raw) : null;
+      if (!parsed || typeof parsed !== "object") return {};
+      const choice: NativeCrashReportingOptions = {};
+      const { nativeCrashReporting, metricKitDiagnostics } = parsed as Record<string, unknown>;
+      if (typeof nativeCrashReporting === "boolean") choice.nativeCrashReporting = nativeCrashReporting;
+      if (typeof metricKitDiagnostics === "boolean") choice.metricKitDiagnostics = metricKitDiagnostics;
+      return choice;
+    } catch {
+      return {};
+    }
+  }
+
+  private persistNativeCrashChoice(): void {
+    this.nativeCrashStored = { ...this.nativeCrashStored, ...this.nativeCrashSet };
+    void Promise.resolve()
+      .then(() => this.storage.setItem(KEYS.nativeCrash, JSON.stringify(this.nativeCrashStored)))
+      .catch(() => {});
   }
 
   /** Stops the auto-flush timer and removes the `captureExceptions`
