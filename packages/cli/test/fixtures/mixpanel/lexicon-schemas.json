@@ -1,0 +1,85 @@
+{
+  "status": "ok",
+  "results": [
+    {
+      "entityType": "event",
+      "name": "Signed Up",
+      "schemaJson": {
+        "description": "A visitor finished the sign-up form",
+        "properties": {
+          "plan": {
+            "description": "Plan chosen at sign-up",
+            "metadata": { "com.mixpanel": { "displayName": "Plan", "tags": ["billing"] } }
+          },
+          "referrer": {
+            "metadata": { "com.mixpanel": { "hidden": true } }
+          }
+        },
+        "metadata": {
+          "com.mixpanel": {
+            "displayName": "Account created",
+            "tags": ["growth", "activation"],
+            "hidden": false,
+            "dropped": true,
+            "mergedInto": "Sign Up",
+            "verified": true,
+            "reviewStatus": "approved"
+          }
+        }
+      }
+    },
+    {
+      "entityType": "event",
+      "name": "Purchase",
+      "schemaJson": {
+        "description": "An order was paid",
+        "properties": {
+          "plan": {
+            "description": "Same property name under another event",
+            "metadata": { "com.mixpanel": { "displayName": "Plan again", "tags": ["revenue"] } }
+          },
+          "amount": { "description": "Order total in cents" }
+        },
+        "metadata": { "com.mixpanel": { "hidden": true, "tags": ["revenue"] } }
+      }
+    },
+    {
+      "entityType": "event",
+      "name": "Viewed Page",
+      "schemaJson": { "description": "A page was shown" }
+    },
+    {
+      "entityType": "profile",
+      "name": "User Profile",
+      "schemaJson": {
+        "properties": {
+          "$email": {
+            "description": "Contact e-mail",
+            "metadata": { "com.mixpanel": { "displayName": "E-mail", "tags": ["pii"], "dropped": true } }
+          },
+          "company": { "description": "Company name" }
+        }
+      }
+    },
+    {
+      "entityType": "custom_event",
+      "name": "Any Checkout Step",
+      "schemaJson": { "description": "Union of checkout events" }
+    },
+    {
+      "entityType": "group",
+      "name": "Account",
+      "schemaJson": { "properties": { "tier": { "description": "Account tier" } } }
+    },
+    {
+      "entityType": "lookup_table",
+      "name": "Plans",
+      "schemaJson": { "description": "Plan names by id" }
+    },
+    {
+      "entityType": "calculated_property",
+      "name": "Revenue per order",
+      "schemaJson": { "description": "amount / orders" }
+    }
+  ]
+}

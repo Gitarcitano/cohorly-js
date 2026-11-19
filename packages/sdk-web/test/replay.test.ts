@@ -3,6 +3,8 @@ import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Breadcrumb, CohorlyWebOptions, SessionReplayOptions, TrackedEvent } from "../src/index.js";
 import { cohorly, init } from "../src/index.js";
+import type { ReplayChunk } from "../src/replay/sender.js";
+import { ReplaySender } from "../src/replay/sender.js";
 
 interface RrEvent {
   type: number;
@@ -52,6 +54,13 @@ const rr = vi.hoisted(() => {
   return { state, record, incremental };
 });
 vi.mock("@rrweb/record", () => ({ record: rr.record }));
+// Plain keepalive bodies too (the keepalive path gzips with fflate); replay-sender.test.ts covers the gzip.
+vi.mock("fflate", () => ({
+  gzipSync: () => {
+    throw new Error("plain bodies in this test");
+  },
+  strToU8: (text: string) => new TextEncoder().encode(text),
+}));
 
 const API_HOST = "https://ingest.example.com";
 const T0 = Date.UTC(2026, 10, 14, 12, 0, 0);
@@ -261,9 +270,67 @@ describe("session replay", () => {
       expect(chunks.flatMap((c) => c.chunk.events).map((e) => e.type)).toEqual([4, 2, 3, 3, 3]);
     });
 
+    it("keeps a Meta and the FullSnapshot after it in one chunk, even past 1 MB", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      interaction(100, { blob: "x".repeat(600_000) });
+      rr.state.emit?.({ type: 4, timestamp: Date.now(), data: { href: location.href } });
+      rr.state.emit?.({ type: 2, timestamp: Date.now(), data: { node: {}, blob: "y".repeat(1_200_000) } });
+      interaction(101);
+      await vi.advanceTimersByTimeAsync(5000);
+      await vi.waitFor(() => expect(sentChunks()).toHaveLength(3));
+
+      const chunks = sentChunks();
+      expect(chunks.map((c) => c.chunk.events.map((e) => e.type))).toEqual([[4, 2, 3], [4, 2], [3]]);
+      expect(chunks[1].bytes).toBeGreaterThan(1_000_000);
+    });
+
+    it("keeps a Meta that is the 1000th pending event with the FullSnapshot after it", async () => {
+      start({ sampleRate: 1 });
+      await recording(); // Meta + FullSnapshot: 2 pending
+      for (let i = 0; i < 997; i += 1) interaction();
+      rr.record.takeFullSnapshot(); // the Meta is the 1000th event, its FullSnapshot the 1001st
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.waitFor(() => expect(sentChunks()).toHaveLength(2));
+
+      const chunks = sentChunks();
+      expect(chunks.map((c) => c.chunk.events.length)).toEqual([999, 2]);
+      expect(chunks[1].chunk.events.map((e) => e.type)).toEqual([4, 2]);
+    });
+
+    it("marks hasSnapshot only on the chunk holding the FullSnapshot, and on the right half after a split", async () => {
+      const enqueued = vi.spyOn(ReplaySender.prototype, "enqueue");
+      const split = vi.spyOn(
+        ReplaySender.prototype as unknown as { split: (chunk: ReplayChunk) => [ReplayChunk, ReplayChunk] | null },
+        "split",
+      );
+      start({ sampleRate: 1 });
+      await recording();
+      interaction(1);
+      replayResponses.push(ok({ status: 0, error: "too large" }, 413));
+      await vi.advanceTimersByTimeAsync(5000);
+      interaction(2);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const summary = (c: ReplayChunk) => ({
+        types: (JSON.parse(c.eventsJson) as RrEvent[]).map((e) => e.type),
+        hasSnapshot: c.hasSnapshot === true,
+      });
+      expect(enqueued.mock.calls.flatMap(([chunks]) => chunks).map(summary)).toEqual([
+        { types: [4, 2, 3], hasSnapshot: true },
+        { types: [3], hasSnapshot: false },
+      ]);
+      const halves = split.mock.results[0]?.value as [ReplayChunk, ReplayChunk];
+      expect(halves.map(summary)).toEqual([
+        { types: [4, 2], hasSnapshot: true },
+        { types: [3], hasSnapshot: false },
+      ]);
+    });
+
     it("keeps a chunk on 5xx and retries it after Retry-After; splits it on 413", async () => {
       start({ sampleRate: 1 });
       await recording();
+      interaction(); // the Meta + FullSnapshot pair is never split: something after it to split off
       replayResponses.push(ok({ status: 0 }, 503, { "retry-after": "20" }));
       await vi.advanceTimersByTimeAsync(5000);
       expect(sentChunks()).toHaveLength(1);
@@ -275,7 +342,7 @@ describe("session replay", () => {
 
       const chunks = sentChunks();
       // 503, then the 413, then the two halves.
-      expect(chunks.map((c) => c.chunk.events.length)).toEqual([2, 2, 1, 1]);
+      expect(chunks.map((c) => c.chunk.events.length)).toEqual([3, 3, 2, 1]);
       expect(chunks.map((c) => c.chunk.seq)).toEqual([0, 0, 0, 1]);
     });
 

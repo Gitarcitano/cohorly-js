@@ -1,8 +1,21 @@
 import { CompressionStream as NodeCompressionStream } from "node:stream/web";
 import { gunzipSync } from "node:zlib";
+import * as fflate from "fflate";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReplayChunk, SenderOptions } from "../src/replay/sender.js";
-import { KEEPALIVE_BUDGET_BYTES, ReplaySender } from "../src/replay/sender.js";
+import { chunkJson, KEEPALIVE_BUDGET_BYTES, MAX_CHUNK_BYTES, ReplaySender } from "../src/replay/sender.js";
+
+vi.mock("fflate", async (importOriginal) => {
+  const real = await importOriginal<typeof import("fflate")>();
+  return { ...real, gzipSync: vi.fn(real.gzipSync) };
+});
+const realFflate = await vi.importActual<typeof import("fflate")>("fflate");
+const gzipSync = vi.mocked(fflate.gzipSync);
+
+/** The keepalive path gzips with fflate (by default these tests keep plain bodies, sized as their JSON). */
+function useRealGzip(): void {
+  gzipSync.mockImplementation(realFflate.gzipSync);
+}
 
 const API_HOST = "https://ingest.example.com";
 
@@ -53,10 +66,30 @@ describe("ReplaySender", () => {
     });
   }
 
+  /** A chunk of the given events. */
+  function eventsChunk(s: ReplaySender, events: object[], extra: Partial<ReplayChunk> = {}): ReplayChunk {
+    return s.chunk({
+      sessionId: "s1",
+      distinctId: "d1",
+      mode: "session",
+      eventsJson: JSON.stringify(events),
+      count: events.length,
+      ...extra,
+    });
+  }
+
+  const meta = { type: 4, timestamp: 1, data: { href: "https://app.example.com/" } };
+  const snapshot = (padBytes = 0) => ({ type: 2, timestamp: 1, data: { node: {}, pad: "x".repeat(padBytes) } });
+  const incremental = { type: 3, timestamp: 2, data: { source: 2 } };
+
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     vi.setSystemTime(Date.UTC(2026, 10, 14));
     vi.stubGlobal("CompressionStream", undefined);
+    gzipSync.mockReset();
+    gzipSync.mockImplementation(() => {
+      throw new Error("plain bodies in this test");
+    });
     calls = [];
     seqs = new Map();
     respond = async () => new Response('{"status":1}', { status: 200 });
@@ -128,7 +161,13 @@ describe("ReplaySender", () => {
       const small = chunk(s, 1, 20_000);
       s.enqueue([big, small], false);
       const hidden = s.flushKeepalive(false); // visibilitychange
-      const pagehide = s.flushKeepalive(true); // arrives while the first one runs
+      expect(calls.map((c) => c.chunk.seq)).toEqual([small.seq]);
+      const pagehide = s.flushKeepalive(true); // arrives before anything resumes
+      // Its fetch started inside the call: no await between the handler and the request.
+      expect(calls.map((c) => [c.chunk.seq, c.chunk.events.length])).toEqual([
+        [small.seq, 1],
+        [big.seq, 2],
+      ]);
       await Promise.all([hidden, pagehide]);
 
       const keepalive = calls.filter((c) => c.keepalive);
@@ -143,6 +182,7 @@ describe("ReplaySender", () => {
 
     it("gzips keepalive bodies and puts token and compression in the query", async () => {
       vi.stubGlobal("CompressionStream", NodeCompressionStream);
+      useRealGzip();
       const s = sender();
       s.enqueue([chunk(s, 3)], false);
       await s.flushKeepalive(true);
@@ -152,6 +192,224 @@ describe("ReplaySender", () => {
       expect(calls[0].url).toBe(`${API_HOST}/replay?token=tok&compression=gzip`);
       expect(calls[0].headers).toEqual({ "content-type": "text/plain;charset=UTF-8" });
       expect(calls[0].chunk.events).toHaveLength(3);
+    });
+
+    it("starts the first keepalive fetch inside the flush call, with a gzip body and no await before it", () => {
+      useRealGzip();
+      const s = sender();
+      const queued = chunk(s, 3);
+      s.enqueue([queued], false);
+
+      void s.flushKeepalive(true);
+
+      const fetchMock = vi.mocked(fetch);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { body: Uint8Array; keepalive: boolean }];
+      expect(url).toBe(`${API_HOST}/replay?token=tok&compression=gzip`);
+      expect(init.keepalive).toBe(true);
+      const json = realFflate.strFromU8(realFflate.gunzipSync(init.body));
+      expect(JSON.parse(json)).toEqual(JSON.parse(chunkJson(queued)));
+    });
+
+    it("sends plain JSON, still inside the flush call, when gzipSync throws", () => {
+      const s = sender();
+      const queued = chunk(s, 3);
+      s.enqueue([queued], false);
+
+      void s.flushKeepalive(true);
+
+      const fetchMock = vi.mocked(fetch);
+      expect(gzipSync).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, { body: unknown; keepalive: boolean }];
+      expect(url).toBe(`${API_HOST}/replay?token=tok`);
+      expect(init.keepalive).toBe(true);
+      expect(init.body).toBe(chunkJson(queued));
+    });
+
+    it("never compresses a chunk over MAX_CHUNK_BYTES on the keepalive path: it stays queued whole", async () => {
+      useRealGzip();
+      respond = () => new Promise(() => {});
+      const s = sender();
+      const big = chunk(s, 2, MAX_CHUNK_BYTES / 2 + 100);
+      s.enqueue([big], false);
+      await s.flushKeepalive(true);
+
+      expect(gzipSync).not.toHaveBeenCalled();
+      expect(calls.filter((c) => c.keepalive)).toEqual([]);
+      expect(s.pending.filter((c) => c.seq === big.seq).map((c) => c.count)).toEqual([2]);
+    });
+
+    it("leaves later chunks of a session queued when its FullSnapshot does not fit; other sessions still go", async () => {
+      respond = () => new Promise(() => {});
+      const s = sender();
+      // Only a Meta and its FullSnapshot, over the budget: never split, so it stays.
+      const x0 = eventsChunk(s, [meta, snapshot(80_000)], { sessionId: "x", hasSnapshot: true });
+      const y0 = eventsChunk(s, [incremental], { sessionId: "y" });
+      const x1 = eventsChunk(s, [incremental], { sessionId: "x" });
+      s.enqueue([x0, y0, x1], false);
+      await s.flushKeepalive(true);
+
+      expect(calls.filter((c) => c.keepalive).map((c) => c.chunk.session_id)).toEqual(["y"]);
+      expect(s.pending.filter((c) => c.sessionId === "x").map((c) => c.count)).toEqual([2, 1]);
+    });
+
+    it("sends the later chunks of a session when its FullSnapshot fits", async () => {
+      respond = () => new Promise(() => {});
+      const s = sender();
+      const x0 = eventsChunk(s, [meta, snapshot()], { sessionId: "x", hasSnapshot: true });
+      const y0 = eventsChunk(s, [incremental], { sessionId: "y" });
+      const x1 = eventsChunk(s, [incremental], { sessionId: "x" });
+      s.enqueue([x0, y0, x1], false);
+      await s.flushKeepalive(true);
+
+      expect(calls.filter((c) => c.keepalive).map((c) => [c.chunk.session_id, c.chunk.seq])).toEqual([
+        ["x", x0.seq],
+        ["y", y0.seq],
+        ["x", x1.seq],
+      ]);
+    });
+
+    it("with little budget left, skips a chunk too big to split and still sends a smaller one after it", () => {
+      respond = () => new Promise(() => {});
+      const s = sender();
+      const first = chunk(s, 1, 52 * 1024); // leaves about 10 KiB of the budget
+      const mid = chunk(s, 3, 5_000); // ~15 KiB: does not fit, too little left to split
+      const tail = chunk(s, 1, 1_000);
+      s.enqueue([first, mid, tail], false);
+      void s.flushKeepalive(true);
+
+      expect(KEEPALIVE_BUDGET_BYTES - calls[0].bytes).toBeLessThan(16 * 1024);
+      expect(calls.map((c) => c.chunk.seq)).toEqual([first.seq, tail.seq]);
+      expect(s.pending.find((c) => c.seq === mid.seq)?.count).toBe(3);
+    });
+
+    it("measures MAX_CHUNK_BYTES in UTF-8: a chunk under it in UTF-16 but over in UTF-8 is never compressed", () => {
+      useRealGzip();
+      respond = () => new Promise(() => {});
+      const s = sender();
+      const wide = eventsChunk(s, [{ type: 3, timestamp: 1, data: { pad: "é".repeat(600_000) } }]);
+      expect(chunkJson(wide).length).toBeLessThan(MAX_CHUNK_BYTES);
+      expect(Buffer.byteLength(chunkJson(wide))).toBeGreaterThan(MAX_CHUNK_BYTES);
+      s.enqueue([wide], false);
+      void s.flushKeepalive(true);
+
+      // Gzipped, it would fit the budget easily: only the UTF-8 size keeps it out.
+      expect(gzipSync).not.toHaveBeenCalled();
+      expect(calls).toEqual([]);
+      expect(s.pending.map((c) => c.count)).toEqual([1]);
+    });
+
+    it("on pagehide drops what follows the FullSnapshot from a session's head so its start still goes", () => {
+      respond = () => new Promise(() => {});
+      const s = sender();
+      const x0 = eventsChunk(s, [incremental], { sessionId: "x" });
+      const tail = { type: 3, timestamp: 2, data: { source: 2, pad: "z".repeat(40_000) } };
+      const x1 = eventsChunk(s, [meta, snapshot(30_000), tail], { sessionId: "x", hasSnapshot: true });
+      s.enqueue([x0, x1], false);
+      void s.flushKeepalive(true);
+
+      expect(calls.map((c) => [c.chunk.seq, (c.chunk.events as { type: number }[]).map((e) => e.type)])).toEqual([
+        [x0.seq, [3]],
+        [x1.seq, [4, 2]],
+      ]);
+      expect(s.pending.filter((c) => !c.keepalive).map((c) => [c.count, c.hasSnapshot])).toEqual([[1, false]]);
+    });
+
+    describe("with real gzip", () => {
+      /** Text gzip barely shrinks (deterministic pseudo-random base 36). */
+      function noise(length: number): string {
+        let state = 1;
+        const out: string[] = [];
+        while (out.length < length) {
+          state = (state + 0x6d2b79f5) | 0;
+          let t = Math.imul(state ^ (state >>> 15), state | 1);
+          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+          out.push((((t ^ (t >>> 14)) >>> 0) % 36).toString(36));
+        }
+        return out.join("");
+      }
+
+      beforeEach(() => {
+        useRealGzip();
+        respond = () => new Promise(() => {}); // the page is closing: nothing answers
+      });
+
+      it("never sends the start of a session without its snapshot: a small prefix waits with a FullSnapshot whose gzip is over the budget", () => {
+        const s = sender();
+        const x0 = eventsChunk(s, [incremental], { sessionId: "x" });
+        const x1 = eventsChunk(s, [meta, { ...snapshot(), data: { node: {}, pad: noise(150_000) } }], {
+          sessionId: "x",
+          hasSnapshot: true,
+        });
+        const y0 = eventsChunk(s, [incremental], { sessionId: "y" });
+        const x2 = eventsChunk(s, [incremental], { sessionId: "x" });
+        s.enqueue([x0, x1, y0, x2], false);
+        void s.flushKeepalive(true);
+
+        expect(calls.map((c) => [c.chunk.session_id, c.chunk.seq])).toEqual([["y", y0.seq]]);
+        expect(calls.every((c) => c.keepalive)).toBe(true);
+        expect(s.pending.filter((c) => c.sessionId === "x").map((c) => c.seq)).toEqual([x0.seq, x1.seq, x2.seq]);
+      });
+
+      it("sends a session's whole head in order when its gzip fits, within the budget", () => {
+        const s = sender();
+        const x0 = eventsChunk(s, [incremental], { sessionId: "x" });
+        // 500 KB as JSON, about 1 KB gzipped: only the gzip makes it fit.
+        const x1 = eventsChunk(s, [meta, snapshot(500_000)], { sessionId: "x", hasSnapshot: true });
+        const y0 = eventsChunk(s, [incremental], { sessionId: "y" });
+        const x2 = eventsChunk(s, [incremental], { sessionId: "x" });
+        s.enqueue([x0, x1, y0, x2], false);
+        void s.flushKeepalive(true);
+
+        expect(calls.map((c) => [c.chunk.session_id, c.chunk.seq])).toEqual([
+          ["x", x0.seq],
+          ["x", x1.seq],
+          ["y", y0.seq],
+          ["x", x2.seq],
+        ]);
+        expect(calls.every((c) => c.url.endsWith("compression=gzip"))).toBe(true);
+        expect(calls.reduce((sum, c) => sum + c.bytes, 0)).toBeLessThanOrEqual(KEEPALIVE_BUDGET_BYTES);
+      });
+
+      it("stops at the budget measured on the gzip bodies and leaves the rest queued whole", () => {
+        const s = sender();
+        const chunks = [0, 1, 2].map((i) =>
+          eventsChunk(s, [{ ...incremental, data: { source: 2, i, pad: noise(60_000) } }]),
+        ); // ~40 KB gzipped each: one fits, two do not
+        s.enqueue(chunks, false);
+        void s.flushKeepalive(false);
+
+        expect(calls.map((c) => c.chunk.seq)).toEqual([chunks[0].seq]);
+        expect(calls[0].bytes).toBeLessThan(60_000);
+        expect(s.pending.filter((c) => !c.keepalive).map((c) => c.seq)).toEqual([chunks[1].seq, chunks[2].seq]);
+      });
+    });
+  });
+
+  describe("Meta + FullSnapshot pair", () => {
+    it("a split never cuts between a Meta and the FullSnapshot after it", async () => {
+      const responses = [413, 200, 200];
+      respond = async () => new Response("{}", { status: responses.shift() ?? 200 });
+      const s = sender();
+      s.enqueue([eventsChunk(s, [incremental, meta, snapshot()])]);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(calls.map((c) => (c.chunk.events as { type: number }[]).map((e) => e.type))).toEqual([
+        [3, 4, 2],
+        [3],
+        [4, 2],
+      ]);
+    });
+
+    it("a chunk with only the pair cannot be split: on 413 it is dropped, never half sent", async () => {
+      respond = async () => new Response("{}", { status: 413 });
+      const s = sender();
+      s.enqueue([eventsChunk(s, [meta, snapshot()], { hasSnapshot: true })]);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(calls.map((c) => c.chunk.events.length)).toEqual([2]);
+      expect(s.pending).toHaveLength(0);
     });
   });
 

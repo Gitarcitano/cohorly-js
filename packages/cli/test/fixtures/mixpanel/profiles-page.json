@@ -1,0 +1,28 @@
+{
+  "page": 0,
+  "page_size": 1000,
+  "session_id": "1700000000-example",
+  "status": "ok",
+  "total": 4,
+  "results": [
+    {
+      "$distinct_id": "user-1",
+      "$properties": {
+        "$email": "ada@example.com",
+        "$name": "Ada",
+        "$last_seen": "2024-03-01T10:00:00",
+        "$timezone": "America/Sao_Paulo",
+        "plan": "pro"
+      }
+    },
+    {
+      "$distinct_id": "user-2",
+      "$properties": { "$email": "grace@example.com", "plan": "free", "ip": "203.0.113.9" }
+    },
+    { "$distinct_id": "user-3" },
+    {
+      "$distinct_id": "user-4",
+      "$properties": { "$last_seen": "2024-02-10T08:30:00", "plan": "free" }
+    }
+  ]
+}

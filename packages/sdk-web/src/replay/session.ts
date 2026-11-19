@@ -35,6 +35,16 @@ export interface SessionReplayOptions {
    * size is). `[data-cohorly-block]` is always blocked too.
    */
   blockSelector?: string;
+  /**
+   * Exact origins (`"https://pay.example.com"`) of cross-origin iframes
+   * recorded inside this page's replay, and, in an iframe, of the parent page
+   * allowed to record it. Both pages must run the SDK and list each other.
+   * Empty by default; an item that is not an exact http(s) origin (`"*"`, a
+   * path, a trailing slash) is ignored with a debug log. In the iframe, its
+   * own `maskTextSelector` and `blockSelector` apply, and it relays even with
+   * both rates at 0 (the parent decides).
+   */
+  allowedIframeOrigins?: string[];
 }
 
 export const SESSION_KEY = "chl_replay_session";

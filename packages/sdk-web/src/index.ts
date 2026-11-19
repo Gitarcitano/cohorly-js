@@ -30,8 +30,10 @@ import {
   PAGEVIEW_EVENT,
   setupPageviewAutotrack,
 } from "./pageview.js";
+import type { IframeRelay } from "./replay/relay.js";
+import { normalizeIframeOrigins, startIframeRelay } from "./replay/relay.js";
 import type { ReplayController, SessionReplayOptions } from "./replay/session.js";
-import { replayWanted, startSessionReplay } from "./replay/session.js";
+import { replayWanted, SESSION_KEY, startSessionReplay } from "./replay/session.js";
 import { localStorageAdapter, sessionStorageAdapter } from "./storage.js";
 
 export interface CohorlyWebOptions {
@@ -135,7 +137,8 @@ export interface CohorlyWebOptions {
    * the last 30 to 60 seconds in memory and sends them when an exception is
    * captured (needs `captureExceptions` or `captureException()`). Inputs are always masked, `[data-cohorly-mask]` text is masked
    * and `[data-cohorly-block]` elements are never recorded. When set (with a
-   * rate above 0), every event carries `$session_id`.
+   * rate above 0), every event carries `$session_id`. `allowedIframeOrigins`
+   * records cross-origin iframes that run the SDK and list this page back.
    */
   sessionReplay?: SessionReplayOptions;
 }
@@ -250,6 +253,10 @@ let activeClient: CohorlyClient | null = null;
 let debugEnabled = false;
 let exceptionTeardown: (() => void) | null = null;
 let replayController: ReplayController | null = null;
+/** Child-frame side of cross-origin iframe recording (VEL-2152). */
+let iframeRelay: IframeRelay | null = null;
+/** The child's own recording is suspended while its parent records this frame. */
+let ownReplaySuspended = false;
 
 function ensureClient(): CohorlyClient {
   if (!activeClient) {
@@ -326,6 +333,8 @@ export const cohorly: Cohorly = {
     const client = ensureClient();
     // Replay first: its pending chunk still belongs to the outgoing identity.
     replayController?.reset();
+    // Suspended by an iframe relay: the resumed recording must not continue the outgoing identity's session.
+    if (ownReplaySuspended) sessionStorageAdapter.remove(SESSION_KEY);
     client.reset();
   },
   register(props) {
@@ -403,6 +412,13 @@ export const cohorly: Cohorly = {
     // Recording does not resume on optInTracking(), only on the next init().
     replayController?.optOut();
     replayController = null;
+    iframeRelay?.dispose();
+    iframeRelay = null;
+    if (ownReplaySuspended) {
+      ownReplaySuspended = false;
+      // The suspended recorder handed its queue on for the resume: opt-out drops it instead.
+      void import("./replay/replay.js").then((mod) => mod.discardHandoff()).catch(() => {});
+    }
   },
   optInTracking() {
     ensureClient().optInTracking();
@@ -447,6 +463,9 @@ export function init(options: CohorlyWebOptions): Cohorly {
   unloadTeardown = null;
   replayController?.stop();
   replayController = null;
+  iframeRelay?.dispose();
+  iframeRelay = null;
+  ownReplaySuspended = false;
   activeClient = new CohorlyClient({
     apiHost: options.apiHost,
     storage: localStorageAdapter,
@@ -501,21 +520,49 @@ export function init(options: CohorlyWebOptions): Cohorly {
 
   // After the exception capture: both share one fetch/XHR wrapper (network.ts).
   // Opted out at init: rrweb is never loaded.
-  if (replayWanted(options.sessionReplay) && !activeClient.hasOptedOutTracking()) {
+  if (options.sessionReplay && !activeClient.hasOptedOutTracking()) {
     const client = activeClient;
-    replayController = startSessionReplay(options.sessionReplay ?? {}, {
-      apiHost: client.getApiHost(),
-      token: options.token,
-      localStorage: localStorageAdapter,
-      sessionStorage: sessionStorageAdapter,
-      maxRetryDelayMs: options.maxRetryDelayMs ?? 600_000,
-      getDistinctId: () => client.getDistinctId(),
-      log: (...args) => {
-        if (debugEnabled) console.warn("[cohorly]", ...args);
+    const replayLog = (...args: unknown[]) => {
+      if (debugEnabled) console.warn("[cohorly]", ...args);
+    };
+    const replayOptions = {
+      ...options.sessionReplay,
+      allowedIframeOrigins: normalizeIframeOrigins(options.sessionReplay.allowedIframeOrigins, replayLog),
+    };
+    const startOwnReplay = () => {
+      if (!replayWanted(replayOptions)) return;
+      replayController = startSessionReplay(replayOptions, {
+        apiHost: client.getApiHost(),
+        token: options.token,
+        localStorage: localStorageAdapter,
+        sessionStorage: sessionStorageAdapter,
+        maxRetryDelayMs: options.maxRetryDelayMs ?? 600_000,
+        getDistinctId: () => client.getDistinctId(),
+        log: replayLog,
+        random: Math.random,
+        // replay.ts, the sender and rrweb load only when a session records.
+        loadReplay: () => import("./replay/replay.js"),
+      });
+    };
+    startOwnReplay();
+    // In a cross-origin iframe whose parent lists this origin (and this page
+    // lists the parent's): the parent records this frame on request. Not
+    // gated by the rates, and no rrweb until the parent asks.
+    iframeRelay = startIframeRelay({
+      options: replayOptions,
+      origins: replayOptions.allowedIframeOrigins,
+      load: () => import("./replay/replay.js"),
+      suspend: () => {
+        ownReplaySuspended = replayController !== null;
+        replayController?.stop();
+        replayController = null;
       },
-      random: Math.random,
-      // replay.ts, the sender and rrweb load only when a session records.
-      loadReplay: () => import("./replay/replay.js"),
+      resume: () => {
+        const resume = ownReplaySuspended;
+        ownReplaySuspended = false;
+        if (resume && activeClient === client && !client.hasOptedOutTracking()) startOwnReplay();
+      },
+      log: replayLog,
     });
   }
 

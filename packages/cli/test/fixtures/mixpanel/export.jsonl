@@ -1,0 +1,10 @@
+{"event":"Signed Up","properties":{"time":1700000000,"distinct_id":"user-1","$insert_id":"ins-0001","mp_lib":"web","$browser":"Chrome","$city":"Lisbon","mp_country_code":"PT","mp_processing_time_ms":1700000000412}}
+{"event":"Viewed Page","properties":{"time":1700000100,"distinct_id":"user-1","$insert_id":"ins-0002","mp_lib":"web","$current_url":"https://example.com/pricing"}}
+{"event":"Viewed Page","properties":{"time":1700000200,"distinct_id":"user-2","$insert_id":"ins-0003","mp_lib":"web","$browser":"Firefox"}}
+{"event":"Purchase","properties":{"time":1700050000,"distinct_id":"user-1","$insert_id":"ins-0004","mp_lib":"web","amount":12.5,"plan":"pro"}}
+{"event":"Viewed Page","properties":{"time":1700100000000,"distinct_id":"user-3","$insert_id":"ins-0005","mp_lib":"android","$lib":"cohorly-android"}}
+{"event":"Signed Up","properties":{"time":1700100001000,"distinct_id":"user-3","$insert_id":"ins-0006","mp_lib":"android","$os":"Android"}}
+{"event":"Viewed Page","properties":{"time":1700100002000,"distinct_id":"user-3","$insert_id":"ins-0007","mp_lib":"android"}}
+{"event":"Purchase","properties":{"time":1700100003000,"distinct_id":"user-3","$insert_id":"ins-0008","mp_lib":"android","amount":30,"plan":"team"}}
+{"event":"Signed Up","properties":{"time":1700150000,"distinct_id":"user-4","$insert_id":"ins-0009","mp_lib":"iphone","$os":"iOS"}}
+{"event":"Viewed Page","properties":{"time":1700150010,"distinct_id":"user-4","$insert_id":"ins-0010","mp_lib":"iphone"}}

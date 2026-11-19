@@ -1,0 +1,97 @@
+{
+  "name": "@cohorly/cli",
+  "version": "0.2.0",
+  "description": "Cohorly command line and build plugins: inject debug ids, upload source map indexes, R8 mappings and dSYM symcaches so Cohorly can symbolicate errors. Includes Vite, Next.js and Expo (React Native) plugins, and imports Mixpanel event history.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "default": "./dist/vite.js"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "default": "./dist/next.js"
+    },
+    "./expo": {
+      "types": "./dist/expo.d.ts",
+      "default": "./dist/expo.js"
+    },
+    "./app.plugin": "./app.plugin.cjs",
+    "./app.plugin.js": "./app.plugin.cjs",
+    "./app.plugin.cjs": "./app.plugin.cjs",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "cohorly": "dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "app.plugin.cjs",
+    "cohorly.gradle",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node -e \"require('node:fs').writeFileSync('dist/cjs/package.json', '{\\\"type\\\":\\\"commonjs\\\"}\\\\n')\"",
+    "test": "vitest run",
+    "prepublishOnly": "pnpm run build"
+  },
+  "keywords": [
+    "cohorly",
+    "error-tracking",
+    "source-maps",
+    "sourcemaps",
+    "hermes",
+    "r8",
+    "proguard",
+    "dsym",
+    "symcache",
+    "ios",
+    "react-native",
+    "expo",
+    "config-plugin",
+    "vite",
+    "vite-plugin",
+    "nextjs",
+    "cli",
+    "mixpanel",
+    "import"
+  ],
+  "author": "Giovanne Tarcitano",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Gitarcitano/cohorly-js",
+    "directory": "packages/cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31"
+  },
+  "peerDependencies": {
+    "@expo/config-plugins": ">=9"
+  },
+  "peerDependenciesMeta": {
+    "@expo/config-plugins": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@expo/config-plugins": "57.0.2",
+    "@jridgewell/gen-mapping": "^0.3.13",
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.2",
+    "vitest": "4.1.12"
+  }
+}

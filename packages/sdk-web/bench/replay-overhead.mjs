@@ -18,8 +18,11 @@
 //   (decompressed), counted by a local mock API.
 //
 // Usage (from the repo root, after `pnpm --filter @cohorly/core build` and
-// `pnpm --filter @cohorly/web build`, browsers from `pnpm --filter @cohorly/e2e browsers`):
-//   node packages/sdk-web/bench/replay-overhead.mjs [--duration 60] [--runs 2]
+// `pnpm --filter @cohorly/web build`, browsers from `pnpm --filter @cohorly/e2e browsers`, plus `pnpm exec playwright install firefox webkit` for the others):
+//   node packages/sdk-web/bench/replay-overhead.mjs [--duration 60] [--runs 2] [--browser chromium|firefox|webkit]
+// (or BENCH_BROWSER). Chromium is the default and the only one with CPU
+// numbers: CDP Performance.getMetrics does not exist in Firefox or WebKit, so
+// there only the bytes sent (and that the SDK runs at all) are reported.
 // (5 variants x runs x about DURATION_S + 11 s each).
 import { readFileSync, realpathSync } from "node:fs";
 import { createServer } from "node:http";
@@ -35,6 +38,10 @@ const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`);
   return i > 0 ? Number(process.argv[i + 1]) : fallback;
 };
+const BROWSER = (() => {
+  const i = process.argv.indexOf("--browser");
+  return (i > 0 ? process.argv[i + 1] : process.env.BENCH_BROWSER) || "chromium";
+})();
 const DURATION_S = arg("duration", 60);
 const RUNS = arg("runs", 2);
 const VARIANTS = [
@@ -50,10 +57,17 @@ const REPLAY_OPTIONS = {
 };
 
 const require = createRequire(realpathSync(join(repo, "apps/e2e/node_modules/@playwright/test/package.json")));
-const { chromium } = require("playwright-core");
+const playwright = require("playwright-core");
+const browserType = playwright[BROWSER];
+if (!browserType) throw new Error(`unknown browser "${BROWSER}" (chromium, firefox or webkit)`);
 const recordJs = join(
   dirname(realpathSync(join(repo, "packages/sdk-web/node_modules/@rrweb/record/package.json"))),
   "dist/record.js",
+);
+// The SDK build keeps `import "fflate"` (keepalive gzip): serve its browser ESM build.
+const fflateJs = join(
+  dirname(createRequire(join(repo, "packages/sdk-web/package.json")).resolve("fflate/package.json")),
+  "esm/browser.js",
 );
 
 // ---- mock ingestion API: counts /replay bytes
@@ -96,7 +110,7 @@ const API = `http://127.0.0.1:${api.address().port}`;
 // scripted interaction driven by page timers; init() runs when the harness says.
 const page = (replay, cards) => `<!doctype html><meta charset=utf-8><title>bench</title>
 <style>body{font:14px system-ui;margin:16px}li{padding:2px}.card{border:1px solid #ccc;margin:4px;padding:4px}</style>
-<script type="importmap">{"imports":{"@cohorly/core":"/core/index.js","@cohorly/web":"/web/index.js","@rrweb/record":"/rrweb/record.js"}}</script>
+<script type="importmap">{"imports":{"@cohorly/core":"/core/index.js","@cohorly/web":"/web/index.js","@rrweb/record":"/rrweb/record.js","fflate":"/fflate/browser.js"}}</script>
 <h1>Checkout</h1>
 <form><input id=name placeholder=Name><input id=email placeholder=Email><textarea id=notes></textarea><button type=button id=add>Add item</button></form>
 <ul id=list></ul><div id=cards></div>
@@ -160,6 +174,9 @@ const site = createServer((req, res) => {
   if (url.pathname === "/rrweb/record.js") {
     return void res.writeHead(200, { "content-type": "text/javascript" }).end(readFileSync(recordJs));
   }
+  if (url.pathname === "/fflate/browser.js") {
+    return void res.writeHead(200, { "content-type": "text/javascript" }).end(readFileSync(fflateJs));
+  }
   const m = /^\/(core|web)\/([\w./-]+)$/.exec(url.pathname);
   if (!m || m[2].includes("..")) return void res.writeHead(404).end();
   try {
@@ -172,27 +189,30 @@ const site = createServer((req, res) => {
 await new Promise((r) => site.listen(0, "127.0.0.1", r));
 const ORIGIN = `http://127.0.0.1:${site.address().port}`;
 
-const browser = await chromium.launch();
+const browser = await browserType.launch();
+const CDP = BROWSER === "chromium";
 const metric = (all, name) => all.metrics.find((x) => x.name === name)?.value ?? 0;
+const NO_METRICS = { metrics: [] };
 
 async function run(variant) {
   resetStats();
   const context = await browser.newContext();
   const p = await context.newPage();
-  const cdp = await context.newCDPSession(p);
-  await cdp.send("Performance.enable", { timeDomain: "threadTicks" });
+  const cdp = CDP ? await context.newCDPSession(p) : null;
+  const getMetrics = async () => (cdp ? cdp.send("Performance.getMetrics") : NO_METRICS);
+  if (cdp) await cdp.send("Performance.enable", { timeDomain: "threadTicks" });
   await p.goto(`${ORIGIN}/?replay=${variant.replay ?? ""}&cards=${variant.cards}`);
   await p.waitForFunction(() => window.ready === true);
   await p.waitForTimeout(500);
   const elements = await p.evaluate(() => window.elementCount());
-  const beforeInit = await cdp.send("Performance.getMetrics");
+  const beforeInit = await getMetrics();
   await p.evaluate(() => window.startSdk());
   await p.waitForTimeout(1500); // dynamic imports, record(), first full snapshot
-  const afterInit = await cdp.send("Performance.getMetrics");
+  const afterInit = await getMetrics();
   await p.waitForTimeout(1000);
-  const before = await cdp.send("Performance.getMetrics");
+  const before = await getMetrics();
   await p.evaluate((ms) => window.runInteraction(ms), DURATION_S * 1000);
-  const after = await cdp.send("Performance.getMetrics");
+  const after = await getMetrics();
   if (variant.replay === "error") await p.evaluate(() => window.captureError());
   await p.waitForTimeout(6000); // the 5 s chunk timer
   await p.close({ runBeforeUnload: true }); // pagehide: keepalive flush
@@ -217,14 +237,14 @@ const minutes = DURATION_S / 60;
 const fmt = (n, d = 3) => n.toFixed(d);
 
 console.log(`machine: ${cpus()[0]?.model} x${cpus().length}, ${Math.round(totalmem() / 2 ** 30)} GB, ${platform()} ${release()}, node ${process.version}`);
-console.log(`browser: chromium ${browser.version()} (headless, playwright-core)`);
+console.log(`browser: ${BROWSER} ${browser.version()} (headless, playwright-core)${CDP ? "" : "; no CDP, so no CPU numbers, only bytes sent"}`);
 console.log(`interaction: ${DURATION_S}s scripted (typing 10/s, click+append 2/s, text mutations 1/s, mousemove 20/s, scroll 0.5/s), ${RUNS} runs per variant`);
-console.log("init window: from just before init() to 1.5 s after it (replay imports, record(), first full snapshot)");
-console.log(`CPU window: the ${DURATION_S}s interaction only, starting 1 s after the init window; page load, init, the error send and the final flushes are outside it`);
+if (CDP) console.log("init window: from just before init() to 1.5 s after it (replay imports, record(), first full snapshot)");
+if (CDP) console.log(`CPU window: the ${DURATION_S}s interaction only, starting 1 s after the init window; page load, init, the error send and the final flushes are outside it`);
 for (const [name, list] of Object.entries(results)) {
   for (const [i, r] of list.entries()) {
     console.log(
-      `${name} run ${i + 1}: elements ${r.elements} init Task ${fmt(r.initTaskS)}s Script ${fmt(r.initScriptS)}s | TaskDuration ${fmt(r.taskS)}s ScriptDuration ${fmt(r.scriptS)}s | replay requests ${r.requests} (gzip ${r.gzip}, keepalive ${r.keepalive}, error chunks ${r.errorChunks}) events ${r.events} wire ${r.wire} B raw ${r.raw} B`,
+      `${name} run ${i + 1}: elements ${r.elements} ${CDP ? `init Task ${fmt(r.initTaskS)}s Script ${fmt(r.initScriptS)}s | TaskDuration ${fmt(r.taskS)}s ScriptDuration ${fmt(r.scriptS)}s | ` : ""}replay requests ${r.requests} (gzip ${r.gzip}, keepalive ${r.keepalive}, error chunks ${r.errorChunks}) events ${r.events} wire ${r.wire} B raw ${r.raw} B`,
     );
   }
 }
@@ -236,10 +256,10 @@ const compare = (base, name) => {
   const dInitTask = avg(on, "initTaskS") - avg(off, "initTaskS");
   const dInitScript = avg(on, "initScriptS") - avg(off, "initScriptS");
   console.log(`== ${name} vs ${base} (elements ${Math.round(avg(on, "elements"))})`);
-  console.log(`avg ${base}: init Task ${fmt(avg(off, "initTaskS"))}s Script ${fmt(avg(off, "initScriptS"))}s | TaskDuration ${fmt(avg(off, "taskS"))}s ScriptDuration ${fmt(avg(off, "scriptS"))}s`);
-  console.log(`avg ${name}: init Task ${fmt(avg(on, "initTaskS"))}s Script ${fmt(avg(on, "initScriptS"))}s | TaskDuration ${fmt(avg(on, "taskS"))}s ScriptDuration ${fmt(avg(on, "scriptS"))}s`);
-  console.log(`init cost: +${fmt(dInitTask)}s task, +${fmt(dInitScript)}s script`);
-  console.log(
+  if (CDP) console.log(`avg ${base}: init Task ${fmt(avg(off, "initTaskS"))}s Script ${fmt(avg(off, "initScriptS"))}s | TaskDuration ${fmt(avg(off, "taskS"))}s ScriptDuration ${fmt(avg(off, "scriptS"))}s`);
+  if (CDP) console.log(`avg ${name}: init Task ${fmt(avg(on, "initTaskS"))}s Script ${fmt(avg(on, "initScriptS"))}s | TaskDuration ${fmt(avg(on, "taskS"))}s ScriptDuration ${fmt(avg(on, "scriptS"))}s`);
+  if (CDP) console.log(`init cost: +${fmt(dInitTask)}s task, +${fmt(dInitScript)}s script`);
+  if (CDP) console.log(
     `interaction CPU overhead: +${fmt(dTask)}s main-thread task time over ${DURATION_S}s (${fmt((dTask / DURATION_S) * 100, 2)}% of wall time), +${fmt(dScript)}s script`,
   );
   console.log(

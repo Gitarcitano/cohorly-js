@@ -15,12 +15,16 @@ struct CrashUserInfo: Equatable {
     static let distinctIdKey = "distinct_id"
     static let deviceIdKey = "device_id"
     static let userIdKey = "user_id"
+    static let sessionIdKey = "session_id"
 
     var release: String?
     var dist: String?
     var distinctId: String?
     var deviceId: String?
     var userId: String?
+    /// `$session_id` of the replay session the app is in (Swift SDK with
+    /// `CohorlyReplay` only).
+    var sessionId: String?
 
     /// Key/value pairs as written to KSCrash. A nil value removes the key.
     var entries: [(key: String, value: String?)] {
@@ -29,7 +33,8 @@ struct CrashUserInfo: Equatable {
             (Self.distKey, dist),
             (Self.distinctIdKey, distinctId),
             (Self.deviceIdKey, deviceId),
-            (Self.userIdKey, userId)
+            (Self.userIdKey, userId),
+            (Self.sessionIdKey, sessionId)
         ]
     }
 }

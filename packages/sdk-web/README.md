@@ -246,6 +246,31 @@ Privacy defaults, which cannot be turned off:
 <p data-cohorly-mask>Signed in as jane@example.com</p>
 ```
 
+**Cross-origin iframes.** `allowedIframeOrigins` (exact origins such as
+`"https://pay.example.com"`, empty by default; `*`, paths and trailing
+slashes are ignored with a debug log) records a cross-origin `<iframe>`
+inside the parent page's recording, when both pages run the SDK and each
+lists the other's origin:
+
+```ts
+// parent, https://shop.example.com
+sessionReplay: { sampleRate: 0.1, allowedIframeOrigins: ["https://pay.example.com"] }
+// iframe, https://pay.example.com (relays even with both rates at 0)
+sessionReplay: { allowedIframeOrigins: ["https://shop.example.com"] }
+```
+
+Both sides use `postMessage({ source: "cohorly-replay", v: 1, op }, origin)`,
+only to listed origins, never `"*"`: `op` is `"snapshot"` or `"stop"` from the
+parent, and `"ready"` from the frame at each `init()` (so a late or repeated
+init is asked again). The frame answers only its own `window.parent` on a
+listed origin, and the parent drops rrweb messages from unlisted origins, from
+windows that are not one of its iframes, or from an iframe it blocks (its
+`blockSelector`, on the frame or an ancestor). The frame's own masking applies
+inside it, and it does not record a session of its own meanwhile. An
+interaction inside the frame wakes the parent's session after an idle expiry.
+One level of nesting, no canvas or cursor inside the frame. Details in
+`docs/SESSION-REPLAY.md` "Cross-origin iframes".
+
 Overhead, measured with `bench/replay-overhead.mjs` (in the repository) on
 an Apple M4 Pro (12 cores, macOS), headless Chromium 149, 60 seconds of
 scripted interaction (typing 10 keys/s, a click that appends a list item 2/s,

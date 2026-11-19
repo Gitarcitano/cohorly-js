@@ -1,0 +1,44 @@
+// Applied to android/app/build.gradle by the @cohorly/cli Expo config plugin.
+// For every non-debuggable variant, uploadCohorlySymbols<Variant> runs after
+// assemble<Variant> and bundle<Variant>: it uploads the composed JS source map
+// as ~/index.android.bundle and, when the variant is minified, the R8
+// mapping.txt. A failed upload fails the build; COHORLY_UPLOAD_DISABLED=1 is
+// the only way to skip it. Override the node binary with the Gradle property
+// cohorly.nodeExecutable.
+
+def cohorlyCliBin = new File(buildscript.sourceFile.parentFile, "dist/bin.js").absolutePath
+def cohorlyNode = (project.findProperty("cohorly.nodeExecutable") ?: "node").toString()
+
+android.applicationVariants.configureEach { variant ->
+    if (variant.buildType.debuggable) {
+        return
+    }
+    def variantName = variant.name
+    def suffix = variantName.capitalize()
+    def buildDirFile = project.layout.buildDirectory.get().asFile
+    def sourcemap = new File(buildDirFile, "generated/sourcemaps/react/${variantName}/index.android.bundle.map")
+    def mapping = new File(buildDirFile, "outputs/mapping/${variantName}/mapping.txt")
+    def minify = variant.buildType.minifyEnabled
+    def release = variant.versionName != null ? "${variant.applicationId}@${variant.versionName}+${variant.versionCode}".toString() : null
+    def producers = ["createBundle${suffix}JsAndAssets".toString(), "minify${suffix}WithR8".toString()]
+    def consumers = ["assemble${suffix}".toString(), "bundle${suffix}".toString()]
+
+    def upload = tasks.register("uploadCohorlySymbols${suffix}", Exec) {
+        group = "cohorly"
+        description = "Uploads the ${variantName} JS source map and R8 mapping to Cohorly"
+        workingDir project.rootDir
+        def command = [cohorlyNode, cohorlyCliBin, "react-native", "gradle", "--sourcemap", sourcemap.absolutePath]
+        if (release != null) {
+            command += ["--release", release]
+        }
+        if (minify) {
+            command += ["--mapping", mapping.absolutePath]
+        }
+        commandLine command
+        dependsOn(tasks.matching { producers.contains(it.name) })
+    }
+
+    tasks.matching { consumers.contains(it.name) }.configureEach {
+        finalizedBy(upload)
+    }
+}

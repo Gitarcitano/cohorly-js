@@ -128,6 +128,7 @@ enum CrashReportConverter {
         if let distinctId = present(CrashUserInfo.distinctIdKey) ?? deviceId { props["distinct_id"] = distinctId }
         if let deviceId { props["$device_id"] = deviceId }
         if let userId = present(CrashUserInfo.userIdKey) { props["$user_id"] = userId }
+        if let sessionId = present(CrashUserInfo.sessionIdKey) { props["$session_id"] = sessionId }
         if let dist = present(CrashUserInfo.distKey) { props["$exception_dist"] = dist }
         if let osVersion = system["system_version"] as? String { props["$os_version"] = osVersion }
         if let model = system["machine"] as? String { props["$model"] = model }

@@ -8,8 +8,11 @@
  * keep and back off honoring Retry-After, 413: split, 400: drop, 401: keep at
  * max backoff), plus 404: replay is not served there, stop for this page.
  */
+import { gzipSync, strToU8 } from "fflate";
 import { VERSION } from "../version.js";
 
+/** A chunk is split before sending past this serialized size (the server's wire limit is 1 MB). */
+export const MAX_CHUNK_BYTES = 1_000_000 - 1024;
 export const MAX_OUTBOX_BYTES = 5 * 1024 * 1024;
 /** Browsers refuse keepalive bodies above 64 KiB in flight; a margin for the rest of the request. */
 export const KEEPALIVE_BUDGET_BYTES = 63 * 1024;
@@ -32,6 +35,8 @@ export interface ReplayChunk {
   seq: number;
   /** Chunks of one error send share it: dropping one drops the batch (it is unplayable without the rest). */
   batch?: number;
+  /** Holds a FullSnapshot (rrweb type 2): the session's later chunks are unplayable without it. */
+  hasSnapshot?: boolean;
   /** A regular request carries it now. */
   inFlight?: boolean;
   /** A keepalive request carries it now. */
@@ -84,6 +89,32 @@ export async function encodeBody(json: string): Promise<Encoded> {
   return { body: json, gzip: false, bytes: byteLength(json) };
 }
 
+/**
+ * Gzip on the calling task, for the keepalive path: a closing page (Firefox)
+ * never resumes an await, so nothing may come between the handler and the
+ * fetch. Plain JSON when fflate throws.
+ */
+export function encodeBodySync(json: string): Encoded {
+  try {
+    const body = gzipSync(strToU8(json));
+    return { body, gzip: true, bytes: body.byteLength };
+  } catch {
+    return { body: json, gzip: false, bytes: byteLength(json) };
+  }
+}
+
+const META = 4;
+const FULL_SNAPSHOT = 2;
+
+function eventType(event: unknown): unknown {
+  return typeof event === "object" && event !== null ? (event as { type?: unknown }).type : undefined;
+}
+
+/** A Meta and the FullSnapshot right after it are one unit: never cut between them. */
+function isSnapshotPair(before: unknown, after: unknown): boolean {
+  return eventType(before) === META && eventType(after) === FULL_SNAPSHOT;
+}
+
 export function chunkJson(chunk: ReplayChunk): string {
   const head = JSON.stringify({
     session_id: chunk.sessionId,
@@ -132,10 +163,6 @@ export class ReplaySender {
   private backoffUntil = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private sending = false;
-  /** The keepalive flush running now (passes chained by {@link flushKeepalive}). */
-  private flushRun: Promise<void> | null = null;
-  /** A split pass was asked for while a flush ran: it runs right after. */
-  private splitQueued = false;
   /** Bumped by shutdown(): responses of older requests change nothing. */
   private epoch = 0;
   private closed = false;
@@ -264,7 +291,8 @@ export class ReplaySender {
     let outcome: Outcome;
     let bytes = 0;
     try {
-      const enc = encoded ?? (await encodeBody(chunkJson(chunk)));
+      const enc =
+        encoded ?? (keepalive ? encodeBodySync(chunkJson(chunk)) : await encodeBody(chunkJson(chunk)));
       if (epoch !== this.epoch) return;
       const headers: Record<string, string> = keepalive
         ? // CORS-safelisted: a keepalive request cannot wait for a preflight.
@@ -320,7 +348,7 @@ export class ReplaySender {
         const halves = this.split(chunk);
         const index = this.outbox.indexOf(chunk);
         if (!halves) {
-          this.options.log("replay chunk with a single event is too large, dropped");
+          this.options.log("replay chunk that cannot be split is too large, dropped");
           this.outbox.splice(index, 1);
           return;
         }
@@ -353,24 +381,37 @@ export class ReplaySender {
   }
 
   /**
-   * Two chunks with half the events each, or null when it holds a single
-   * event. The first half keeps the seq; the second takes a new one from the
-   * same session (the server tolerates gaps and out-of-order seqs, and the
-   * player orders events by timestamp).
+   * Two chunks with about half the events each, or null when it holds a
+   * single event or only a Meta and its FullSnapshot (never cut apart: the
+   * Meta alone is unplayable). The first half keeps the seq; the second
+   * takes a new one from the same session (the server tolerates gaps and
+   * out-of-order seqs, and the player orders events by timestamp).
    */
   private split(chunk: ReplayChunk): [ReplayChunk, ReplayChunk] | null {
     if (chunk.count < 2) return null;
     const events = JSON.parse(chunk.eventsJson) as unknown[];
-    const half = Math.ceil(events.length / 2);
-    const first = events.slice(0, half);
-    const second = events.slice(half);
+    const middle = Math.ceil(events.length / 2);
+    let cut = -1;
+    for (let offset = 0; offset < events.length && cut < 0; offset += 1) {
+      for (const at of [middle - offset, middle + offset]) {
+        if (at >= 1 && at < events.length && !isSnapshotPair(events[at - 1], events[at])) {
+          cut = at;
+          break;
+        }
+      }
+    }
+    if (cut < 0) return null;
+    const first = events.slice(0, cut);
+    const second = events.slice(cut);
+    const holds = (part: unknown[]) => part.some((e) => eventType(e) === FULL_SNAPSHOT);
     const base = { ...chunk, inFlight: false, keepalive: false, claimed: false };
     return [
-      { ...base, eventsJson: JSON.stringify(first), count: first.length },
+      { ...base, eventsJson: JSON.stringify(first), count: first.length, hasSnapshot: holds(first) },
       {
         ...base,
         eventsJson: JSON.stringify(second),
         count: second.length,
+        hasSnapshot: holds(second),
         seq: this.options.nextSeq(chunk.sessionId),
       },
     ];
@@ -381,68 +422,135 @@ export class ReplaySender {
    * `fetch(..., { keepalive: true })` (token and compression as query
    * parameters) while they fit the browser's keepalive budget. A chunk a
    * regular request carries is sent again (a closing page cancels that
-   * request; the server stores a seq once). Chunks are claimed before the
-   * first await, so the regular sender never sends them at the same time.
+   * request; the server stores a seq once). The whole flush is synchronous:
+   * each body is gzipped with fflate and each fetch starts inside this call
+   * (Firefox never resumes an await in a closing page). A chunk over
+   * {@link MAX_CHUNK_BYTES} (UTF-8) is not even compressed (it cannot fit).
    * Only on `split` (pagehide) is a chunk too big split, and only while
    * enough budget is left; what does not fit stays queued whole for the
-   * regular sender if the page comes back. Re-entry (visibilitychange then
-   * pagehide) never sends a chunk twice: a call while a flush runs queues a
-   * split pass (pagehide) after it, over what is left and with what is left
-   * of the same budget; a plain call then is a no-op. Ignores the backoff
-   * (last chance).
+   * regular sender if the page comes back.
+   *
+   * The start of a session never goes without its snapshot: the chunks of a
+   * session up to and including the first one holding a FullSnapshot still
+   * queued (its head) go together, all of them only if their sum fits what
+   * is left of the budget, else none (on `split`, the snapshot chunk may
+   * first be split to drop what follows the snapshot). When a chunk holding
+   * a FullSnapshot stays queued, so do the later chunks of its session in
+   * that pass (they are unplayable without it).
+   *
+   * Each call (visibilitychange, then pagehide) runs its own pass right away
+   * over what is neither in a keepalive request nor reserved, against the
+   * same budget, so no chunk is sent twice. The regular sender resumes on a
+   * later microtask, after the handlers of the current task. Ignores the
+   * backoff (last chance).
    */
   flushKeepalive(split: boolean): Promise<void> {
     if (this.closed) return Promise.resolve();
-    if (this.flushRun) {
-      if (split) this.splitQueued = true;
-      return this.flushRun;
-    }
-    const run = this.runKeepalive(split).finally(() => {
-      this.flushRun = null;
-    });
-    this.flushRun = run;
-    return run;
-  }
-
-  private async runKeepalive(split: boolean): Promise<void> {
     const epoch = this.epoch;
-    let pass = split;
-    for (;;) {
-      this.splitQueued = false;
-      await this.keepalivePass(pass, epoch);
-      if (!this.splitQueued || epoch !== this.epoch) break;
-      pass = true;
-    }
-    this.splitQueued = false;
-    if (epoch === this.epoch) this.pump();
+    this.keepalivePass(split, epoch);
+    return Promise.resolve().then(() => {
+      if (epoch === this.epoch) this.pump();
+    });
   }
 
-  private async keepalivePass(split: boolean, epoch: number): Promise<void> {
+  private keepalivePass(split: boolean, epoch: number): void {
     if (epoch !== this.epoch) return;
     const claimed = this.outbox.filter((c) => !c.keepalive && !c.claimed);
     for (const c of claimed) c.claimed = true;
+    /** Sessions whose FullSnapshot stays queued in this pass. */
+    const held = new Set<string>();
+    const leave = (chunk: ReplayChunk) => {
+      if (chunk.hasSnapshot) held.add(chunk.sessionId);
+    };
+    /** Sessions whose head was already dealt with in this pass. */
+    const headSeen = new Set<string>();
+    const encodings = new Map<ReplayChunk, Encoded | null>();
+    /** The keepalive body, or null when the chunk cannot fit at all. */
+    const encode = (chunk: ReplayChunk): Encoded | null => {
+      let encoded = encodings.get(chunk);
+      if (encoded === undefined) {
+        const json = chunkJson(chunk);
+        encoded = byteLength(json) > MAX_CHUNK_BYTES ? null : encodeBodySync(json);
+        encodings.set(chunk, encoded);
+      }
+      return encoded;
+    };
+    const left = () => KEEPALIVE_BUDGET_BYTES - this.keepaliveBytes;
+    const replace = (chunk: ReplayChunk, halves: [ReplayChunk, ReplayChunk]) => {
+      for (const half of halves) half.claimed = true;
+      this.outbox.splice(this.outbox.indexOf(chunk), 1, ...halves);
+      claimed.splice(claimed.indexOf(chunk), 1, ...halves);
+    };
+    /**
+     * Sends the head of the session of `claimed[from]` whole, or holds the
+     * session. False when the session has no FullSnapshot queued (no head).
+     */
+    const sendHead = (from: number): boolean => {
+      const sessionId = claimed[from].sessionId;
+      for (;;) {
+        const rest = claimed
+          .slice(from)
+          .filter((c) => c.sessionId === sessionId && this.outbox.includes(c));
+        const end = rest.findIndex((c) => c.hasSnapshot);
+        if (end < 0) return false;
+        const head = rest.slice(0, end + 1);
+        const prefix = head.slice(0, -1).map(encode);
+        if (prefix.some((e) => e === null)) break;
+        const prefixBytes = prefix.reduce((sum, e) => sum + (e?.bytes ?? 0), 0);
+        if (prefixBytes > left()) break; // trimming the snapshot chunk cannot help
+        const last = head[head.length - 1];
+        const encoded = encode(last);
+        if (encoded && prefixBytes + encoded.bytes <= left()) {
+          const bodies = [...prefix, encoded];
+          head.forEach((c, k) => {
+            c.claimed = false;
+            void this.send(c, true, bodies[k] as Encoded);
+          });
+          return true;
+        }
+        // Drop what follows the snapshot (pagehide only, like any split).
+        if (!split || last.inFlight || left() < MIN_SPLIT_BUDGET_BYTES) break;
+        const halves = this.split(last);
+        if (!halves) break;
+        replace(last, halves);
+      }
+      held.add(sessionId);
+      return true;
+    };
     try {
       for (let i = 0; i < claimed.length; i += 1) {
         if (epoch !== this.epoch) return;
         if (this.keepaliveBytes >= KEEPALIVE_BUDGET_BYTES) break;
         const chunk = claimed[i];
         if (!this.outbox.includes(chunk)) continue; // delivered meanwhile
-        const encoded = await encodeBody(chunkJson(chunk));
-        if (epoch !== this.epoch) return;
-        if (!this.outbox.includes(chunk)) continue;
+        if (chunk.keepalive) continue; // went with its session's head
+        if (held.has(chunk.sessionId)) continue;
+        if (!headSeen.has(chunk.sessionId)) {
+          headSeen.add(chunk.sessionId);
+          if (sendHead(i)) continue;
+        }
+        const encoded = encode(chunk);
+        if (!encoded) {
+          leave(chunk);
+          continue;
+        }
         if (this.keepaliveBytes + encoded.bytes <= KEEPALIVE_BUDGET_BYTES) {
           chunk.claimed = false;
           void this.send(chunk, true, encoded);
           continue;
         }
-        if (!split) continue; // backgrounded only: never fragment the outbox
-        if (KEEPALIVE_BUDGET_BYTES - this.keepaliveBytes < MIN_SPLIT_BUDGET_BYTES) break;
-        if (chunk.inFlight) continue; // a regular request carries it whole
+        // backgrounded only: never fragment the outbox; a regular request
+        // carries it whole; too little budget left to be worth a split.
+        if (!split || chunk.inFlight || left() < MIN_SPLIT_BUDGET_BYTES) {
+          leave(chunk);
+          continue;
+        }
         const halves = this.split(chunk);
-        if (!halves) continue;
-        for (const half of halves) half.claimed = true;
-        this.outbox.splice(this.outbox.indexOf(chunk), 1, ...halves);
-        claimed.splice(i, 1, ...halves);
+        if (!halves) {
+          leave(chunk);
+          continue;
+        }
+        replace(chunk, halves);
         i -= 1;
       }
     } finally {

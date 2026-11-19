@@ -12,10 +12,15 @@
  *   previous one, so the buffer can always start at a snapshot.
  * - An expired session (30 min without activity) stops the recorder; the next
  *   interaction or tracked event starts a new session from a full snapshot.
+ * - With `allowedIframeOrigins`, cross-origin iframes running the SDK are
+ *   recorded in place (iframes.ts here, relay.ts in the iframe, VEL-2152).
+ *   They keep relaying through an idle expiry, and an interaction inside one
+ *   wakes the session.
  */
 import { absoluteWithoutQuery, observeNetwork, sdkRequestMatcher } from "../network.js";
+import { iframeBridge } from "./iframes.js";
 import type { ChunkMode, ReplayChunk } from "./sender.js";
-import { ReplaySender } from "./sender.js";
+import { MAX_CHUNK_BYTES, ReplaySender } from "./sender.js";
 import type {
   Recording,
   RecordingContext,
@@ -28,8 +33,7 @@ export const DEFAULT_MASK_SELECTOR = "[data-cohorly-mask]";
 export const DEFAULT_BLOCK_SELECTOR = "[data-cohorly-block]";
 export const FLUSH_INTERVAL_MS = 5000;
 export const MAX_CHUNK_EVENTS = 1000;
-/** A chunk is split before sending past this serialized size (the server's wire limit is 1 MB). */
-export const MAX_CHUNK_BYTES = 1_000_000 - 1024;
+export { MAX_CHUNK_BYTES };
 /** Error mode never sends events older than this before the error... */
 export const ERROR_WINDOW_MS = 60_000;
 /** ...and covers at least this much when the recording is that old. */
@@ -89,6 +93,20 @@ export interface RecordFn {
 
 export interface RecordModule {
   record: RecordFn;
+}
+
+/** An iframe's full snapshot, inserted by rrweb as a mutation (any iframe, same-origin ones too). */
+function isAttachIframe(event: RrwebEvent): boolean {
+  return event.type === INCREMENTAL && (event.data as { isAttachIframe?: unknown } | undefined)?.isAttachIframe === true;
+}
+
+function isInteraction(event: RrwebEvent | null | undefined): boolean {
+  return (
+    typeof event === "object" &&
+    event !== null &&
+    event.type === INCREMENTAL &&
+    INTERACTION_SOURCES.has((event.data as { source?: number } | undefined)?.source ?? -1)
+  );
 }
 
 function combineSelectors(base: string, extra: unknown): string {
@@ -160,7 +178,24 @@ function lastIndex<T>(list: T[], test: (item: T) => boolean): number {
   return -1;
 }
 
+/** The rrweb type of a serialized event (rrweb writes `type` first; anything else is parsed). */
+function serializedType(json: string): number | undefined {
+  const match = /^\{"type":(\d+)[,}]/.exec(json);
+  if (match) return Number(match[1]);
+  try {
+    const type = (JSON.parse(json) as { type?: unknown }).type;
+    return typeof type === "number" ? type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 let handoff: { apiHost: string; token: string | undefined; chunks: ReplayChunk[] } | null = null;
+
+/** Drops what a stopped recorder handed on (opt-out while an iframe relay had it suspended). */
+export function discardHandoff(): void {
+  handoff = null;
+}
 let batches = 0;
 
 interface Segment {
@@ -212,6 +247,15 @@ export function startRecording(
   /** An exception stamped with a session whose recorder is still starting. */
   let pendingException: string | null = null;
   const isCohorly = cohorlyMatcher(ctx.apiHost);
+  /** Cross-origin iframes recorded in place; null without `allowedIframeOrigins` or in a child frame. */
+  const iframes = iframeBridge({
+    origins: options.allowedIframeOrigins,
+    blockSelector: recordOptions(options).blockSelector as string,
+    // An interaction inside an iframe while the recorder sleeps after an idle expiry wakes it like one here.
+    onChildEvent: (event) => {
+      if (wakeArmed && isInteraction(event as RrwebEvent)) onWake();
+    },
+  });
 
   const takeSnapshot = () => {
     try {
@@ -257,7 +301,11 @@ export function startRecording(
   }
   handoff = null;
 
-  /** Chunks of at most 1000 events and ~1 MB serialized, from already serialized events. */
+  /**
+   * Chunks of at most 1000 events and ~1 MB serialized, from already
+   * serialized events. A Meta and the FullSnapshot right after it always go
+   * in the same chunk, even past those limits (the Meta alone is unplayable).
+   */
   const enqueue = (
     sessionId: string,
     mode: ChunkMode,
@@ -269,6 +317,7 @@ export function startRecording(
     const chunks: ReplayChunk[] = [];
     let part: string[] = [];
     let bytes = 2;
+    let hasSnapshot = false;
     const close = () => {
       if (part.length === 0) return;
       chunks.push(
@@ -279,17 +328,28 @@ export function startRecording(
           eventsJson: `[${part.join(",")}]`,
           count: part.length,
           ...(batch !== undefined ? { batch } : {}),
+          ...(hasSnapshot ? { hasSnapshot } : {}),
         }),
       );
       part = [];
       bytes = 2;
+      hasSnapshot = false;
     };
-    for (const event of serialized) {
-      if (part.length >= MAX_CHUNK_EVENTS || (part.length > 0 && bytes + event.length + 1 > MAX_CHUNK_BYTES)) {
+    const types = serialized.map(serializedType);
+    for (let i = 0; i < serialized.length; ) {
+      const size = types[i] === META && types[i + 1] === FULL_SNAPSHOT ? 2 : 1;
+      const unit = serialized.slice(i, i + size);
+      const unitBytes = unit.reduce((sum, event) => sum + event.length + 1, 0);
+      if (
+        part.length > 0 &&
+        (part.length + size > MAX_CHUNK_EVENTS || bytes + unitBytes > MAX_CHUNK_BYTES)
+      ) {
         close();
       }
-      part.push(event);
-      bytes += event.length + 1;
+      part.push(...unit);
+      bytes += unitBytes;
+      if (types.slice(i, i + size).includes(FULL_SNAPSHOT)) hasSnapshot = true;
+      i += size;
     }
     close();
     sender.enqueue(chunks, send);
@@ -323,9 +383,12 @@ export function startRecording(
     current.events.push(json);
     current.bytes += json.length;
     bufferBytes += json.length;
-    if (STATE_TYPES.has(event.type) && current.firstActivity === null) {
+    // A cross-origin iframe's snapshot (relayed by its child) is page state. The
+    // same mutation from a same-origin iframe stays activity, as it always was.
+    const state = STATE_TYPES.has(event.type) || (isAttachIframe(event) && iframes?.fromChild() === true);
+    if (state && current.firstActivity === null) {
       current.lead += 1;
-    } else if (!STATE_TYPES.has(event.type)) {
+    } else if (!state) {
       if (current.firstActivity === null) current.firstActivity = event.timestamp;
       dirtySinceCheckout = true;
       dirtySinceSend = true;
@@ -353,6 +416,8 @@ export function startRecording(
 
   const emit = (raw: RrwebEvent) => {
     if (halted || !recorder) return;
+    // Before the session checks: rrweb listens on an attached iframe's window whether or not the event is kept.
+    if (raw.type === FULL_SNAPSHOT || isAttachIframe(raw)) iframes?.guard();
     let event = raw;
     if (event.type === META) {
       // The page URL never carries its query or fragment.
@@ -361,23 +426,24 @@ export function startRecording(
         event = { ...event, data: { ...data, href: strippedUrl(data.href) } };
       }
     }
-    const interaction =
-      event.type === INCREMENTAL &&
-      INTERACTION_SOURCES.has((event.data as { source?: number } | undefined)?.source ?? -1);
+    const interaction = isInteraction(event);
     const session = interaction ? store.touch() : store.active();
     // Expired (the next tick stops the recorder): these events belong to no one.
     if (!session) return;
     if (session.id !== recorder.sessionId) {
       // Rotated under this recorder (the rotation restarts it): an
       // interaction, the one that woke the session included, is kept for
-      // the new session's recording.
-      if (interaction && session.id === store.last().id) {
+      // the new session's recording. Never one an iframe relayed: its ids
+      // were mapped by this recorder, and the iframe sends a new snapshot.
+      if (interaction && !iframes?.fromChild() && session.id === store.last().id) {
         if (carried?.sessionId !== session.id) carried = { sessionId: session.id, events: [] };
         if (carried.events.length < MAX_CARRIED_EVENTS) carried.events.push(event);
       }
       return;
     }
     accept(event);
+    // Every full snapshot (start, checkout, rotation) serializes iframes empty: ask them again.
+    if (event.type === FULL_SNAPSHOT) iframes?.snapshot();
     if (event.type === FULL_SNAPSHOT && carried?.sessionId === recorder.sessionId) {
       const { events } = carried;
       carried = null;
@@ -389,7 +455,8 @@ export function startRecording(
     if (!recorder) return;
     if (recorder.mode === "session") {
       pending.push(event);
-      if (pending.length >= MAX_CHUNK_EVENTS) flushPending();
+      // A Meta waits for its FullSnapshot (rrweb emits it right after): the pair goes in one chunk.
+      if (pending.length >= MAX_CHUNK_EVENTS && event.type !== META) flushPending();
     } else {
       pushToBuffer(event);
     }
@@ -429,6 +496,7 @@ export function startRecording(
     }
   }
 
+  /** The bridge stays attached: the iframes keep relaying across restarts and an idle expiry. */
   const stopRecorder = () => {
     generation += 1;
     if (recorder) {
@@ -454,9 +522,16 @@ export function startRecording(
         recorder = { mode, sessionId: session.id, stop: () => {} };
         dirtySinceSend = true;
         dirtySinceCheckout = false;
-        const stop = mod.record({ ...recordOptions(options), emit });
+        // Before record(): its message filter must run ahead of rrweb's listener.
+        iframes?.attach();
+        const stop = mod.record({
+          ...recordOptions(options),
+          ...(iframes ? { recordCrossOriginIframes: true } : {}),
+          emit,
+        });
         if (!recorder || mine !== generation) return;
         recorder.stop = stop ?? (() => {});
+        iframes?.started();
         // An exception captured while this recorder was starting.
         if (pendingException === recorder.sessionId) {
           pendingException = null;
@@ -473,6 +548,7 @@ export function startRecording(
     disarmWake();
     const session = store.active();
     if (!session) {
+      // Expired: the iframes keep relaying, an interaction in one wakes it (no stop).
       armWake();
       return;
     }
@@ -483,6 +559,7 @@ export function startRecording(
     if (mode === "off") {
       carried = null;
       pendingException = null;
+      iframes?.release();
       return;
     }
     startRecorder(session, mode);
@@ -493,7 +570,8 @@ export function startRecording(
     flushPending();
     const session = store.active();
     if (!session) {
-      // Expired without activity: stop recording until something happens.
+      // Expired without activity: stop recording until something happens,
+      // here or inside a relaying iframe (no stop sent to them).
       if (recorder) stopRecorder();
       armWake();
       return;
@@ -542,6 +620,7 @@ export function startRecording(
     else pending = [];
     segments = [];
     stopRecorder();
+    iframes?.release();
     halted = true;
     teardown();
     const left = sender.shutdown();

@@ -1,5 +1,17 @@
 # Cohorly JavaScript SDKs
 
+<!-- cohorly-mirror-notice:start -->
+> **This repository is a read-only mirror** of a private monorepo. Its
+> contents are generated on every release, so changes made here would be
+> overwritten.
+>
+> - Pull requests are not accepted for now.
+> - Bugs and questions: open an issue in this repository.
+> - Security vulnerabilities: follow [SECURITY.md](./SECURITY.md). Do not open
+>   a public issue.
+<!-- cohorly-mirror-notice:end -->
+
+
 Official JavaScript/TypeScript SDKs for [Cohorly](https://cohorly.com), a product analytics platform.
 
 | Package | Use for |
