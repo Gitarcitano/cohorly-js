@@ -1,6 +1,7 @@
 // Expo config plugin (`"plugins": ["@cohorly/cli"]`). On `expo prebuild`:
 //   iOS: the "Bundle React Native code and images" phase exports SOURCEMAP_FILE,
-//        and a new "Upload symbols to Cohorly" phase runs `cohorly react-native xcode`.
+//        and a new "Upload symbols to Cohorly" phase, placed after every phase the
+//        target has when the plugin runs, runs `cohorly react-native xcode`.
 //   Android: app/build.gradle applies cohorly.gradle, which runs
 //        `cohorly react-native gradle` after every release assemble/bundle.
 // The transformations are pure functions so they can be tested on fixtures.
@@ -66,8 +67,16 @@ function entries(section: PbxSection | undefined): Array<[string, PbxObject]> {
 
 /**
  * Adds the SOURCEMAP_FILE export to every "Bundle React Native code and
- * images" phase and an "Upload symbols to Cohorly" phase right after it in
- * each target that runs it. Idempotent. Throws when there is no bundle phase.
+ * images" phase and an "Upload symbols to Cohorly" phase to each target that
+ * runs it, after every phase the target has at that point. The phase reads the
+ * dSYM and the Info.plist, so placing it before a phase that writes into the
+ * app bundle ([CP] Copy Pods Resources, Embed Watch Content, ...) makes
+ * `xcodebuild archive` fail with a dependency cycle. Phases appended later (by
+ * `pod install`, which runs after the config plugins) may follow it without
+ * recreating the cycle, so it is not necessarily the last phase of the built
+ * project. An existing upload phase (0.1.1 put it right after the bundle phase)
+ * is refreshed and moved after the other phases too. Idempotent. Throws when
+ * there is no bundle phase.
  */
 export function applyCohorlyXcode<P extends XcodeProjectLike>(project: P): P {
   const objects = project.hash.project.objects;
@@ -85,19 +94,28 @@ export function applyCohorlyXcode<P extends XcodeProjectLike>(project: P): P {
     for (const [, target] of entries(objects.PBXNativeTarget)) {
       const buildPhases = target.buildPhases as Array<{ value: string; comment?: string }> | undefined;
       if (!Array.isArray(buildPhases)) continue;
-      const at = buildPhases.findIndex((p) => p.value === bundleId);
-      if (at < 0) continue;
-      const existing = buildPhases
-        .map((p) => phases[p.value])
-        .find((other): other is PbxObject => typeof other === "object" && decodePbxString(other.name) === UPLOAD_PHASE_NAME);
-      if (existing) {
-        existing.inputPaths = [...UPLOAD_PHASE_INPUTS];
-        existing.shellScript = encodePbxString(xcodeUploadScript());
+      if (!buildPhases.some((p) => p.value === bundleId)) continue;
+      const existingAt = buildPhases.findIndex((p) => {
+        const other = phases[p.value];
+        return typeof other === "object" && decodePbxString(other.name) === UPLOAD_PHASE_NAME;
+      });
+      if (existingAt >= 0) {
+        const [ref] = buildPhases.splice(existingAt, 1);
+        const existing = ref && phases[ref.value];
+        if (ref && typeof existing === "object") {
+          existing.inputPaths = [...UPLOAD_PHASE_INPUTS];
+          existing.shellScript = encodePbxString(xcodeUploadScript());
+          existing.alwaysOutOfDate = 1;
+          buildPhases.push(ref);
+        }
         continue;
       }
       const uuid = project.generateUuid();
       phases[uuid] = {
         isa: "PBXShellScriptBuildPhase",
+        // Runs on every build by design (no outputs); this keeps Xcode from
+        // warning about it ("Based on dependency analysis" unchecked).
+        alwaysOutOfDate: 1,
         buildActionMask: 2147483647,
         files: [],
         inputFileListPaths: [],
@@ -110,7 +128,7 @@ export function applyCohorlyXcode<P extends XcodeProjectLike>(project: P): P {
         shellScript: encodePbxString(xcodeUploadScript()),
       };
       phases[`${uuid}_comment`] = UPLOAD_PHASE_NAME;
-      buildPhases.splice(at + 1, 0, { value: uuid, comment: UPLOAD_PHASE_NAME });
+      buildPhases.push({ value: uuid, comment: UPLOAD_PHASE_NAME });
     }
   }
   return project;

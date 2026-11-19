@@ -36,6 +36,14 @@ export {
   MetricsAggregator,
 } from "./metrics.js";
 export {
+  isSecretKey,
+  MAX_SCRUB_DEPTH,
+  SCRUB_TOKEN,
+  SCRUB_TRUNCATED,
+  scrubDeep,
+  scrubText,
+} from "./scrub.js";
+export {
   fetchFlagsFetcher,
   fetchTransport,
   parseRetryAfterMs,

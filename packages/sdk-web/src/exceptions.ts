@@ -20,6 +20,7 @@ import {
   MAX_DEDUP_FINGERPRINTS,
   stringifyValue,
 } from "@cohorly/core";
+import { observeConsole } from "./console.js";
 import { observeNetwork, patchMethod, safely, sdkRequestMatcher } from "./network.js";
 
 export { EXCEPTION_DEDUP_WINDOW_MS, MAX_EXCEPTIONS_PER_FINGERPRINT } from "@cohorly/core";
@@ -292,24 +293,17 @@ export function setupExceptionCapture(hooks: ExceptionCaptureHooks): () => void 
   document.addEventListener("click", onClick, true);
   cleanups.push(() => document.removeEventListener("click", onClick, true));
 
-  if (typeof console !== "undefined") {
-    cleanups.push(
-      patchMethod(console, "error", (original) =>
-        function patchedConsoleError(this: unknown, ...args: unknown[]) {
-          if (active) {
-            safely(() =>
-              crumb({
-                category: "console",
-                level: "error",
-                message: args.map(consoleArg).join(" "),
-              }),
-            );
-          }
-          return original.apply(this, args);
-        },
-      ),
-    );
-  }
+  // One shared console.error wrapper (console.ts), also used by session replay.
+  cleanups.push(
+    observeConsole({
+      levels: ["error"],
+      call: (_level, args) => {
+        if (active) {
+          crumb({ category: "console", level: "error", message: args.map(consoleArg).join(" ") });
+        }
+      },
+    }),
+  );
 
   // The SDK's own requests (network.ts SDK_ENDPOINTS, /replay included) are
   // never breadcrumbs.

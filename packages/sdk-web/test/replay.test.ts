@@ -1,10 +1,11 @@
 import { CompressionStream as NodeCompressionStream } from "node:stream/web";
 import { gunzipSync } from "node:zlib";
+import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Breadcrumb, CohorlyWebOptions, SessionReplayOptions, TrackedEvent } from "../src/index.js";
 import { cohorly, init } from "../src/index.js";
 import type { ReplayChunk } from "../src/replay/sender.js";
-import { ReplaySender } from "../src/replay/sender.js";
+import { MAX_CHUNK_BYTES, ReplaySender } from "../src/replay/sender.js";
 
 interface RrEvent {
   type: number;
@@ -869,6 +870,350 @@ describe("session replay", () => {
       const event = cohorly.captureException(new Error("probe")) as TrackedEvent;
       const crumbs = (event.properties.$exception_breadcrumbs as Breadcrumb[] | undefined) ?? [];
       expect(crumbs.filter((c) => JSON.stringify(c).includes("/replay"))).toEqual([]);
+    });
+
+    it("with the network option, records headers and bodies of allowed URLs; breadcrumbs stay as they were", async () => {
+      start(
+        {
+          sampleRate: 1,
+          network: { headers: true, bodies: true, allowUrls: ["https://app.example.com/api/"] },
+        },
+        { captureExceptions: true },
+      );
+      await recording();
+      const respondedAt = Date.now();
+      const res = await fetch("https://app.example.com/api/items?x=1", {
+        method: "POST",
+        headers: { authorization: "Bearer secret", "content-type": "application/json" },
+        body: JSON.stringify({ email: "ana@example.com", password: "x" }),
+      });
+      expect(await res.json()).toEqual({ items: [] });
+      await fetch("https://app.example.com/other");
+      await expect(fetch("https://app.example.com/down")).rejects.toThrow(TypeError);
+      // The SDK's copy of the response body is read in the background.
+      for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(5000);
+
+      // A request whose body is read is recorded after those without: find each by URL.
+      const byUrl = (url: string) => networkEvents().find((e) => e.url === url);
+      const items = byUrl("https://app.example.com/api/items");
+      const other = byUrl("https://app.example.com/other");
+      const down = byUrl("https://app.example.com/down");
+      expect(networkEvents()).toHaveLength(3);
+      expect(items).toMatchObject({
+        method: "POST",
+        url: "https://app.example.com/api/items",
+        status: 201,
+        kind: "fetch",
+        ts: respondedAt,
+        request: {
+          headers: { "content-type": "application/json" },
+          body: '{"email":"[email]","password":"[token]"}',
+        },
+        response: { body: '{"items":[]}' },
+      });
+      expect(JSON.stringify(items)).not.toContain("secret");
+      expect(other).toEqual({
+        method: "GET",
+        url: "https://app.example.com/other",
+        status: 201,
+        duration_ms: expect.any(Number),
+        capture: "not_allowed",
+      });
+      expect(down).toMatchObject({ status: 0, capture: "not_allowed" });
+
+      const event = cohorly.captureException(new Error("probe")) as TrackedEvent;
+      const crumbs = (event.properties.$exception_breadcrumbs as Breadcrumb[] | undefined) ?? [];
+      expect(crumbs.filter((c) => c.category === "fetch").map((c) => c.data)).toEqual([
+        { method: "GET", url: "https://app.example.com/down" },
+      ]);
+    });
+  });
+
+  describe("network detail in error mode (VEL-2145)", () => {
+    it("an error captured while a failed request's body is still read waits for its $network", async () => {
+      start({
+        sampleRate: 0,
+        onErrorSampleRate: 1,
+        network: { bodies: true, allowUrls: ["https://app.example.com/api/"] },
+      });
+      await recording();
+      let finishBody: () => void = () => {};
+      const page = fetchMock.getMockImplementation();
+      fetchMock.mockImplementation(async (url: string, init?: unknown) => {
+        if (!String(url).startsWith("https://app.example.com/api/")) return page?.(url, init);
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"error":'));
+            finishBody = () => {
+              controller.enqueue(new TextEncoder().encode('"boom"}'));
+              controller.close();
+            };
+          },
+        });
+        return new Response(body, { status: 500, headers: { "content-type": "application/json" } });
+      });
+
+      const res = await fetch("https://app.example.com/api/pay");
+      expect(res.status).toBe(500);
+      cohorly.captureException(new Error("payment failed"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sentChunks()).toHaveLength(0);
+
+      finishBody();
+      await vi.advanceTimersByTimeAsync(10);
+      const [sent] = sentChunks();
+      expect(sent.chunk.mode).toBe("error");
+      const network = sent.chunk.events
+        .filter((e) => e.type === 5 && e.data.tag === "$network")
+        .map((e) => e.data.payload as Record<string, unknown>);
+      expect(network).toEqual([
+        expect.objectContaining({
+          url: "https://app.example.com/api/pay",
+          status: 500,
+          response: { body: '{"error":"boom"}' },
+        }),
+      ]);
+    });
+  });
+
+  describe("console (VEL-2144)", () => {
+    const LEVELS = ["log", "info", "warn", "error"] as const;
+    type Level = (typeof LEVELS)[number];
+    let page: Record<Level, MockInstance<(...args: unknown[]) => unknown>>;
+
+    const consoleLines = () =>
+      sentChunks()
+        .flatMap((c) => c.chunk.events)
+        .filter((e) => e.type === 5 && e.data.tag === "$console")
+        .map((e) => e.data.payload as Record<string, unknown>);
+
+    beforeEach(() => {
+      // The page's own console, before the SDK wraps it.
+      const own = (level: Level, result?: unknown) =>
+        vi.spyOn(console, level).mockImplementation(() => result) as unknown as MockInstance<
+          (...args: unknown[]) => unknown
+        >;
+      page = { log: own("log", "log-result"), info: own("info"), warn: own("warn"), error: own("error") };
+    });
+
+    it("records log, info, warn and error as $console custom events; the page's console gets the same this and arguments and its result comes back", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      const target = { owner: "app" };
+      const payload = { step: 2 };
+      const result = console.log.call(target, "checkout", payload);
+      console.info("info line");
+      console.warn("warn line", 3);
+      console.error("error line");
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(consoleLines()).toEqual([
+        { level: "log", message: 'checkout {"step":2}' },
+        { level: "info", message: "info line" },
+        { level: "warn", message: "warn line 3" },
+        { level: "error", message: "error line" },
+      ]);
+      expect(result).toBe("log-result");
+      expect(page.log.mock.calls).toEqual([["checkout", payload]]);
+      expect(page.log.mock.calls[0][1]).toBe(payload);
+      expect(page.log.mock.contexts[0]).toBe(target);
+      expect(page.warn.mock.calls).toEqual([["warn line", 3]]);
+    });
+
+    it("scrubs the line before it leaves the page", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      console.error({ email: "a@b.co", password: "hunter2" }, "for jane.doe@example.com");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(consoleLines()).toEqual([
+        { level: "error", message: '{"email":"[email]","password":"[token]"} for [email]' },
+      ]);
+      const raw = sentChunks().map((c) => JSON.stringify(c.chunk)).join("");
+      expect(raw).not.toContain("hunter2");
+      expect(raw).not.toContain("example.com");
+    });
+
+    it("with console: false records no line and never wraps the console", async () => {
+      const before = { log: console.log, info: console.info, warn: console.warn, error: console.error };
+      start({ sampleRate: 1, console: false });
+      await recording();
+      for (const level of LEVELS) expect(console[level]).toBe(before[level]);
+      console.log("not recorded");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks().length).toBeGreaterThan(0);
+      expect(consoleLines()).toEqual([]);
+    });
+
+    it("never records the SDK's own [cohorly] messages", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      console.warn("[cohorly] dropping a repeated exception (local rate limit)");
+      console.warn("[cohorly]", "session replay could not load");
+      console.log("app line");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(consoleLines()).toEqual([{ level: "log", message: "app line" }]);
+      expect(page.warn).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not record a console call made from inside the SDK while it records a line", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      const add = rr.record.addCustomEvent;
+      rr.record.addCustomEvent = (tag: string, payload: unknown) => {
+        console.warn("rrweb noise");
+        add(tag, payload);
+      };
+      try {
+        console.log("app line");
+      } finally {
+        rr.record.addCustomEvent = add;
+      }
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(consoleLines()).toEqual([{ level: "log", message: "app line" }]);
+      expect(page.warn).toHaveBeenCalledWith("rrweb noise");
+    });
+
+    it("never throws into the page when recording fails", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      const add = rr.record.addCustomEvent;
+      rr.record.addCustomEvent = () => {
+        throw new Error("rrweb blew up");
+      };
+      try {
+        expect(() => console.error("still logged")).not.toThrow();
+      } finally {
+        rr.record.addCustomEvent = add;
+      }
+      expect(page.error).toHaveBeenCalledWith("still logged");
+    });
+
+    it("does not keep a line logged while the session is expired", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      expect(rr.state.stops).toBe(1);
+      console.log("while idle");
+
+      window.dispatchEvent(new Event("pointerdown"));
+      await recording(2);
+      console.log("after wake");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(consoleLines()).toEqual([{ level: "log", message: "after wake" }]);
+      expect(page.log).toHaveBeenCalledWith("while idle");
+    });
+
+    it("error mode keeps lines in the buffer sent with the error", async () => {
+      start({ sampleRate: 0, onErrorSampleRate: 1 });
+      await recording();
+      console.warn("before the error");
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(sentChunks()).toEqual([]);
+      cohorly.captureException(new Error("boom"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sentChunks().map((c) => c.chunk.mode)).toEqual(["error"]);
+      expect(consoleLines()).toEqual([{ level: "warn", message: "before the error" }]);
+    });
+
+    it("wraps the console once per page: a session rotation and an error to session mode switch keep the wrapper, which goes when replay and exception capture stop", async () => {
+      const before = { log: console.log, error: console.error };
+      // Session-mode recording paused by the replay quota: it buffers as error mode until then.
+      window.localStorage.setItem("chl_replay_quota_until", String(T0 + 7000));
+      start({ sampleRate: 1 }, { captureExceptions: true });
+      await recording();
+      const wrapped = { log: console.log, error: console.error };
+      expect(wrapped.log).not.toBe(before.log);
+      expect(wrapped.error).not.toBe(before.error);
+
+      console.log("buffered in error mode");
+      cohorly.captureException(new Error("boom"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sentChunks().map((c) => c.chunk.mode)).toEqual(["error"]);
+
+      // The pause ran out: the next tick restarts the recorder in session mode.
+      await vi.advanceTimersByTimeAsync(10_000);
+      await recording(2);
+      expect(console.log).toBe(wrapped.log);
+      console.log("in session mode");
+
+      cohorly.reset();
+      await vi.advanceTimersByTimeAsync(0);
+      await recording(3);
+      expect(console.log).toBe(wrapped.log);
+      expect(console.error).toBe(wrapped.error);
+      console.log("after rotation");
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(consoleLines().map((l) => l.message)).toEqual([
+        "buffered in error mode",
+        "in session mode",
+        "after rotation",
+      ]);
+      expect(page.log).toHaveBeenCalledTimes(3);
+
+      init({ apiHost: API_HOST, loadFeatureFlags: false, flushIntervalMs: 0 });
+      expect(console.log).toBe(before.log);
+      expect(console.error).toBe(before.error);
+    });
+
+    it("with exception capture and replay on, one console.error is one breadcrumb and one $console line", async () => {
+      start({ sampleRate: 1 }, { captureExceptions: true });
+      await recording();
+      console.error("payment failed", { code: 42 });
+      const event = cohorly.captureException(new Error("probe")) as TrackedEvent;
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const crumbs = ((event.properties.$exception_breadcrumbs as Breadcrumb[] | undefined) ?? []).filter(
+        (c) => c.category === "console",
+      );
+      expect(crumbs.map((c) => [c.level, c.message])).toEqual([["error", 'payment failed {"code":42}']]);
+      expect(consoleLines()).toEqual([{ level: "error", message: 'payment failed {"code":42}' }]);
+      expect(page.error).toHaveBeenCalledTimes(1);
+    });
+
+    it("with only one of them on, each records once: replay alone adds no breadcrumb, exception capture alone wraps only console.error", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      console.error("replay only");
+      const event = cohorly.captureException(new Error("probe")) as TrackedEvent;
+      await vi.advanceTimersByTimeAsync(5000);
+      const crumbs = (event.properties.$exception_breadcrumbs as Breadcrumb[] | undefined) ?? [];
+      expect(crumbs.filter((c) => c.category === "console")).toEqual([]);
+      expect(consoleLines()).toEqual([{ level: "error", message: "replay only" }]);
+
+      cohorly.optOutTracking();
+      cohorly.optInTracking();
+      const logBefore = console.log;
+      const errorBefore = console.error;
+      init({ apiHost: API_HOST, token: "tok-web", loadFeatureFlags: false, flushIntervalMs: 0, captureExceptions: true });
+      expect(console.log).toBe(logBefore);
+      expect(console.error).not.toBe(errorBefore);
+      console.error("exceptions only");
+      const second = cohorly.captureException(new Error("probe 2")) as TrackedEvent;
+      const trail = (second.properties.$exception_breadcrumbs as Breadcrumb[] | undefined) ?? [];
+      expect(trail.filter((c) => c.category === "console").map((c) => c.message)).toEqual(["exceptions only"]);
+      expect(page.error).toHaveBeenCalledTimes(2);
+    });
+
+    it("caps lines at 500 per minute without ever making a chunk too big, then writes the dropped count", async () => {
+      start({ sampleRate: 1 });
+      await recording();
+      const firstDrop = Date.now();
+      for (let i = 0; i < 503; i++) console.log(`${i} ${"x".repeat(3000)}`);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const lines = consoleLines();
+      expect(lines).toHaveLength(500);
+      expect(lines.every((l) => typeof l.message === "string" && l.message.length === 2048)).toBe(true);
+      expect(sentChunks().length).toBeGreaterThan(1);
+      expect(sentChunks().every((c) => JSON.stringify(c.chunk.events).length <= MAX_CHUNK_BYTES)).toBe(true);
+      expect(sentChunks().every((c) => c.bytes <= 1_000_000)).toBe(true);
+      expect(page.log).toHaveBeenCalledTimes(503);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(consoleLines().at(-1)).toEqual({ level: "warn", message: "", dropped: 3, at: firstDrop });
+      expect(consoleLines()).toHaveLength(501);
     });
   });
 

@@ -1,5 +1,11 @@
 # @cohorly/nest
 
+## 0.4.1
+
+### Patch Changes
+
+- @cohorly/node@0.5.1
+
 ## 0.4.0
 
 ### Minor Changes

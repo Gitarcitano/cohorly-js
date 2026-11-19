@@ -14,7 +14,7 @@ import Foundation
 @objc(CohorlyNativeCrashes)
 public final class CohorlyNativeCrashes: NSObject {
     /// `$lib_version` of crash events; mirrors package.json (scripts/sync-versions.mjs).
-    static let libVersion = "1.5.0"
+    static let libVersion = "1.5.1"
     static let lib = CrashLibInfo(lib: "react-native", version: libVersion)
 
     @objc public static func start() {

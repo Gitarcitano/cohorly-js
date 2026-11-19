@@ -74,7 +74,7 @@ if (typeof p !== "function" || typeof p.applyCohorlyXcode !== "function") proces
 });
 
 describe("Expo plugin, iOS", () => {
-  it("adds the upload phase after the bundle phase and the SOURCEMAP_FILE export, once", async () => {
+  it("adds the upload phase after the existing phases and the SOURCEMAP_FILE export, once", async () => {
     const { dir, file, project } = await parsedFixture();
     applyCohorlyXcode(project);
     applyCohorlyXcode(project);
@@ -90,8 +90,8 @@ describe("Expo plugin, iOS", () => {
       "[CP] Check Pods Manifest.lock",
       "Sources",
       BUNDLE_PHASE_NAME,
-      UPLOAD_PHASE_NAME,
       "[CP] Copy Pods Resources",
+      UPLOAD_PHASE_NAME,
     ]);
     const phases = shellPhases(reparsed);
     const uploads = phases.filter(([, p]) => decodePbxString(p.name) === UPLOAD_PHASE_NAME);
@@ -102,6 +102,7 @@ describe("Expo plugin, iOS", () => {
       "$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)",
     ]);
     expect(await readFile(path.join(dir, "again.pbxproj"), "utf8")).toContain('"$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)",');
+    expect(upload.alwaysOutOfDate).toBe(1);
     const script = decodePbxString(upload.shellScript);
     expect(script).toBe(xcodeUploadScript());
     expect(script.startsWith("set -e\n")).toBe(true);
@@ -113,6 +114,53 @@ describe("Expo plugin, iOS", () => {
     expect(bundle.startsWith(`${SOURCEMAP_MARKER}\n${SOURCEMAP_EXPORT}\nif [[ -f "$PODS_ROOT/../.xcode.env" ]]`)).toBe(true);
     expect(bundle.split(SOURCEMAP_MARKER)).toHaveLength(2);
     expect(bundle).toContain("react-native-xcode.sh");
+  });
+
+  // The upload phase reads the dSYM and Info.plist; placed before a phase that
+  // still writes into the app bundle, `xcodebuild archive` reports a cycle.
+  // Phases `pod install` appends afterwards may follow it, so the contract is
+  // "after every phase present when the plugin runs", not "last".
+  it("places the upload phase after every phase present when the plugin runs, new or prebuilt by 0.1.1", async () => {
+    const fresh = (await parsedFixture()).project;
+    const before = targetPhaseNames(fresh);
+    expect(before).not.toContain(UPLOAD_PHASE_NAME);
+    applyCohorlyXcode(fresh);
+    expect(targetPhaseNames(fresh)).toEqual([...before, UPLOAD_PHASE_NAME]);
+
+    // 0.1.1 layout: upload right after the bundle phase, with phases after it
+    // that write into the bundle.
+    const { project } = await parsedFixture();
+    applyCohorlyXcode(project);
+    const target = Object.entries(project.hash.project.objects.PBXNativeTarget ?? {}).find(([k]) => !k.endsWith("_comment"))![1] as Phase;
+    const buildPhases = target.buildPhases as Array<{ value: string; comment: string }>;
+    const upload = buildPhases.splice(buildPhases.findIndex((p) => p.comment === UPLOAD_PHASE_NAME), 1)[0]!;
+    buildPhases.splice(buildPhases.findIndex((p) => p.comment === BUNDLE_PHASE_NAME) + 1, 0, upload);
+    buildPhases.push({ value: "0000000000000000000000EE", comment: "Embed Watch Content" });
+    expect(targetPhaseNames(project)).toEqual([
+      "[CP] Check Pods Manifest.lock",
+      "Sources",
+      BUNDLE_PHASE_NAME,
+      UPLOAD_PHASE_NAME,
+      "[CP] Copy Pods Resources",
+      "Embed Watch Content",
+    ]);
+
+    applyCohorlyXcode(project);
+
+    expect(targetPhaseNames(project)).toEqual([
+      "[CP] Check Pods Manifest.lock",
+      "Sources",
+      BUNDLE_PHASE_NAME,
+      "[CP] Copy Pods Resources",
+      "Embed Watch Content",
+      UPLOAD_PHASE_NAME,
+    ]);
+    const uploads = shellPhases(project).filter(([, p]) => decodePbxString(p.name) === UPLOAD_PHASE_NAME);
+    expect(uploads).toHaveLength(1);
+    expect(uploads[0]![1].inputPaths.map(decodePbxString)).toEqual([
+      "$(DWARF_DSYM_FOLDER_PATH)/$(DWARF_DSYM_FILE_NAME)/Contents/Resources/DWARF/$(TARGET_NAME)",
+      "$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)",
+    ]);
   });
 
   it("rewrites an upload phase prebuilt without input files, so it runs after the Info.plist and the dSYM", async () => {

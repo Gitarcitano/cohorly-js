@@ -1,5 +1,11 @@
 # @cohorly/cli
 
+## 0.2.1
+
+### Patch Changes
+
+- 21ec8c1: Expo plugin: the iOS "Upload symbols to Cohorly" phase is now placed after every build phase the target has when the plugin runs (phases `pod install` appends later may follow it), and `expo prebuild` moves it there in projects prebuilt with 0.1.1. It is also marked to run on every build, so Xcode no longer warns that it has no outputs. Since 0.1.1 it read the dSYM and Info.plist while sitting before phases that still write into the app bundle (Copy Pods Resources, Embed Watch Content), so `xcodebuild archive` failed with a dependency cycle.
+
 ## 0.2.0
 
 ### Minor Changes

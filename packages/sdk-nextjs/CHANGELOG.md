@@ -1,5 +1,14 @@
 # @cohorly/nextjs
 
+## 0.4.2
+
+### Patch Changes
+
+- Updated dependencies [916660e]
+  - @cohorly/core@0.5.0
+  - @cohorly/node@0.5.1
+  - @cohorly/react@0.4.2
+
 ## 0.4.1
 
 ### Patch Changes

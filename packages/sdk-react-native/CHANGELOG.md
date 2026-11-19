@@ -1,5 +1,12 @@
 # @cohorly/react-native
 
+## 1.5.1
+
+### Patch Changes
+
+- Updated dependencies [916660e]
+  - @cohorly/core@0.5.0
+
 ## 1.5.0
 
 ### Minor Changes

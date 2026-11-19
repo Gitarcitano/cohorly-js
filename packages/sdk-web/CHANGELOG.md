@@ -1,5 +1,18 @@
 # @cohorly/web
 
+## 0.6.0
+
+### Minor Changes
+
+- 8ea584e: Session replay records canvas (VEL-2155). New `sessionReplay.canvas`, off unless it is an object (`{}` turns it on): the content of every `<canvas>`, 2D and WebGL, is recorded as WebP images, at most `fps` frames per second per canvas (default 2, 1 to 12) at `quality` (default 0.4, 0.1 to 1), values outside the range clamped. A canvas is recorded as pixels, so text masking does not apply and text drawn on it is recorded; one inside `[data-cohorly-block]` or the `blockSelector` is never recorded. A frame over 400,000 characters is dropped, a page load records at most 64 MiB of frames (later ones are dropped with a debug log), and a full snapshot over the chunk limit is sent without its canvases' `rr_dataURL`, so a chunk is never refused because of canvas. A page whose CSP has no `worker-src` for `blob:` and `data:` records no frames. Without the option nothing changes.
+- 916660e: Session replay records the console (VEL-2144). While a recorder runs (session mode or the error buffer), `console.log`, `info`, `warn` and `error` become rrweb custom events `{ type: 5, data: { tag: "$console", payload: { level, message } } }`: the arguments joined by a space, at most 2048 characters, an `Error` with its stack, objects as JSON 4 levels deep with 50 keys or items each and cycles as `[Circular]`. Each line is scrubbed in the browser (values under secret keys such as `password`, `apiKey` or `authorization` become `[token]`; e-mails, bearer and JWT tokens, `token=`-style secrets and Luhn-valid card numbers are replaced). At most 500 lines per 60 s window per page; when a window that dropped lines closes, one `{ level: "warn", message: "", dropped, at }` line records how many. The SDK's own `[cohorly]` messages and lines logged while nothing records are never recorded. On by default; `sessionReplay.console: false` turns it off and, without `captureExceptions`, leaves the console unwrapped. The console is wrapped once per page, shared with the `console.error` breadcrumb of error tracking, and calls the page's console with the same `this` and arguments and returns its result.
+- cefb784: Session replay can record request and response headers and bodies (VEL-2145). New `sessionReplay.network: { headers?, bodies?, allowUrls, redact? }`, off by default: without it, or with an empty `allowUrls` (a debug warning says so), `$network` keeps only method, URL without query, status and duration, and no body is read. For a URL in `allowUrls` (tested against the absolute URL without query or fragment; a string matches as a prefix, a `RegExp` by `test`) the payload gains `kind`, `ts` and `request`/`response` with `headers` (lower-case names) and/or `body`; a URL outside it gets `capture: "not_allowed"` only. `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key` and every header whose name contains `token`, `secret`, `password`, `auth` or `session` are never recorded, and the other values are scrubbed. Text bodies (JSON, `text/*`, form, XML) are scrubbed and cut at 16 KiB with `[truncated]`; binary bodies become `[binary N bytes]`, `FormData` `[form-data]`, streams and `text/event-stream` `[stream]`. A fetch response is read from a clone, at most 16 KiB and 2 s (`[unavailable]` after that), in the background: the page gets the same response, as soon as before, with its body intact. `redact(entry)` changes an entry or returns `null` to drop its headers and bodies; one that throws drops them too. The exception breadcrumbs share the wrapper and still read no header and no body.
+
+### Patch Changes
+
+- Updated dependencies [916660e]
+  - @cohorly/core@0.5.0
+
 ## 0.5.0
 
 ### Minor Changes

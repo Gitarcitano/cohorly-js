@@ -1,5 +1,11 @@
 # @cohorly/core
 
+## 0.5.0
+
+### Minor Changes
+
+- 916660e: Export the PII scrub used by error tracking on the server: `scrubText` (e-mails, bearer and JWT tokens, `token=`-style secrets, Luhn-valid card numbers), `isSecretKey` (`password`, `apiKey`, `authorization`, `cookie`, ...) and `scrubDeep` (a scrubbed copy of a JSON-like value with secret keys replaced by `"[token]"`, bounded in depth), plus `MAX_SCRUB_DEPTH`, `SCRUB_TOKEN` and `SCRUB_TRUNCATED`.
+
 ## 0.4.0
 
 ### Minor Changes

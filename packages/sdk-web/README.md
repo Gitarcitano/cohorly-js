@@ -177,6 +177,7 @@ init({
     onErrorSampleRate: 1, // of the rest, keep the last 30 to 60 s and send them on an error
     maskTextSelector: ".pii", // optional, added to [data-cohorly-mask]
     blockSelector: ".ads", // optional, added to [data-cohorly-block]
+    console: true, // default; false records no console lines
   },
 });
 ```
@@ -236,15 +237,64 @@ Privacy defaults, which cannot be turned off:
 - The page URL is recorded without its query string or fragment.
 - Network requests (`fetch` and `XMLHttpRequest`, `http(s)` only) appear as
   `$network` events with only method, URL without query or fragment, status
-  (0 for a network error) and duration. Never headers or bodies, never the
-  SDK's own requests to the Cohorly API. The SDK wraps `fetch` and
-  `XMLHttpRequest.open` once per page, shared with the error tracking
-  breadcrumbs, and the app always gets the original response.
+  (0 for a network error) and duration, never the SDK's own requests to the
+  Cohorly API. Headers and bodies only with the `network` option below. The
+  SDK wraps `fetch` and `XMLHttpRequest` once per page, shared with the error
+  tracking breadcrumbs, and the app always gets the original response.
+
+The console is recorded by default and can be turned off:
+
+- `console.log`, `info`, `warn` and `error` appear as `$console` events
+  (`{ level, message }`), the arguments joined by a space, at most 2048
+  characters: an `Error` with its stack, objects as JSON (4 levels, 50 keys
+  each, cycles as `[Circular]`). Each line is scrubbed in the browser:
+  values under secret keys (`password`, `apiKey`, `authorization`, ...)
+  become `[token]`, and e-mails, bearer and JWT tokens, `token=`-style
+  secrets and card numbers become `[email]`, `[token]` or `[card]`.
+- At most 500 lines a minute per page; the rest is counted and the recording
+  shows how many lines were dropped.
+- The SDK's own `[cohorly] ...` messages are never recorded, nor lines logged
+  while no session is recording. The page's console keeps working exactly as
+  before (same arguments, same `this`, same return value).
+- `sessionReplay: { console: false }` records none; without
+  `captureExceptions` the console is then never wrapped.
 
 ```html
 <div data-cohorly-block>card form</div>
 <p data-cohorly-mask>Signed in as jane@example.com</p>
 ```
+
+**Network headers and bodies.** `network` records request and response
+headers and/or bodies (both `false` by default) for the URLs in `allowUrls`
+only, tested against the absolute URL without query or fragment (a string as
+a prefix, a `RegExp` with `test`). Without `allowUrls` nothing more is
+recorded (a debug warning says so); a request to another URL is marked
+`capture: "not_allowed"`.
+
+```ts
+sessionReplay: {
+  sampleRate: 0.1,
+  network: {
+    headers: true,
+    bodies: true,
+    allowUrls: ["https://api.example.com/"],
+    redact: (entry) => entry, // change it, or return null for no headers and bodies
+  },
+}
+```
+
+Turning this on is your app's responsibility: a body can carry personal data
+the scrub does not recognize, and `redact` is where you remove it.
+`authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`
+and any header whose name contains `token`, `secret`, `password`, `auth` or
+`session` are never recorded; other values are scrubbed. Text bodies (JSON,
+`text/*`, form, XML) are scrubbed (in JSON, secret keys become `[token]`) and
+cut at 16 KiB with `[truncated]`; other bodies become `[binary N bytes]`,
+`[form-data]` or `[stream]`. A fetch response is read from a clone, at most
+16 KiB and 2 s (`[unavailable]` after that), without delaying or changing the
+response the app gets. A `redact` that throws records the request without
+headers or bodies. On a cross-origin request only the response headers in
+`Access-Control-Expose-Headers` (plus the safe ones) can be recorded.
 
 **Cross-origin iframes.** `allowedIframeOrigins` (exact origins such as
 `"https://pay.example.com"`, empty by default; `*`, paths and trailing
@@ -270,6 +320,31 @@ inside it, and it does not record a session of its own meanwhile. An
 interaction inside the frame wakes the parent's session after an idle expiry.
 One level of nesting, no canvas or cursor inside the frame. Details in
 `docs/SESSION-REPLAY.md` "Cross-origin iframes".
+
+**Canvas.** `canvas` records every `<canvas>` (2D and WebGL) as WebP images.
+It is off unless it is an object: `canvas: {}` turns it on with the defaults,
+`fps` 2 (1 to 12) frames per second per canvas and `quality` 0.4 (0.1 to 1);
+out-of-range numbers are clamped and anything else is the default.
+
+```ts
+sessionReplay: { sampleRate: 0.1, canvas: { fps: 2, quality: 0.4 } }
+```
+
+Cost, measured with the same bench (2026-11-18, headless Chromium, a 800x600
+canvas redrawn 20 times a second with noisy content, `fps: 2`): about 118
+frames and 1.9 MiB per minute on the wire (gzip barely shrinks WebP in
+base64), +0.74 s of main-thread task time per minute (1.2% of wall time) and
++0.04 s at init, against the same page with the option off. A page whose
+canvas changes less costs less. A canvas is recorded as
+pixels: text masking does not apply, so text drawn on it is recorded as it
+shows. Put `data-cohorly-block` on the canvas or an ancestor (or match it with
+`blockSelector`) to keep it out of the recording. A frame over 400,000
+characters is dropped, a page load records at most 64 MiB of frames, and a
+snapshot over the chunk limit is sent without the canvases' pixels. A page
+whose CSP has no `worker-src` for `blob:` (and `data:`) records no canvas, with
+no error. rrweb forces `preserveDrawingBuffer` on WebGL contexts created after
+recording started, which can cost performance. Details in
+`docs/SESSION-REPLAY.md` "Canvas (VEL-2155)".
 
 Overhead, measured with `bench/replay-overhead.mjs` (in the repository) on
 an Apple M4 Pro (12 cores, macOS), headless Chromium 149, 60 seconds of

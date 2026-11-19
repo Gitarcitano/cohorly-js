@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/node",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Server-side Node.js SDK for Cohorly, hosted product analytics (Mixpanel-style). Stateless mixpanel-node-like API: track with explicit distinct_id, batching queue with retry/backoff, people profile ops, alias, error tracking with serverless flush.",
   "type": "module",
   "main": "dist/index.js",

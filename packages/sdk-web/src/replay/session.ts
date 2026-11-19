@@ -45,6 +45,68 @@ export interface SessionReplayOptions {
    * both rates at 0 (the parent decides).
    */
   allowedIframeOrigins?: string[];
+  /**
+   * Records the content of every `<canvas>` (2D and WebGL) as WebP images, at
+   * most `fps` frames per second per canvas. Off unless this is an object
+   * (`{}` turns it on with the defaults). Canvases are recorded as pixels:
+   * text masking does not apply to them, only `[data-cohorly-block]` and
+   * `blockSelector` keep one out. Costs CPU and bytes, see the docs.
+   */
+  canvas?: {
+    /** Frames per second per canvas, 1 to 12 (clamped). Default 2. */
+    fps?: number;
+    /** WebP quality, 0.1 to 1 (clamped). Default 0.4. */
+    quality?: number;
+  };
+  /**
+   * Records `console.log`, `info`, `warn` and `error` as `$console` events,
+   * scrubbed of e-mails, tokens and card numbers, at most 500 lines a minute.
+   * Default true; `false` records none and leaves the console unwrapped.
+   */
+  console?: boolean;
+  /**
+   * Records headers and/or bodies of the requests whose URL is in `allowUrls`
+   * (VEL-2145). Off by default: without it, or with an empty `allowUrls`,
+   * `$network` keeps only method, URL without query, status and duration.
+   * Secret headers are always removed and bodies are scrubbed and cut at
+   * 16 KiB, but a body can still carry personal data: `redact` is where the
+   * app removes the rest. See docs/SESSION-REPLAY.md section 5.
+   */
+  network?: SessionReplayNetworkOptions;
+}
+
+/** One side of a recorded request. */
+export interface NetworkMessage {
+  /** Lower-case names. */
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/** What `redact` gets, and returns (or null to record no headers and no bodies). */
+export interface NetworkEntry {
+  method: string;
+  /** Absolute, without query or fragment. */
+  url: string;
+  /** 0 for a network error. */
+  status: number;
+  kind: "fetch" | "xhr";
+  request: NetworkMessage;
+  response?: NetworkMessage;
+}
+
+export interface SessionReplayNetworkOptions {
+  /** Request and response headers. Default false. */
+  headers?: boolean;
+  /** Request and response bodies (text types, 16 KiB each). Default false. */
+  bodies?: boolean;
+  /**
+   * URLs whose headers and bodies are recorded, tested against the absolute
+   * URL without query or fragment: a string matches as a prefix, a RegExp by
+   * `test`. Empty or absent: nothing beyond the basics.
+   */
+  allowUrls?: (string | RegExp)[];
+  /** Last say on each recorded entry; throwing records it without headers and bodies. */
+  redact?: (entry: NetworkEntry) => NetworkEntry | null;
 }
 
 export const SESSION_KEY = "chl_replay_session";
@@ -259,6 +321,25 @@ export function rate(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value)
     ? Math.min(1, Math.max(0, value))
     : 0;
+}
+
+export const CANVAS_DEFAULT_FPS = 2;
+export const CANVAS_DEFAULT_QUALITY = 0.4;
+
+function clamped(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : fallback;
+}
+
+/** The canvas option, normalized: null (off) unless it is an object; fps 1..12, quality 0.1..1. */
+export function canvasSettings(value: unknown): { fps: number; quality: number } | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const { fps, quality } = value as { fps?: unknown; quality?: unknown };
+  return {
+    fps: clamped(fps, CANVAS_DEFAULT_FPS, 1, 12),
+    quality: clamped(quality, CANVAS_DEFAULT_QUALITY, 0.1, 1),
+  };
 }
 
 /** Whether replay can do anything with these options (some rate above 0). */

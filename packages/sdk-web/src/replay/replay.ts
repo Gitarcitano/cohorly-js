@@ -16,9 +16,17 @@
  *   recorded in place (iframes.ts here, relay.ts in the iframe, VEL-2152).
  *   They keep relaying through an idle expiry, and an interaction inside one
  *   wakes the session.
+ * - Console lines become `$console` events (console-record.ts) unless
+ *   `console: false`.
+ * - Requests become `$network` events; headers and bodies only with the
+ *   `network` option, for URLs in its `allowUrls` (network-record.ts).
  */
+import { CONSOLE_LEVELS, observeConsole } from "../console.js";
 import { absoluteWithoutQuery, observeNetwork, sdkRequestMatcher } from "../network.js";
+import { canvasFilter } from "./canvas.js";
+import { CONSOLE_TAG, consoleRecorder } from "./console-record.js";
 import { iframeBridge } from "./iframes.js";
+import { networkRecorder } from "./network-record.js";
 import type { ChunkMode, ReplayChunk } from "./sender.js";
 import { MAX_CHUNK_BYTES, ReplaySender } from "./sender.js";
 import type {
@@ -27,7 +35,7 @@ import type {
   ReplaySession,
   SessionReplayOptions,
 } from "./session.js";
-import { QUOTA_PAUSE_KEY } from "./session.js";
+import { canvasSettings, QUOTA_PAUSE_KEY } from "./session.js";
 
 export const DEFAULT_MASK_SELECTOR = "[data-cohorly-mask]";
 export const DEFAULT_BLOCK_SELECTOR = "[data-cohorly-block]";
@@ -44,6 +52,7 @@ export const ERROR_BUFFER_MAX_BYTES = 10 * 1024 * 1024;
 /** Minimum time between two error-triggered sends (a later error waits, it is not lost). */
 export const ERROR_SEND_GAP_MS = 5000;
 export const NETWORK_TAG = "$network";
+export { CONSOLE_TAG };
 
 /** Every input type rrweb knows, plus `hidden`: no input value is ever recorded. */
 export const MASK_INPUT_OPTIONS: Readonly<Record<string, true>> = {
@@ -124,10 +133,20 @@ function combineSelectors(base: string, extra: unknown): string {
  * SDK times the checkouts instead.
  */
 export function recordOptions(options: SessionReplayOptions): Record<string, unknown> {
+  const canvas = canvasSettings(options.canvas);
   return {
     maskInputOptions: { ...MASK_INPUT_OPTIONS },
     maskTextSelector: combineSelectors(DEFAULT_MASK_SELECTOR, options.maskTextSelector),
     blockSelector: combineSelectors(DEFAULT_BLOCK_SELECTOR, options.blockSelector),
+    // A numeric sampling.canvas is rrweb's per-frame mode; the default PNG
+    // would make every snapshot's canvases huge.
+    ...(canvas
+      ? {
+          recordCanvas: true,
+          sampling: { canvas: canvas.fps },
+          dataURLOptions: { type: "image/webp", quality: canvas.quality },
+        }
+      : {}),
   };
 }
 
@@ -234,6 +253,9 @@ export function startRecording(
   let dirtySinceSend = true;
   let lastErrorSend = Number.NEGATIVE_INFINITY;
   let errorSendTimer: ReturnType<typeof setTimeout> | null = null;
+  /** `$network` reports waiting for bodies (each settles within 2 s): an error send waits for them. */
+  const pendingReads = new Set<Promise<void>>();
+  let waitingForReads = false;
   let snapshotRequested = false;
   /** The session the last restart() set up (recording or not). */
   let targetSessionId: string | null = null;
@@ -414,6 +436,9 @@ export function startRecording(
     segments = segments.slice(count);
   };
 
+  const limitCanvas = canvasFilter(ctx.log);
+  const canvasOn = canvasSettings(options.canvas) !== null;
+
   const emit = (raw: RrwebEvent) => {
     if (halted || !recorder) return;
     // Before the session checks: rrweb listens on an attached iframe's window whether or not the event is kept.
@@ -441,6 +466,12 @@ export function startRecording(
       }
       return;
     }
+    const kept = limitCanvas(event, {
+      budget: recorder.mode === "session",
+      pixels: canvasOn || iframes?.fromChild() === true,
+    });
+    if (!kept) return;
+    event = kept;
     accept(event);
     // Every full snapshot (start, checkout, rotation) serializes iframes empty: ask them again.
     if (event.type === FULL_SNAPSHOT) iframes?.snapshot();
@@ -462,18 +493,35 @@ export function startRecording(
     }
   }
 
+  const network = networkRecorder(options.network, ctx.log);
   let unobserve: (() => void) | null = observeNetwork({
     wants: (url) => !halted && recorder !== null && isHttp(url) && !isCohorly(url),
+    detail: (url) => network.detail(url),
+    // The reading code comes from here, so the breadcrumbs never load it.
+    capture: network.capture,
+    reading: (reported) => {
+      pendingReads.add(reported);
+      const drop = () => pendingReads.delete(reported);
+      reported.then(drop, drop);
+    },
     done: (request) => {
       if (!recorder || halted) return;
-      record?.addCustomEvent?.(NETWORK_TAG, {
-        method: request.method,
-        url: strippedUrl(request.url),
-        status: request.status ?? 0,
-        duration_ms: request.durationMs,
-      });
+      record?.addCustomEvent?.(NETWORK_TAG, network.payload(request));
     },
   });
+
+  // Subscribed once, like the network: a recorder restart keeps the wrapper and the line limit.
+  const consoleLines =
+    options.console === false
+      ? null
+      : consoleRecorder({
+          recording: () => !halted && recorder !== null && store.active()?.id === recorder.sessionId,
+          session: () => recorder?.sessionId ?? null,
+          add: (payload) => record?.addCustomEvent?.(CONSOLE_TAG, payload),
+        });
+  let unobserveConsole: (() => void) | null = consoleLines
+    ? observeConsole({ levels: CONSOLE_LEVELS, call: consoleLines.line })
+    : null;
 
   const onWake = () => {
     disarmWake();
@@ -500,6 +548,7 @@ export function startRecording(
   const stopRecorder = () => {
     generation += 1;
     if (recorder) {
+      consoleLines?.flush();
       flushPending();
       try {
         recorder.stop();
@@ -589,6 +638,7 @@ export function startRecording(
 
   const onHidden = (split: boolean) => {
     if (halted) return;
+    consoleLines?.flush();
     // Queued without a regular send: the keepalive requests are the ones
     // that survive the page.
     flushPending(false);
@@ -609,6 +659,9 @@ export function startRecording(
     disarmWake();
     unobserve?.();
     unobserve = null;
+    unobserveConsole?.();
+    unobserveConsole = null;
+    consoleLines?.stop();
     window.removeEventListener("pagehide", onPageHide);
     document.removeEventListener("visibilitychange", onVisibility);
   }
@@ -684,13 +737,25 @@ export function startRecording(
   };
 
   /** The SDK captured an exception stamped with the running recorder's session. */
-  function handleException(): void {
+  function handleException(readsDone = false): void {
     if (halted || !recorder) return;
     if (recorder.mode === "session") {
       flushPending();
       return;
     }
-    if (errorSendTimer) return; // a send is already scheduled; it will include this error
+    if (errorSendTimer || waitingForReads) return; // a send is already scheduled; it will include this error
+    if (!readsDone && pendingReads.size > 0) {
+      // A request the app just saw fail is still being read: its `$network`
+      // would otherwise land in the next buffer, after this send. Only the
+      // reads pending now are waited for, so steady traffic never holds it.
+      waitingForReads = true;
+      const resume = () => {
+        waitingForReads = false;
+        handleException(true);
+      };
+      Promise.all([...pendingReads]).then(resume, resume);
+      return;
+    }
     const wait = lastErrorSend + ERROR_SEND_GAP_MS - Date.now();
     if (wait <= 0) {
       sendErrorBuffer();

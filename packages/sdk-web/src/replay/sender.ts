@@ -67,7 +67,7 @@ interface Encoded {
   bytes: number;
 }
 
-function byteLength(text: string): number {
+export function byteLength(text: string): number {
   if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(text).byteLength;
   return text.length;
 }

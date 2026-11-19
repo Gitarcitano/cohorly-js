@@ -3,10 +3,22 @@
 // Loads a local static page with the BUILT SDK (packages/sdk-core/dist,
 // packages/sdk-web/dist, @rrweb/record) in headless Chromium, runs the same
 // scripted interaction for DURATION_S seconds (typing into inputs, clicks that
-// add list items, text mutations, mouse moves, scrolling) in five variants:
+// add list items, text mutations, mouse moves, scrolling) in seven variants:
 // no replay, session mode (sampleRate 1) and error mode (onErrorSampleRate 1,
-// one captureException() at the end) on a page of about 1000 elements, and no
-// replay / session mode on a page of about 5000 elements. It reports:
+// one captureException() at the end) on a page of about 1000 elements, no
+// replay / session mode on a page of about 5000 elements, and (VEL-2155) two
+// variants of the 1000 element page plus an 800x600 2D <canvas> redrawn 20
+// times a second during the interaction: session mode with
+// `canvas: { fps: 2 }` (`canvas`) and the same without the option
+// (`canvas-off`), and session mode on the 1000 element page that also logs 10
+// console lines a second (log, info, warn and error, an object now and then:
+// `$console`, VEL-2144, `session-console`), and (VEL-2145) two session-mode
+// variants of the 1000 element page that also fetch 1 MB of JSON from the
+// page's own server twice a second and read it whole: `session-fetch` without
+// the network option and `session-network` with
+// `network: { headers: true, bodies: true, allowUrls: [<page origin>] }`
+// (each response cloned, 16 KiB of it read, `$network` with headers and
+// bodies). It reports:
 // - init cost: deltas of CDP Performance.getMetrics TaskDuration and
 //   ScriptDuration from just before init() to 1.5 s after it (the replay
 //   chunks' dynamic imports, rrweb's record() and its first full snapshot),
@@ -23,7 +35,10 @@
 // (or BENCH_BROWSER). Chromium is the default and the only one with CPU
 // numbers: CDP Performance.getMetrics does not exist in Firefox or WebKit, so
 // there only the bytes sent (and that the SDK runs at all) are reported.
-// (5 variants x runs x about DURATION_S + 11 s each).
+// (10 variants x runs x about DURATION_S + 11 s each). For the canvas variants it
+// also prints the canvas frames received (rrweb source 9 events) and the mean
+// serialized bytes per frame, and for the fetch variants the `$network` events
+// received and their mean serialized size.
 import { readFileSync, realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -48,13 +63,28 @@ const VARIANTS = [
   { name: "off", replay: null, cards: 150 },
   { name: "session", replay: "session", cards: 150 },
   { name: "error", replay: "error", cards: 150 },
+  { name: "session-console", replay: "session", cards: 150, console: true },
   { name: "off-5k", replay: null, cards: 800 },
   { name: "session-5k", replay: "session", cards: 800 },
+  { name: "canvas-off", replay: "canvas-off", cards: 150, animate: true },
+  { name: "canvas", replay: "canvas", cards: 150, animate: true },
+  { name: "session-fetch", replay: "session", cards: 150, fetching: true },
+  { name: "session-network", replay: "session-network", cards: 150, fetching: true },
 ];
 const REPLAY_OPTIONS = {
   session: "{ sampleRate: 1 }",
   error: "{ sampleRate: 0, onErrorSampleRate: 1 }",
+  canvas: "{ sampleRate: 1, canvas: { fps: 2 } }",
+  "canvas-off": "{ sampleRate: 1 }",
+  // Evaluated in the page: the 1 MB endpoint is on the page's own origin.
+  "session-network": '{ sampleRate: 1, network: { headers: true, bodies: true, allowUrls: [location.origin + "/"] } }',
 };
+// What GET /data.json answers in the fetch variants: about 1 MB of JSON.
+const DATA_JSON = Buffer.from(
+  JSON.stringify({
+    items: Array.from({ length: 9000 }, (_, i) => ({ id: i, sku: `SKU-${i}`, name: `Product ${i}`, price: i * 3, tags: ["a", "b", "c"], note: "lorem ipsum dolor sit amet" })),
+  }),
+);
 
 const require = createRequire(realpathSync(join(repo, "apps/e2e/node_modules/@playwright/test/package.json")));
 const playwright = require("playwright-core");
@@ -73,7 +103,7 @@ const fflateJs = join(
 // ---- mock ingestion API: counts /replay bytes
 let stats;
 const resetStats = () => {
-  stats = { requests: 0, wire: 0, raw: 0, events: 0, gzip: 0, keepalive: 0, errorChunks: 0 };
+  stats = { requests: 0, wire: 0, raw: 0, events: 0, gzip: 0, keepalive: 0, errorChunks: 0, canvasFrames: 0, canvasChars: 0, networkEvents: 0, networkChars: 0 };
 };
 resetStats();
 const api = createServer((req, res) => {
@@ -99,6 +129,16 @@ const api = createServer((req, res) => {
       if (gzip) stats.gzip += 1;
       if (url.searchParams.has("token")) stats.keepalive += 1;
       if (chunk.mode === "error") stats.errorChunks += 1;
+      for (const event of chunk.events) {
+        if (event.type === 3 && event.data?.source === 9) {
+          stats.canvasFrames += 1;
+          stats.canvasChars += JSON.stringify(event).length;
+        }
+        if (event.type === 5 && event.data?.tag === "$network") {
+          stats.networkEvents += 1;
+          stats.networkChars += JSON.stringify(event).length;
+        }
+      }
     }
     res.writeHead(200, { ...cors, "content-type": "application/json" }).end('{"status":1}');
   });
@@ -108,12 +148,12 @@ const API = `http://127.0.0.1:${api.address().port}`;
 
 // ---- the page: about 1000 (150 cards) or 5000 (800 cards) elements and a
 // scripted interaction driven by page timers; init() runs when the harness says.
-const page = (replay, cards) => `<!doctype html><meta charset=utf-8><title>bench</title>
+const page = (replay, cards, animate) => `<!doctype html><meta charset=utf-8><title>bench</title>
 <style>body{font:14px system-ui;margin:16px}li{padding:2px}.card{border:1px solid #ccc;margin:4px;padding:4px}</style>
 <script type="importmap">{"imports":{"@cohorly/core":"/core/index.js","@cohorly/web":"/web/index.js","@rrweb/record":"/rrweb/record.js","fflate":"/fflate/browser.js"}}</script>
 <h1>Checkout</h1>
 <form><input id=name placeholder=Name><input id=email placeholder=Email><textarea id=notes></textarea><button type=button id=add>Add item</button></form>
-<ul id=list></ul><div id=cards></div>
+<ul id=list></ul>${animate ? "<canvas id=art width=800 height=600></canvas>" : ""}<div id=cards></div>
 <script type="module">
   import { cohorly, init } from "@cohorly/web";
   const cards = document.getElementById("cards");
@@ -135,7 +175,7 @@ const page = (replay, cards) => `<!doctype html><meta charset=utf-8><title>bench
     list.appendChild(li);
     if (list.children.length > 200) list.firstChild.remove();
   });
-  window.runInteraction = (ms) => new Promise((done) => {
+  window.runInteraction = (ms, logging, fetching) => new Promise((done) => {
     const text = "the quick brown fox jumps over the lazy dog ";
     const fields = ["name", "email", "notes"].map((id) => document.getElementById(id));
     let t = 0;
@@ -155,8 +195,42 @@ const page = (replay, cards) => `<!doctype html><meta charset=utf-8><title>bench
       m++;
     }, 50);
     const scrolling = setInterval(() => window.scrollTo(0, (m * 37) % 2000), 2000);
+    // A moving gradient with a few hundred random rectangles: noisy enough that
+    // WebP does not collapse it, like a chart or a map rather than a flat fill.
+    const art = document.getElementById("art");
+    let frame = 0;
+    const drawing = art ? setInterval(() => {
+      const g = art.getContext("2d");
+      const shift = (frame * 9) % 800;
+      const gradient = g.createLinearGradient(shift, 0, shift + 800, 600);
+      gradient.addColorStop(0, "hsl(" + ((frame * 5) % 360) + ",70%,50%)");
+      gradient.addColorStop(1, "hsl(" + ((frame * 5 + 120) % 360) + ",70%,35%)");
+      g.fillStyle = gradient;
+      g.fillRect(0, 0, 800, 600);
+      for (let i = 0; i < 400; i++) {
+        g.fillStyle = "hsl(" + Math.floor(Math.random() * 360) + ",80%," + (20 + Math.floor(Math.random() * 60)) + "%)";
+        g.fillRect(Math.random() * 780, Math.random() * 580, 4 + Math.random() * 16, 4 + Math.random() * 16);
+      }
+      frame++;
+    }, 50) : null;
+    const levels = ["log", "info", "warn", "error"];
+    let n = 0;
+    const logging10 = logging
+      ? setInterval(() => {
+          const level = levels[n % 4];
+          if (n % 5 === 0) console[level]("cart updated", { id: n, items: [{ sku: "A-" + n, qty: n % 3 }], user: { email: "bench@example.com" } });
+          else console[level]("render " + n + " took " + (n % 17) + " ms");
+          n++;
+        }, 100)
+      : null;
+    // The page reads every response whole, as an app would.
+    const fetching2 = fetching
+      ? setInterval(() => {
+          fetch("/data.json?page=" + n++, { headers: { "x-trace": "bench" } }).then((r) => r.json()).catch(() => {});
+        }, 500)
+      : null;
     setTimeout(() => {
-      for (const id of [typing, clicking, mutating, moving, scrolling]) clearInterval(id);
+      for (const id of [typing, clicking, mutating, moving, scrolling, drawing, logging10, fetching2]) if (id) clearInterval(id);
       done();
     }, ms);
   });
@@ -169,7 +243,11 @@ const site = createServer((req, res) => {
   if (url.pathname === "/") {
     const replay = url.searchParams.get("replay") || null;
     const cards = Number(url.searchParams.get("cards") ?? 150);
-    return void res.writeHead(200, { "content-type": "text/html" }).end(page(replay, cards));
+    const animate = url.searchParams.get("animate") === "1";
+    return void res.writeHead(200, { "content-type": "text/html" }).end(page(replay, cards, animate));
+  }
+  if (url.pathname === "/data.json") {
+    return void res.writeHead(200, { "content-type": "application/json", "content-length": DATA_JSON.length }).end(DATA_JSON);
   }
   if (url.pathname === "/rrweb/record.js") {
     return void res.writeHead(200, { "content-type": "text/javascript" }).end(readFileSync(recordJs));
@@ -201,7 +279,7 @@ async function run(variant) {
   const cdp = CDP ? await context.newCDPSession(p) : null;
   const getMetrics = async () => (cdp ? cdp.send("Performance.getMetrics") : NO_METRICS);
   if (cdp) await cdp.send("Performance.enable", { timeDomain: "threadTicks" });
-  await p.goto(`${ORIGIN}/?replay=${variant.replay ?? ""}&cards=${variant.cards}`);
+  await p.goto(`${ORIGIN}/?replay=${variant.replay ?? ""}&cards=${variant.cards}${variant.animate ? "&animate=1" : ""}`);
   await p.waitForFunction(() => window.ready === true);
   await p.waitForTimeout(500);
   const elements = await p.evaluate(() => window.elementCount());
@@ -211,7 +289,11 @@ async function run(variant) {
   const afterInit = await getMetrics();
   await p.waitForTimeout(1000);
   const before = await getMetrics();
-  await p.evaluate((ms) => window.runInteraction(ms), DURATION_S * 1000);
+  await p.evaluate(([ms, logging, fetching]) => window.runInteraction(ms, logging, fetching), [
+    DURATION_S * 1000,
+    variant.console === true,
+    variant.fetching === true,
+  ]);
   const after = await getMetrics();
   if (variant.replay === "error") await p.evaluate(() => window.captureError());
   await p.waitForTimeout(6000); // the 5 s chunk timer
@@ -238,7 +320,7 @@ const fmt = (n, d = 3) => n.toFixed(d);
 
 console.log(`machine: ${cpus()[0]?.model} x${cpus().length}, ${Math.round(totalmem() / 2 ** 30)} GB, ${platform()} ${release()}, node ${process.version}`);
 console.log(`browser: ${BROWSER} ${browser.version()} (headless, playwright-core)${CDP ? "" : "; no CDP, so no CPU numbers, only bytes sent"}`);
-console.log(`interaction: ${DURATION_S}s scripted (typing 10/s, click+append 2/s, text mutations 1/s, mousemove 20/s, scroll 0.5/s), ${RUNS} runs per variant`);
+console.log(`interaction: ${DURATION_S}s scripted (typing 10/s, click+append 2/s, text mutations 1/s, mousemove 20/s, scroll 0.5/s; session-console adds 10 console lines/s, session-fetch and session-network fetch 1 MB of JSON 2/s), ${RUNS} runs per variant`);
 if (CDP) console.log("init window: from just before init() to 1.5 s after it (replay imports, record(), first full snapshot)");
 if (CDP) console.log(`CPU window: the ${DURATION_S}s interaction only, starting 1 s after the init window; page load, init, the error send and the final flushes are outside it`);
 for (const [name, list] of Object.entries(results)) {
@@ -268,7 +350,24 @@ const compare = (base, name) => {
 };
 compare("off", "session");
 compare("off", "error");
+compare("off", "session-console");
+compare("session", "session-console");
 compare("off-5k", "session-5k");
+compare("canvas-off", "canvas");
+compare("session", "session-fetch");
+compare("session-fetch", "session-network");
+for (const name of ["session-fetch", "session-network"]) {
+  const count = avg(results[name], "networkEvents");
+  console.log(
+    `${name} $network events: ${fmt(count, 0)} per run, ${count > 0 ? fmt(avg(results[name], "networkChars") / count / 1024, 2) : "n/a"} KiB mean serialized per event`,
+  );
+}
+for (const name of ["canvas-off", "canvas"]) {
+  const frames = avg(results[name], "canvasFrames");
+  console.log(
+    `${name} canvas frames: ${fmt(frames, 0)} per run, ${frames > 0 ? fmt(avg(results[name], "canvasChars") / frames / 1024, 1) : "n/a"} KiB mean serialized per frame`,
+  );
+}
 
 await browser.close();
 api.close();

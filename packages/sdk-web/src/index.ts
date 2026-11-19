@@ -633,5 +633,10 @@ export {
   MAX_EXCEPTIONS_PER_FINGERPRINT,
 } from "./exceptions.js";
 export { getPageviewProperties, PAGEVIEW_EVENT } from "./pageview.js";
-export type { SessionReplayOptions } from "./replay/session.js";
+export type {
+  NetworkEntry,
+  NetworkMessage,
+  SessionReplayNetworkOptions,
+  SessionReplayOptions,
+} from "./replay/session.js";
 export type { AutocaptureConfig, AutocaptureOption };

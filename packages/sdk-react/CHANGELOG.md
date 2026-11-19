@@ -1,5 +1,16 @@
 # @cohorly/react
 
+## 0.4.2
+
+### Patch Changes
+
+- Updated dependencies [916660e]
+- Updated dependencies [8ea584e]
+- Updated dependencies [916660e]
+- Updated dependencies [cefb784]
+  - @cohorly/core@0.5.0
+  - @cohorly/web@0.6.0
+
 ## 0.4.1
 
 ### Patch Changes
