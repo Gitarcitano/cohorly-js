@@ -39,7 +39,7 @@ repositories {
     mavenCentral()
     // Real (non-vendored) dependency on the Cohorly Android SDK, published via
     // JitPack from https://github.com/cohorly-io/cohorly-android (see that
-    // repo's tag v0.3.0, which adds native crash reporting).
+    // repo's tag v0.4.0, whose crash reporter stamps the replay session id).
     maven { url 'https://jitpack.io' }
 }
 
@@ -47,7 +47,7 @@ dependencies {
     implementation 'com.facebook.react:react-native:+'
     // Brings AndroidDeviceInfo (app version/build/model/manufacturer/brand/
     // carrier reads) - transitively pulls cohorly-android-core.
-    implementation 'com.github.cohorly-io.cohorly-android:cohorly-android:v0.3.0'
+    implementation 'com.github.cohorly-io.cohorly-android:cohorly-android:v0.4.0'
     // Session replay (VEL-2142): the recorder copy under com/cohorly/android/replay
     // follows windows and touches through curtains (same version as
     // sdks/android/cohorly-replay), and reads Compose only when the app has it.

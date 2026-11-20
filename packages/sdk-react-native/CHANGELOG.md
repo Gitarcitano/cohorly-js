@@ -1,5 +1,16 @@
 # @cohorly/react-native
 
+## 1.7.0
+
+### Minor Changes
+
+- 2a6b2de: Session replay: `sessionReplay.remoteConfig: true` applies the rates and the minimum duration saved in Settings > Session replay (`GET /replay/config`), cached for 1 hour per token, for new sessions only. Off by default.
+- f73cb03: Automatic screen views: `trackScreenViews: true` makes `trackNavigation(navigationRef)` send `$screen` with `$screen_name` (the route name, never params) for the initial route and every route change. Off by default.
+
+### Patch Changes
+
+- 88778f2: Android: depend on cohorly-android v0.4.0, so an uncaught JVM exception or a watchdog ANR carries the replay's `$session_id` and its error issue links to the recording.
+
 ## 1.6.0
 
 ### Minor Changes

@@ -80,7 +80,7 @@ to storage, so nothing is lost if the app closes before a flush.
 | `isExceptionCaptureEnabled` | `() => boolean` | `false` until the persisted state is read, and after opt-out or with `captureExceptions: false`; use it as `enabled` for a native crash reporter. `false` before `init()`. |
 | `onExceptionCaptureChange` | `(listener: (enabled: boolean) => void) => () => void` | Called when `isExceptionCaptureEnabled()` changes (end of hydration, opt-out, opt-in); not on subscribe. Re-send the native crash reporter configuration from it. Subscribe after `init()`; before it returns a no-op unsubscribe. |
 | `addBreadcrumb` | `(crumb) => void` | Step sent with the next exceptions (last 50, memory only, cleared by `reset()`). |
-| `trackNavigation` | `(navigationRef) => () => void` | `navigation` breadcrumbs (route names only) from a React Navigation / expo-router container ref. |
+| `trackNavigation` | `(navigationRef) => () => void` | `navigation` breadcrumbs (route names only) from a React Navigation / expo-router container ref; with `trackScreenViews: true` it also sends `$screen`. |
 | `CohorlyErrorBoundary` | component | Catches render errors, captures them (`react.errorboundary`), renders `fallback`. |
 
 You can also construct `new CohorlyClient(options)` directly instead of using the module-level
@@ -170,7 +170,7 @@ cd ios && pod install
 ```
 
 - **Android is a real dependency**, not vendored: `android/build.gradle` pulls
-  `com.github.cohorly-io.cohorly-android:cohorly-android:v0.3.0` straight from
+  `com.github.cohorly-io.cohorly-android:cohorly-android:v0.4.0` straight from
   JitPack (built off the public `cohorly-io/cohorly-android` mirror - see
   [docs/RELEASING.md](../../docs/RELEASING.md#sdk-releases)), so it reuses the
   same `AndroidDeviceInfo` class the standalone Cohorly Android SDK ships, no
@@ -308,6 +308,38 @@ init({ token: "YOUR_PROJECT_TOKEN", storage: AsyncStorage, nativeCrashReporting:
 
 See the [React Native docs](https://cohorly-docs.velloalabs.com/sdks/react-native#error-tracking) for the details.
 
+## Screen views
+
+Off by default. With `trackScreenViews: true` in `init`, `trackNavigation()` also
+sends the event `$screen` with the property `$screen_name`: the route name of
+the initial route and of every route you navigate to. It needs
+`trackNavigation()`; the option alone sends nothing. Route params are never read.
+
+```tsx
+import { NavigationContainer, useNavigationContainerRef } from "@react-navigation/native";
+import { init, trackNavigation } from "@cohorly/react-native";
+
+init({ token: "YOUR_PROJECT_TOKEN", storage: AsyncStorage, trackScreenViews: true });
+
+export function App() {
+  const navigationRef = useNavigationContainerRef();
+  useEffect(() => trackNavigation(navigationRef), [navigationRef]);
+  return <NavigationContainer ref={navigationRef}>{/* ... */}</NavigationContainer>;
+}
+```
+
+With Expo Router, call `useNavigationContainerRef()` from `expo-router` in the
+root layout the same way. `$screen_name` is the route name, which for Expo Router
+is the file route name relative to its nearest layout: `app/profile/[id].tsx`
+is `profile/[id]`, or `[id]` when `app/profile/_layout.tsx` exists. Two nested layouts can
+therefore report the same name (`index` in two tabs): give those files
+distinct names when you need to tell them apart.
+
+A route that has not changed (`setParams`, or any other `state` event on the
+same screen) is not sent again, and returning from the background sends
+nothing. Each `$screen` is an ordinary event and counts against your event
+quota. Session replay never turns this on.
+
 ## Session replay
 
 Records the screen of sampled sessions on iOS (VEL-2153) and Android (VEL-2142).
@@ -327,6 +359,7 @@ init({
 | `onErrorSampleRate` | `0` | Share of the other sessions that keep the last 30 to 60 s in memory and send them only when the SDK records an exception. |
 | `mode` | `"screenshot"` | `"screenshot"`: each screen is an image, masked before it is encoded. `"wireframe"` (experimental): views described as boxes and text. |
 | `maskAllImages` | `true` | Masks every image, in both modes. |
+| `remoteConfig` | `false` | Reads the rates and minimum duration saved in Settings > Session replay (see below). |
 
 Replay is on when one rate is above 0. Then every event, `$exception` included,
 carries `$session_id`, and the session is drawn once (kept across relaunches):
@@ -334,6 +367,17 @@ recorded whole and uploaded every 5 s, on background and on an exception;
 buffered for errors; or not recorded. A session ends after more than 30 min in
 background or without activity, after 24 h, and on `reset()`. `optOutTracking()`
 stops the recorder and drops what it held.
+
+With `remoteConfig: true` (and a project token) each field the project saved
+wins over your code's, a field it never saved keeps yours, and with no network
+and no cached copy your values apply. Replay then starts even with both rates
+at 0. The settings are kept for 1 hour per token in `storage` and apply to new
+sessions only: a new session gets its `$session_id` at once and waits at most
+3 s for them before it is sampled; `ready` and `track()` never wait. With a
+minimum duration, a recorded session sends nothing until it is that long and a
+shorter one is never sent, unless it holds more than 2.5 MB first, which is
+then sent anyway (sessions recorded on error are always sent).
+Triggers are web only; `mode` and `maskAllImages` always come from your code.
 
 Text inputs are always masked. To hide anything else, wrap it in `<CohorlyMask>`,
 a `View` whose content is never recorded (the recorder draws a placeholder of
@@ -376,9 +420,9 @@ recorder, and the two copies clash (duplicate classes).
   Expo SDK 58.
 - For a fatal JS error, sending the error buffer is best effort: the app may
   terminate first.
-- An Android native crash links to its recording (`$session_id`) only with a
-  cohorly-android release that includes VEL-2150; the JitPack `v0.3.0` this
-  package depends on does not.
+- On Android, an uncaught JVM exception and a watchdog ANR link to the
+  recording (`$session_id`); a crash read on the next launch from the exit
+  info (NDK crash, ANR or kill the watchdog missed) does not.
 - A drain hands over what the recorder has finished; a screenshot still being
   copied from the screen at that moment arrives in the next drain. A fatal
   native crash loses what is pending in memory.

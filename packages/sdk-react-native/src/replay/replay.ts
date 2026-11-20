@@ -28,6 +28,20 @@
  * - `optOut()` and `stop()` end it: the recorder stops, the outbox and the
  *   error buffer are dropped, and nothing is stamped or sent again. Opting
  *   back in does not restart it (the web SDK's rule); the next `init()` does.
+ * - With `remoteConfig` (VEL-2238, remote-config.ts) the project's saved
+ *   fields win over the code's for NEW sessions. The stored copy is read with
+ *   the session record in `load()` (storage only, never the network). A new
+ *   session born without a fresh copy is `pending`: it has its id at once,
+ *   the native recorder is not started for it, and it is decided by the
+ *   answer, the failure (expired copy, else the code) or 3 s, whichever comes
+ *   first. One request at most is in flight; it starts in `start()` without a
+ *   fresh copy, and when a session is born with the copy expired.
+ * - Minimum duration (a session-mode recording of a session that has sent
+ *   nothing yet): what it drains stays in memory, with no seq taken, until
+ *   the recording is `minDurationMs` long (last event minus first) or holds
+ *   more than {@link MIN_DURATION_HOLD_MAX_BYTES}; then everything goes in
+ *   order and nothing is held again. A recording that ends shorter sends
+ *   nothing. Error mode never holds.
  */
 import type { AsyncStorageLike } from "../types.js";
 import type { ChunkMode, Unit } from "./chunks.js";
@@ -47,12 +61,20 @@ import { CHECKOUT_EVERY_MS, ERROR_SEND_GAP_MS, ErrorBuffer } from "./error-buffe
 import type { NativeReplay } from "./native.js";
 import { resolveNativeReplay, warnReplayUnavailable } from "./native.js";
 import type { ReplayDraw, ReplaySettings, SessionReplayOptions } from "./options.js";
-import { drawSession, replaySettings } from "./options.js";
-import { ReplaySender } from "./sender.js";
+import { drawSession, effectiveSettings, replaySettings } from "./options.js";
+import type { StoredReplayConfig } from "./remote-config.js";
+import { fetchReplayConfig, isFresh, REPLAY_CONFIG_TIMEOUT_MS, readReplayConfig } from "./remote-config.js";
+import { MAX_OUTBOX_BYTES, ReplaySender } from "./sender.js";
 import type { ReplaySessionState } from "./session.js";
 import { ReplaySessionStore, replayStorageKey } from "./session.js";
 
 export const DRAIN_INTERVAL_MS = 5000;
+/**
+ * A recording held by its minimum duration is sent anyway past this much
+ * (UTF-8 bytes of its events): half the outbox, as on the web, so the release
+ * never overflows the outbox and loses its first snapshot.
+ */
+export const MIN_DURATION_HOLD_MAX_BYTES = MAX_OUTBOX_BYTES / 2;
 /**
  * SDK-internal events: stamped with the current session, never count as
  * activity, so they never rotate it (neither the 30 min nor the 24 h rule),
@@ -92,6 +114,28 @@ interface Recording {
   awaitSnapshot: boolean;
   /** A snapshot too large was dropped: IncrementalSnapshots wait for one that fits. */
   suppress: boolean;
+  /** Session mode waiting for its minimum duration: what it drained, not sent yet (null: it flows). */
+  held: HeldRecording | null;
+}
+
+interface HeldRecording {
+  minDurationMs: number;
+  units: Unit[];
+  bytes: number;
+  /** Timestamps of the first and the latest event drained. */
+  first?: number;
+  last?: number;
+}
+
+function unitTimestamps(unit: Unit): number[] {
+  try {
+    const events = JSON.parse(`[${unit.json}]`) as unknown[];
+    return events
+      .map((event) => (event as { timestamp?: unknown } | null)?.timestamp)
+      .filter((at): at is number => typeof at === "number" && Number.isFinite(at));
+  } catch {
+    return [];
+  }
 }
 
 function unref(timer: unknown): void {
@@ -124,6 +168,17 @@ export class ReplayController {
   private readonly retiredIdentity = new Map<string, string>();
   private foreground: boolean;
   private batches = 0;
+  private readonly random: () => number;
+  /** The remote settings copy as last read or fetched (remoteConfig only). */
+  private copy: StoredReplayConfig | null = null;
+  /** The settings request in flight (at most one). */
+  private configRequest: Promise<void> | null = null;
+  /** The 3 s a pending session waits for the settings. */
+  private settingsWait: ReturnType<typeof setTimeout> | null = null;
+  /** When that wait ends (Date.now() ms): an answer handled later never decides the session, whatever runs first. */
+  private settingsDeadline: number | null = null;
+  /** The minimum duration of the session just drawn (read by the store right after the draw). */
+  private drawnMinDuration = 0;
 
   constructor(
     private readonly settings: ReplaySettings,
@@ -132,19 +187,26 @@ export class ReplayController {
     appState?: string,
   ) {
     const random = host.random ?? Math.random;
+    this.random = random;
     this.foreground = appState === undefined || appState === "active";
     this.store = new ReplaySessionStore({
       storage: host.storage,
       key: replayStorageKey(host.token),
-      draw: (): ReplayDraw => drawSession(settings, random),
+      draw: (): ReplayDraw => this.drawNew(),
+      minDurationMs: () => this.drawnMinDuration,
       now: () => Date.now(),
-      onRotate: (_session, previous) => {
+      onRotate: (session, previous) => {
         // Before anything else: chunks of the outgoing session built later keep its identity.
         this.retiredIdentity.set(previous.id, host.distinctId());
         while (this.retiredIdentity.size > RETIRED_IDENTITIES) {
           this.retiredIdentity.delete(this.retiredIdentity.keys().next().value as string);
         }
         host.onRotate();
+        if (session.draw === "pending") {
+          if (this.active()) this.waitForSettings();
+        } else {
+          this.clearSettingsWait();
+        }
         if (this.active()) void this.run(() => this.apply());
       },
     });
@@ -172,9 +234,24 @@ export class ReplayController {
     });
   }
 
-  /** Reads the persisted session; see ReplaySessionStore.load(). */
-  load(): Promise<{ from: string; to: string } | null> {
-    return this.store.load();
+  /**
+   * Reads the persisted session (see ReplaySessionStore.load()) and, with
+   * `remoteConfig`, the stored settings copy alongside it, so the first
+   * session is drawn once with what is known. Storage only, never the network.
+   */
+  async load(): Promise<{ from: string; to: string } | null> {
+    const token = this.host.token;
+    const copy =
+      this.settings.remoteConfig && token
+        ? readReplayConfig(this.host.storage, token, () => Date.now()).then((stored) => {
+            this.takeCopy(stored);
+          })
+        : undefined;
+    const adopted = await this.store.load(copy);
+    // A stored session left pending (the app was killed while it waited): a fresh copy, or the
+    // code when the project's settings are no longer read, decides it now.
+    if (!this.settings.remoteConfig || isFresh(this.copy, Date.now())) this.settlePending();
+    return adopted;
   }
 
   /** Starts recording per the session's draw (after the client knows it is not opted out). */
@@ -186,6 +263,8 @@ export class ReplayController {
     unref(this.drainTimer);
     this.checkoutTimer = setInterval(() => void this.run(() => this.checkoutIfDirty()), CHECKOUT_EVERY_MS);
     unref(this.checkoutTimer);
+    if (this.settings.remoteConfig && !isFresh(this.copy, Date.now())) this.requestSettings();
+    if (this.store.last().draw === "pending") this.waitForSettings();
     void this.run(() => this.apply());
   }
 
@@ -277,8 +356,84 @@ export class ReplayController {
     return next;
   }
 
+  /** The draw of a new session: the code's, or with `remoteConfig` the fresh copy's, else `pending`. */
+  private drawNew(): ReplayDraw {
+    this.drawnMinDuration = 0;
+    if (!this.settings.remoteConfig) return drawSession(this.settings, this.random);
+    if (!isFresh(this.copy, Date.now())) {
+      // Born with the copy expired (or unknown before load): read it again, decided later.
+      if (this.started) this.requestSettings();
+      return "pending";
+    }
+    const effective = effectiveSettings(this.settings, this.copy?.config ?? null);
+    this.drawnMinDuration = effective.minDurationMs;
+    return drawSession(effective, this.random);
+  }
+
+  /** Keeps the newer of the copy in memory and `stored`. */
+  private takeCopy(stored: StoredReplayConfig | null): void {
+    if (stored && (!this.copy || stored.fetchedAt >= this.copy.fetchedAt)) this.copy = stored;
+  }
+
+  /** One request for the project's settings at a time; its outcome decides a pending session. */
+  private requestSettings(): void {
+    const token = this.host.token;
+    if (this.configRequest || this.closed || !token) return;
+    this.configRequest = fetchReplayConfig({
+      apiHost: this.host.apiHost,
+      token,
+      storage: this.host.storage,
+      fetch: this.host.fetch(),
+      now: () => Date.now(),
+      onAnswer: (answer) => this.takeSettings(answer),
+      persist: () => !this.closed,
+    }).then((answer) => {
+      this.configRequest = null;
+      // The failure: the expired copy, else the code.
+      if (!answer) this.takeSettings(null);
+    });
+  }
+
+  /** The request's outcome: decides a pending session still within its 3 s, then refreshes the copy. */
+  private takeSettings(answer: StoredReplayConfig | null): void {
+    if (this.closed) return;
+    // Past the 3 s (a suspended app, a busy JS thread): decided as the wait would have, without it.
+    if (this.settingsDeadline !== null && Date.now() >= this.settingsDeadline) this.settlePending();
+    this.takeCopy(answer);
+    this.settlePending();
+  }
+
+  /** The live pending session waits at most 3 s from now, then is decided with what is known. */
+  private waitForSettings(): void {
+    this.clearSettingsWait();
+    const sessionId = this.store.last().id;
+    this.settingsDeadline = Date.now() + REPLAY_CONFIG_TIMEOUT_MS;
+    this.settingsWait = setTimeout(() => {
+      this.settingsWait = null;
+      if (this.store.last().id === sessionId) this.settlePending();
+    }, REPLAY_CONFIG_TIMEOUT_MS);
+    unref(this.settingsWait);
+  }
+
+  private clearSettingsWait(): void {
+    if (this.settingsWait) clearTimeout(this.settingsWait);
+    this.settingsWait = null;
+    this.settingsDeadline = null;
+  }
+
+  /** Decides the live session when it is still pending, with the copy in memory (fresh or expired) else the code. */
+  private settlePending(): void {
+    if (this.closed) return;
+    const session = this.store.last();
+    if (session.draw !== "pending") return;
+    this.clearSettingsWait();
+    const effective = effectiveSettings(this.settings, this.copy?.config ?? null);
+    if (!this.store.settle(session.id, drawSession(effective, this.random), effective.minDurationMs)) return;
+    if (this.active()) void this.run(() => this.apply());
+  }
+
   private effectiveMode(session: ReplaySessionState): ChunkMode | null {
-    if (session.draw === "none") return null;
+    if (session.draw === "none" || session.draw === "pending") return null;
     if (session.draw === "session" && Date.now() < this.store.quotaPausedUntil()) return "error";
     return session.draw;
   }
@@ -342,15 +497,28 @@ export class ReplayController {
         return;
       }
       this.nativeOn = true;
-      this.recording = { sessionId: session.id, mode, awaitSnapshot: true, suppress: false };
+      this.recording = this.newRecording(session, mode);
       this.buffer.clear();
       return;
     }
     if (rec?.sessionId !== session.id || rec?.mode !== mode) {
       // The new recording starts from a full snapshot; anything drained before it is the old screen.
-      this.recording = { sessionId: session.id, mode, awaitSnapshot: true, suppress: false };
+      this.recording = this.newRecording(session, mode);
       await this.native.checkout();
     }
+  }
+
+  /** A session-mode recording of a session that has sent nothing yet holds until its minimum duration. */
+  private newRecording(session: ReplaySessionState, mode: ChunkMode): Recording {
+    const min =
+      this.settings.remoteConfig && mode === "session" && session.seq === 0 ? (session.minDurationMs ?? 0) : 0;
+    return {
+      sessionId: session.id,
+      mode,
+      awaitSnapshot: true,
+      suppress: false,
+      held: min > 0 ? { minDurationMs: min, units: [], bytes: 0 } : null,
+    };
   }
 
   private async tick(): Promise<void> {
@@ -409,16 +577,54 @@ export class ReplayController {
     const distinctId = this.identityOf(sessionId);
     const budget = MAX_CHUNK_BYTES - headerBytes(sessionId, distinctId, "session");
     const units: Unit[] = [];
+    const held = rec.held;
     for (const batch of batches) {
       const parsed = batchUnits(batch, budget);
-      if (parsed) units.push(...parsed.units);
+      if (!parsed) continue;
+      units.push(...parsed.units);
     }
     const admitted = admitUnits(units, budget, rec.suppress);
     rec.suppress = admitted.suppress;
-    const { parts } = packUnits(admitted.kept, budget);
-    this.sender.enqueue(
-      parts.map((eventsJson) => this.sender.chunk({ sessionId, distinctId, mode: "session", eventsJson })),
-    );
+    // Groups enqueued in order. While held, units join the hold one at a time: the hold is released
+    // (and enqueued on its own) as soon as it is long enough or past the cap, so a large drain never
+    // piles on top of it and gets its first chunk evicted by the sender's bound.
+    const groups: Unit[][] = [];
+    if (held) {
+      let rest: Unit[] | null = null;
+      for (const unit of admitted.kept) {
+        if (rest) {
+          rest.push(unit);
+          continue;
+        }
+        held.units.push(unit);
+        held.bytes += unit.bytes;
+        // Only what is sent counts toward the duration: a dropped event never releases the hold.
+        for (const at of unitTimestamps(unit)) {
+          held.first ??= at;
+          held.last = Math.max(held.last ?? at, at);
+        }
+        const long = held.first !== undefined && held.last !== undefined && held.last - held.first >= held.minDurationMs;
+        if (long || held.bytes > MIN_DURATION_HOLD_MAX_BYTES) {
+          // Long enough (or too much to keep): everything goes, in order, and nothing is held again.
+          groups.push(held.units);
+          rec.held = null;
+          rest = [];
+        }
+      }
+      if (rest?.length) groups.push(rest);
+      if (groups.length === 0) {
+        if (admitted.droppedSnapshot && this.recording === rec) await this.native.checkout();
+        return;
+      }
+    } else {
+      groups.push(admitted.kept);
+    }
+    for (const group of groups) {
+      const { parts } = packUnits(group, budget);
+      this.sender.enqueue(
+        parts.map((eventsJson) => this.sender.chunk({ sessionId, distinctId, mode: "session", eventsJson })),
+      );
+    }
     // A snapshot too large to ever send: the next one makes the rest playable again.
     if (admitted.droppedSnapshot && this.recording === rec) await this.native.checkout();
   }
@@ -537,6 +743,7 @@ export class ReplayController {
   }
 
   private clearTimers(): void {
+    this.clearSettingsWait();
     if (this.drainTimer) clearInterval(this.drainTimer);
     if (this.checkoutTimer) clearInterval(this.checkoutTimer);
     if (this.errorSend) clearTimeout(this.errorSend.timer);
@@ -590,7 +797,7 @@ export function createReplay(
   host: ReplayHost,
   appState?: string,
 ): ReplayController | null {
-  const settings = replaySettings(options);
+  const settings = replaySettings(options, host.token);
   if (!settings) return null;
   const native = resolveNativeReplay(rn);
   if (!native) {

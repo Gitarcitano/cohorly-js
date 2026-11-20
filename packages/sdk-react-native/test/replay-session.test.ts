@@ -125,10 +125,11 @@ describe("replay options", () => {
       onErrorSampleRate: 0,
       mode: "screenshot",
       maskAllImages: true,
+      remoteConfig: false,
     });
     expect(
       replaySettings({ sampleRate: Number.NaN, onErrorSampleRate: 0.25, mode: "wireframe", maskAllImages: false }),
-    ).toEqual({ sampleRate: 0, onErrorSampleRate: 0.25, mode: "wireframe", maskAllImages: false });
+    ).toEqual({ sampleRate: 0, onErrorSampleRate: 0.25, mode: "wireframe", maskAllImages: false, remoteConfig: false });
     expect(replaySettings({ sampleRate: "0.5" as any, mode: "video" as any })).toBeNull();
     expect(replaySettings({ sampleRate: 0, onErrorSampleRate: 0 })).toBeNull();
     expect(replaySettings(undefined)).toBeNull();
@@ -439,5 +440,21 @@ describe("native crash config sessionId", () => {
     client.track("E");
     const [id] = await sessionOf("E");
     expect(linked.configs()[0].sessionId).toBe(id);
+  });
+
+  it("on Android, hands configureNativeCrashes the new session id when the session rotates", async () => {
+    const linked = link();
+    const { client, appState, sessionOf } = await makeClient({ platformInfo: { os: "Android" } });
+    client.track("E");
+    appState.emit("background");
+    vi.setSystemTime(Date.now() + 30 * MIN + 1);
+    appState.emit("active");
+    client.track("E");
+    await settle();
+    const [first, second] = await sessionOf("E");
+    expect(second).not.toBe(first);
+    const sessions = linked.configs().map((config) => config.sessionId);
+    expect(sessions[0]).toBe(first);
+    expect(sessions.at(-1)).toBe(second);
   });
 });

@@ -264,6 +264,8 @@ export class CohorlyClient {
   >();
   /** Whether flag reads emit `$feature_flag_called` exposure events. */
   private readonly sendExposureEvents: boolean;
+  /** `trackScreenViews` init option: `trackNavigation` sends `$screen`. */
+  private readonly trackScreenViews: boolean;
   /** Exposures already tracked this identity session, keyed
    * `${key}:${String(value)}`. In memory only, cleared on identify()/reset(). */
   private readonly exposedFlags = new Set<string>();
@@ -365,6 +367,7 @@ export class CohorlyClient {
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
     this.trackAutomaticEvents = options.trackAutomaticEvents ?? false;
     this.sendExposureEvents = options.sendExposureEvents ?? true;
+    this.trackScreenViews = options.trackScreenViews === true;
     this.flagPersistence =
       options.flagPersistence ?? "persistenceUntilNetworkSuccess";
     this.flagCacheTtlMs = normalizeFlagCacheTtlMs(options.flagCacheTtlMs);
@@ -1309,6 +1312,41 @@ export class CohorlyClient {
     this.engageQueue = [];
     this.persistQueue();
     this.persistEngageQueue();
+  }
+
+  /**
+   * Sends `$screen` with `$screen_name` for `trackNavigation()`. Returns
+   * whether it was taken: false with `trackScreenViews` off, while opted out
+   * or once stopped.
+   * @internal Not a public `screen(name)` API: only `trackNavigation()` calls it.
+   */
+  trackScreenView(name: string): boolean {
+    if (!this.trackScreenViews || this.optedOut || this.stopped) return false;
+    // Before the hydration the identity, super props and opt-out are the
+    // constructor's transient ones: the initial screen of a cold start would
+    // go out as a throwaway user. Build the event once the stored state is in.
+    if (!this.hydrated) {
+      // The time is the moment the screen was shown, not the hydration's, and
+      // an opt-out in between discards the screen like any queued event.
+      const time = Date.now();
+      const optOutEpoch = this.optOutEpoch;
+      void this.ready.then(
+        () => {
+          if (this.stopped || this.optOutEpoch !== optOutEpoch) return;
+          this.trackAt("$screen", { $screen_name: name }, time);
+        },
+        // The hydration failed: events keep flowing with the transient state,
+        // so does the screen.
+        () => {
+          if (!this.stopped && this.optOutEpoch === optOutEpoch) {
+            this.track("$screen", { $screen_name: name });
+          }
+        },
+      );
+      return true;
+    }
+    this.track("$screen", { $screen_name: name });
+    return true;
   }
 
   track(event: string, properties: Properties = {}): void {

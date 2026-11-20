@@ -7,7 +7,7 @@ import type { BreadcrumbInput } from "@cohorly/core";
  */
 export interface NavigationRefLike {
   addListener?: (event: "state", callback: () => void) => unknown;
-  getCurrentRoute?: () => { name?: unknown } | undefined | null;
+  getCurrentRoute?: () => { name?: unknown; key?: unknown } | undefined | null;
   isReady?: () => boolean;
   current?: NavigationRefLike | null;
 }
@@ -18,12 +18,15 @@ function resolve(ref: NavigationRefLike | null | undefined): NavigationRefLike |
   return ref.current ?? undefined;
 }
 
-function routeName(nav: NavigationRefLike): string | undefined {
+function currentRoute(nav: NavigationRefLike): { name: string; key?: string } | undefined {
   try {
     // getCurrentRoute() before the container is ready logs an error in React Navigation.
     if (typeof nav.isReady === "function" && !nav.isReady()) return undefined;
-    const name = nav.getCurrentRoute?.()?.name;
-    return typeof name === "string" && name ? name : undefined;
+    const route = nav.getCurrentRoute?.();
+    const name = route?.name;
+    if (typeof name !== "string" || !name) return undefined;
+    const key = route?.key;
+    return typeof key === "string" && key ? { name, key } : { name };
   } catch {
     return undefined;
   }
@@ -33,20 +36,43 @@ function routeName(nav: NavigationRefLike): string | undefined {
  * Records a `navigation` breadcrumb ("Home -> Cart") on every route change.
  * Route names only: params can hold ids, e-mails or tokens and are never
  * read. Returns the unsubscribe. Never throws; a missing ref is a no-op.
+ *
+ * `onScreen(name)` (optional) is called for each screen view: the initial
+ * route (now if the container is ready, else on the first `state` event that
+ * yields a route) and every later route whose `key` differs from the one that
+ * last produced a screen view (the name when the route has no key), so
+ * `setParams` never repeats it. It returns whether the screen was sent; the
+ * dedupe marker only advances then. A throwing `onScreen` is swallowed.
  */
 export function watchNavigation(
   navigationRef: NavigationRefLike | null | undefined,
   addBreadcrumb: (crumb: BreadcrumbInput) => void,
+  onScreen?: (name: string) => boolean,
 ): () => void {
   const nav = resolve(navigationRef);
   if (!nav || typeof nav.addListener !== "function" || typeof nav.getCurrentRoute !== "function") {
     return () => {};
   }
-  let last = routeName(nav);
+  let lastScreenId: string | undefined;
+  const emitScreen = () => {
+    if (!onScreen) return;
+    try {
+      const route = currentRoute(nav);
+      if (!route) return;
+      const id = route.key ? `key:${route.key}` : `name:${route.name}`;
+      if (id === lastScreenId) return;
+      if (onScreen(route.name) === true) lastScreenId = id;
+    } catch {
+      // a screen view must never break navigation
+    }
+  };
+  let last = currentRoute(nav)?.name;
+  emitScreen();
   let unsubscribe: unknown;
   try {
     unsubscribe = nav.addListener("state", () => {
-      const to = routeName(nav);
+      emitScreen();
+      const to = currentRoute(nav)?.name;
       if (!to || to === last) return;
       const from = last;
       last = to;

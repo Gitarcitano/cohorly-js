@@ -271,7 +271,9 @@ export function addBreadcrumb(crumb: BreadcrumbInput): void {
 /**
  * Records a `navigation` breadcrumb ("Home -> Cart", route names only, never
  * params) on every route change of a React Navigation or expo-router
- * container ref. Returns the unsubscribe.
+ * container ref. With `trackScreenViews: true` it also sends `$screen` with
+ * `$screen_name` (the route name) for the initial route and every route
+ * change. Returns the unsubscribe.
  *
  * ```ts
  * const navigationRef = useNavigationContainerRef();
@@ -279,5 +281,6 @@ export function addBreadcrumb(crumb: BreadcrumbInput): void {
  * ```
  */
 export function trackNavigation(navigationRef: NavigationRefLike | null | undefined): () => void {
-  return watchNavigation(navigationRef, addBreadcrumb);
+  // The shared client is read at every screen view, so this works when called before init().
+  return watchNavigation(navigationRef, addBreadcrumb, (name) => sharedInstance?.trackScreenView(name) ?? false);
 }

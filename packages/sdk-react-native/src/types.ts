@@ -208,6 +208,15 @@ export interface CohorlyOptions {
    * Off without this option or with both rates at 0.
    */
   sessionReplay?: SessionReplayOptions;
+  /**
+   * Send `$screen` with `$screen_name` (the React Navigation / expo-router
+   * route name, never params) for the initial route and every route change
+   * seen by `trackNavigation(navigationRef)`; it does nothing without that
+   * call. Off by default. Each `$screen` is an ordinary event and counts
+   * against the event quota like any `track()`. Session replay never turns
+   * it on. Default `false`.
+   */
+  trackScreenViews?: boolean;
 }
 
 /**

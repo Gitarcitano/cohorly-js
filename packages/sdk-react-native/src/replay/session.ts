@@ -23,6 +23,12 @@
  * background transition seen meanwhile is kept by the adopted session.
  * Writes reach storage one at a time, in order; `persisted()` waits for
  * them (a chunk's seq is persisted before the chunk is sent).
+ *
+ * With the project's settings (`remoteConfig`, VEL-2238) a new session may
+ * be born `pending`: it has its id at once and `settle()` decides it later,
+ * once. A decided session is never drawn again and keeps the minimum
+ * duration it was decided with. A record written before VEL-2238 (no
+ * `minDurationMs`) reads as decided with no minimum duration.
  */
 import type { AsyncStorageLike } from "../types.js";
 import { uuid } from "../uuid.js";
@@ -46,6 +52,8 @@ export interface ReplaySessionState {
   draw: ReplayDraw;
   /** The next chunk seq. */
   seq: number;
+  /** Session mode holds what it records until it is this long (VEL-2238); decided with the draw, absent = 0. */
+  minDurationMs?: number;
 }
 
 interface StoredRecord extends ReplaySessionState {
@@ -53,7 +61,7 @@ interface StoredRecord extends ReplaySessionState {
   quotaPausedUntil?: number;
 }
 
-const DRAWS: readonly string[] = ["session", "error", "none"];
+const DRAWS: readonly string[] = ["session", "error", "none", "pending"];
 
 function finite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -74,7 +82,8 @@ function parseRecord(raw: string | null): StoredRecord | null {
       typeof v.draw !== "string" ||
       !DRAWS.includes(v.draw) ||
       !Number.isInteger(v.seq) ||
-      (v.seq as number) < 0
+      (v.seq as number) < 0 ||
+      !(v.minDurationMs === undefined || (finite(v.minDurationMs) && v.minDurationMs >= 0))
     ) {
       return null;
     }
@@ -85,6 +94,7 @@ function parseRecord(raw: string | null): StoredRecord | null {
       backgroundAt: v.backgroundAt ?? null,
       draw: v.draw as ReplayDraw,
       seq: v.seq as number,
+      ...(finite(v.minDurationMs) && v.minDurationMs > 0 ? { minDurationMs: v.minDurationMs } : {}),
       ...(finite(v.quotaPausedUntil) ? { quotaPausedUntil: v.quotaPausedUntil } : {}),
     };
   } catch {
@@ -95,8 +105,10 @@ function parseRecord(raw: string | null): StoredRecord | null {
 export interface SessionStoreOptions {
   storage: AsyncStorageLike;
   key: string;
-  /** The sampling draw of a new session, made once per session id. */
+  /** The sampling draw of a new session, made once per session id (`pending` leaves it to `settle()`). */
   draw: () => ReplayDraw;
+  /** The minimum duration of a NEW session decided now (read right after `draw`, never for `pending`). Default 0. */
+  minDurationMs?: () => number;
   now: () => number;
   /** After a rotation (not at launch), with the new session and the one it replaced. */
   onRotate?: (session: ReplaySessionState, previous: ReplaySessionState) => void;
@@ -126,13 +138,16 @@ export class ReplaySessionStore {
    * provisional id and the adopted one when they differ, so events stamped
    * before the read can be stamped again.
    */
-  async load(): Promise<{ from: string; to: string } | null> {
-    let stored: StoredRecord | null = null;
-    try {
-      stored = parseRecord(await this.options.storage.getItem(this.options.key));
-    } catch {
-      stored = null;
-    }
+  async load(before?: Promise<unknown>): Promise<{ from: string; to: string } | null> {
+    const read = (async (): Promise<StoredRecord | null> => {
+      try {
+        return parseRecord(await this.options.storage.getItem(this.options.key));
+      } catch {
+        return null;
+      }
+    })();
+    // `before` (the remote settings copy) is read alongside: the draw below may need it.
+    const [stored] = await Promise.all([read, before?.catch(() => {})]);
     this.loaded = true;
     const now = this.options.now();
     if (stored?.quotaPausedUntil !== undefined) {
@@ -155,7 +170,7 @@ export class ReplaySessionStore {
       };
       adopted = { from: provisional.id, to: this.current.id };
     } else if (this.undrawn) {
-      this.current.draw = this.options.draw();
+      this.decide(this.current);
     }
     this.undrawn = false;
     this.write();
@@ -212,7 +227,8 @@ export class ReplaySessionStore {
   rotate(): ReplaySessionState {
     const previous = this.current;
     this.retired.set(previous.id, previous.seq);
-    this.current = this.mint(this.options.now(), this.options.draw());
+    this.current = this.mint(this.options.now(), "none");
+    this.decide(this.current);
     this.undrawn = false;
     if (!this.loaded) this.rotatedBeforeLoad = true;
     this.write();
@@ -237,6 +253,20 @@ export class ReplaySessionStore {
     return seq;
   }
 
+  /**
+   * Decides the live session when it is still `pending` and still `sessionId`
+   * (a pending decision settling), persisted. False when there was nothing to
+   * decide: a decided session never changes.
+   */
+  settle(sessionId: string, draw: Exclude<ReplayDraw, "pending">, minDurationMs = 0): boolean {
+    if (sessionId !== this.current.id || this.current.draw !== "pending") return false;
+    this.current.draw = draw;
+    if (minDurationMs > 0) this.current.minDurationMs = minDurationMs;
+    else delete this.current.minDurationMs;
+    this.write();
+    return true;
+  }
+
   quotaPausedUntil(): number {
     return this.quotaUntil;
   }
@@ -251,6 +281,14 @@ export class ReplaySessionStore {
     // Killed in the background: idle since it went there; in the foreground: since its last activity.
     const idleSince = session.backgroundAt ?? session.lastActivity;
     return now - idleSince > SESSION_IDLE_MS || now - session.startedAt > SESSION_MAX_MS;
+  }
+
+  /** The draw (and minimum duration) of a new session, made once. */
+  private decide(session: ReplaySessionState): void {
+    session.draw = this.options.draw();
+    const minDurationMs = session.draw === "pending" ? 0 : (this.options.minDurationMs?.() ?? 0);
+    if (minDurationMs > 0) session.minDurationMs = minDurationMs;
+    else delete session.minDurationMs;
   }
 
   private mint(now: number, draw: ReplayDraw): ReplaySessionState {
