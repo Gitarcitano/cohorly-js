@@ -1,5 +1,11 @@
 # @cohorly/react-native
 
+## 1.7.1
+
+### Patch Changes
+
+- 80bfe8b: Android: the library now builds with Android Gradle Plugin 9 and its built-in Kotlin. `android/build.gradle` applies `kotlin-android` only when AGP has not registered the `kotlin` extension, and sets the JVM target through `kotlin.compilerOptions` in that case, instead of failing configuration with "Cannot add extension with name 'kotlin'". Builds on AGP 8, or on AGP 9 with `android.builtInKotlin=false`, are unchanged.
+
 ## 1.7.0
 
 ### Minor Changes
