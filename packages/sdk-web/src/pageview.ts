@@ -1,3 +1,5 @@
+import { onNavigation } from "./navigation.js";
+
 /** Mixpanel-compatible automatic web pageview event name. */
 export const PAGEVIEW_EVENT = "$mp_web_page_view";
 
@@ -22,26 +24,12 @@ export function getPageviewProperties(): Record<string, unknown> {
 }
 
 /**
- * Wire up SPA pageview autotracking by monkey-patching history.pushState /
- * replaceState (so route changes from client-side routers fire) and
- * listening to popstate (back/forward navigation). No-op during SSR.
+ * SPA pageview autotracking: `onNavigate` runs after every
+ * `history.pushState` / `replaceState` (client-side routers) and `popstate`
+ * (back/forward), through the shared navigation observer (navigation.ts).
+ * Returns its unsubscribe. No-op during SSR.
  */
-export function setupPageviewAutotrack(onNavigate: () => void): void {
-  if (typeof window === "undefined" || typeof history === "undefined") return;
-
-  const wrap = (method: "pushState" | "replaceState") => {
-    const original = history[method];
-    history[method] = function patched(
-      this: History,
-      ...args: Parameters<History["pushState"]>
-    ) {
-      const result = original.apply(this, args);
-      onNavigate();
-      return result;
-    } as History["pushState"];
-  };
-
-  wrap("pushState");
-  wrap("replaceState");
-  window.addEventListener("popstate", onNavigate);
+export function setupPageviewAutotrack(onNavigate: () => void): () => void {
+  if (typeof window === "undefined" || typeof history === "undefined") return () => {};
+  return onNavigation(onNavigate);
 }

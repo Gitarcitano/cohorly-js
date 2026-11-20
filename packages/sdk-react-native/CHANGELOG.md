@@ -1,5 +1,17 @@
 # @cohorly/react-native
 
+## 1.6.0
+
+### Minor Changes
+
+- 33fff49: Session replay on Android (VEL-2142). The `sessionReplay` option of `init()` now records on Android too, with the same options, sampling, session rules, error buffer and upload as iOS (`lib: "react-native"`): the native module `CohorlyReactNativeReplay` ships a copy of the Cohorly Android recorder (wireframe and screenshot modes, Compose masking) and records on API 26+; on older devices `$session_id` is still stamped and nothing is recorded. `<CohorlyMask>` hides its content on Android as on iOS. The library now depends on `com.squareup.curtains:curtains` 1.2.5 and ships consumer ProGuard rules for Compose. Do not also add the native `cohorly-replay` artifact to the app: its classes clash with the copy.
+- b21b017: Session replay on iOS (VEL-2153). `init({ sessionReplay: { sampleRate, onErrorSampleRate, mode, maskAllImages } })`: rates from 0 to 1 (default 0, invalid values count as 0), `mode` `"screenshot"` (default) or `"wireframe"` (experimental), `maskAllImages` default true. With a rate above 0 and an app rebuilt with this version, every event, `$exception` included, carries `$session_id`, and the native crash config carries it too, so a native crash reported on the next launch links to the recording. Each session is drawn once (kept across relaunches): recorded whole and uploaded every 5 s, when the app goes to background and on an exception (`sampleRate`); kept in memory, 30 to 60 s, and sent only when the SDK records an exception (`onErrorSampleRate`; for a fatal JS error the send is best effort, the app may terminate first); or not recorded. A session ends after more than 30 min in background or without activity, after 24 h, and on `reset()`. Chunks are sent as JSON (`lib: "react-native"`) with the web SDK's retry rules, from an in-memory outbox of at most 5 MB. `optOutTracking()` stops the recorder and drops what it held; replay starts again on the next `init()`. Without the native module (Expo Go, an app not rebuilt) replay stays off, with one warning in development builds. New `<CohorlyMask>`: a `View` whose content is never recorded. The pod's minimum iOS version is now 15.1.
+
+### Patch Changes
+
+- Updated dependencies [b15ca9e]
+  - @cohorly/core@0.6.0
+
 ## 1.5.1
 
 ### Patch Changes

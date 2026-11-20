@@ -20,6 +20,8 @@ android {
     defaultConfig {
         minSdkVersion 21
         targetSdkVersion 34
+        // Session replay (VEL-2142): Compose rules for the recorder copy.
+        consumerProguardFiles "consumer-rules.pro"
     }
 
     compileOptions {
@@ -46,4 +48,9 @@ dependencies {
     // Brings AndroidDeviceInfo (app version/build/model/manufacturer/brand/
     // carrier reads) - transitively pulls cohorly-android-core.
     implementation 'com.github.cohorly-io.cohorly-android:cohorly-android:v0.3.0'
+    // Session replay (VEL-2142): the recorder copy under com/cohorly/android/replay
+    // follows windows and touches through curtains (same version as
+    // sdks/android/cohorly-replay), and reads Compose only when the app has it.
+    implementation 'com.squareup.curtains:curtains:1.2.5'
+    compileOnly 'androidx.compose.ui:ui:1.0.0'
 }

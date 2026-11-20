@@ -308,6 +308,84 @@ init({ token: "YOUR_PROJECT_TOKEN", storage: AsyncStorage, nativeCrashReporting:
 
 See the [React Native docs](https://cohorly-docs.velloalabs.com/sdks/react-native#error-tracking) for the details.
 
+## Session replay
+
+Records the screen of sampled sessions on iOS (VEL-2153) and Android (VEL-2142).
+Off by default; turn it on in `init`:
+
+```ts
+init({
+  token: "YOUR_PROJECT_TOKEN",
+  storage: AsyncStorage,
+  sessionReplay: { sampleRate: 0.1, onErrorSampleRate: 1 },
+});
+```
+
+| Option | Default | |
+| --- | --- | --- |
+| `sampleRate` | `0` | Share of sessions recorded whole, 0 to 1. Invalid values count as 0. |
+| `onErrorSampleRate` | `0` | Share of the other sessions that keep the last 30 to 60 s in memory and send them only when the SDK records an exception. |
+| `mode` | `"screenshot"` | `"screenshot"`: each screen is an image, masked before it is encoded. `"wireframe"` (experimental): views described as boxes and text. |
+| `maskAllImages` | `true` | Masks every image, in both modes. |
+
+Replay is on when one rate is above 0. Then every event, `$exception` included,
+carries `$session_id`, and the session is drawn once (kept across relaunches):
+recorded whole and uploaded every 5 s, on background and on an exception;
+buffered for errors; or not recorded. A session ends after more than 30 min in
+background or without activity, after 24 h, and on `reset()`. `optOutTracking()`
+stops the recorder and drops what it held.
+
+Text inputs are always masked. To hide anything else, wrap it in `<CohorlyMask>`,
+a `View` whose content is never recorded (the recorder draws a placeholder of
+the same size):
+
+```tsx
+import { CohorlyMask } from "@cohorly/react-native";
+
+<CohorlyMask>
+  <Text testID="card-number">{card.number}</Text>
+</CohorlyMask>
+```
+
+`CohorlyMask` takes every `View` prop except `testID`: the recorders find it
+by a reserved testID (`cohorly-no-capture`). Put the testID your e2e tests use
+on a child, as above.
+
+### Expo and native builds
+
+The recorder is native code in this package, linked by autolinking: an Expo
+dev client (`expo run:ios`, `expo run:android`, EAS) or a bare React Native
+app records after a rebuild. Expo Go and an app not rebuilt with this version
+lack the native module: replay stays off and a development build logs one
+warning. Do not also add the native `CohorlyReplay` (iOS) or `cohorly-replay`
+(Android) package to the app: this package already ships a copy of each
+recorder, and the two copies clash (duplicate classes).
+
+### Limitations
+
+- Android records on API 26+ only. Below that `$session_id` is still stamped
+  and nothing is recorded.
+- `SurfaceView` and `TextureView` content (video, camera, maps) shows black in
+  screenshot mode and as an empty rectangle in wireframe mode.
+- On iOS, React Native text is hard to tell apart in wireframe mode, which is
+  why screenshot is the default.
+- Chunks are sent as plain JSON (no gzip in Hermes).
+- Every captured frame crosses the React Native bridge as JSON before upload.
+- On Android, `<CohorlyMask>` relies on React Native storing `testID` as the
+  view's tag (`view.setTag(testID)`); tested with React Native 0.88.1 and
+  Expo SDK 58.
+- For a fatal JS error, sending the error buffer is best effort: the app may
+  terminate first.
+- An Android native crash links to its recording (`$session_id`) only with a
+  cohorly-android release that includes VEL-2150; the JitPack `v0.3.0` this
+  package depends on does not.
+- A drain hands over what the recorder has finished; a screenshot still being
+  copied from the screen at that moment arrives in the next drain. A fatal
+  native crash loses what is pending in memory.
+
+See [docs/SESSION-REPLAY.md](../../docs/SESSION-REPLAY.md) "React Native" for
+the contract between the JS side and the native recorders.
+
 ## Testing
 
 ```bash

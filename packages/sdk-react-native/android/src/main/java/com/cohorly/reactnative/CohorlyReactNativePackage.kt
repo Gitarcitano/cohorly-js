@@ -7,7 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class CohorlyReactNativePackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
-        listOf(CohorlyReactNativeModule(reactContext))
+        listOf(CohorlyReactNativeModule(reactContext), CohorlyReactNativeReplay(reactContext))
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
         emptyList()

@@ -1,0 +1,153 @@
+// Adapted from PostHog/posthog-android (MIT): posthog-android/src/main/java/com/posthog/android/replay/ComposeImageMask.kt
+// Changed: package; hasChildLayouts removed (no scrim check by layout here); bounds rounded outward.
+
+package com.cohorly.android.replay
+
+import android.graphics.Rect
+import androidx.compose.ui.graphics.painter.ColorPainter
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.vector.VectorPainter
+import androidx.compose.ui.layout.LayoutInfo
+import androidx.compose.ui.layout.boundsInWindow
+import java.lang.reflect.Field
+import java.lang.reflect.Method
+import java.lang.reflect.Modifier
+import kotlin.math.ceil
+import kotlin.math.floor
+
+// Image and Coil's AsyncImage add no semantics when contentDescription is null, so the semantics
+// tree cannot find them. Walk the layout tree and find the painters instead.
+// Only call on the main thread: the caches below are not synchronized.
+
+// These internal names depend on the Compose version.
+private val layoutNodeChildrenNames = listOf("getChildren\$ui", "getChildren\$ui_release", "getChildrenInfo")
+private val layoutNodeNodesNames = listOf("getNodes\$ui", "getNodes\$ui_release")
+private val nodeChainHeadNames = listOf("getHead\$ui", "getHead\$ui_release")
+private val modifierNodeChildNames = listOf("getChild\$ui", "getChild\$ui_release")
+
+internal class NodeChainAccess(val nodes: Method, val head: Method, val child: Method)
+
+private var layoutNodeChildren: Method? = null
+private var nodeChainResolved = false
+private var nodeChainAccess: NodeChainAccess? = null
+
+// Keyed by class: the Painter fields it and its superclasses declare.
+private val painterFields = HashMap<Class<*>, List<Field>>()
+
+/**
+ * Adds the window bounds of each painter-backed layout node below [root] to [rects].
+ * Skips the subtree of each node in [unmaskedLayouts].
+ * Throws if Compose internals are not available, so that the caller can fail closed.
+ */
+internal fun collectComposeImageRects(root: LayoutInfo, unmaskedLayouts: Set<LayoutInfo>, rects: MutableList<Rect>) {
+    val children = root.childrenMethod()
+    val chain = root.nodeChain()
+    val stack = ArrayDeque<LayoutInfo>()
+    stack.addLast(root)
+    while (stack.isNotEmpty()) {
+        val node = stack.removeLast()
+        if (node in unmaskedLayouts || !node.isPlaced) {
+            continue
+        }
+        node.collectPainterRects(chain, rects)
+        (children.invoke(node) as List<*>).forEach { child ->
+            (child as? LayoutInfo)?.let { stack.addLast(it) }
+        }
+    }
+}
+
+internal fun LayoutInfo.nodeChain(): NodeChainAccess? {
+    if (!nodeChainResolved) {
+        nodeChainAccess = javaClass.findNodeChainAccess()
+        nodeChainResolved = true
+    }
+    return nodeChainAccess
+}
+
+private fun LayoutInfo.childrenMethod(): Method =
+    layoutNodeChildren ?: javaClass.findMethod(layoutNodeChildrenNames).also { layoutNodeChildren = it }
+
+private fun Class<*>.findMethodOrNull(names: List<String>): Method? {
+    for (name in names) {
+        try {
+            return getMethod(name)
+        } catch (_: NoSuchMethodException) {
+        }
+    }
+    return null
+}
+
+private fun Class<*>.findMethod(names: List<String>): Method =
+    findMethodOrNull(names) ?: throw NoSuchMethodException("$name has none of $names")
+
+// Compose before 1.3 has no Modifier.Node, so painters are on the modifiers only. Once it exists,
+// a missing accessor means the internals moved, so throw to fail closed.
+private fun Class<*>.findNodeChainAccess(): NodeChainAccess? {
+    val nodes =
+        findMethodOrNull(layoutNodeNodesNames)
+            ?: if (hasModifierNode()) {
+                throw NoSuchMethodException(
+                    "$name has none of $layoutNodeNodesNames",
+                )
+            } else {
+                return null
+            }
+    val head = nodes.returnType.findMethod(nodeChainHeadNames)
+    val child = head.returnType.findMethod(modifierNodeChildNames)
+    return NodeChainAccess(nodes, head, child)
+}
+
+private fun hasModifierNode(): Boolean = try {
+    Class.forName("androidx.compose.ui.Modifier\$Node")
+    true
+} catch (_: ClassNotFoundException) {
+    false
+}
+
+// Same walk as NodeChain.getModifierInfo: the i-th ModifierInfo pairs with the i-th Modifier.Node
+// from the head, and the tail node has no ModifierInfo. Old-style modifiers keep the painter on
+// the modifier; Coil 3's AsyncImage and Glide keep it on the node only. Each match uses its own
+// modifier's coordinates: a painter followed by padding also paints the padding.
+private fun LayoutInfo.collectPainterRects(chain: NodeChainAccess?, rects: MutableList<Rect>) {
+    var node = chain?.let { it.head.invoke(it.nodes.invoke(this)) }
+    for (info in getModifierInfo()) {
+        if (chain != null && node == null) {
+            throw IllegalStateException("Compose modifier node chain is shorter than its modifiers")
+        }
+        if (info.modifier.holdsMaskablePainter() || node?.holdsMaskablePainter() == true) {
+            val coordinates = info.coordinates
+            if (coordinates.isAttached) {
+                coordinates.boundsInWindow().toMaskRect()?.let(rects::add)
+            }
+        }
+        node = node?.let { chain?.child?.invoke(it) }
+    }
+}
+
+/**
+ * These window bounds as a mask, rounded outward (floor left/top, ceil
+ * right/bottom) so it holds every pixel the node touches; null when empty.
+ */
+internal fun androidx.compose.ui.geometry.Rect.toMaskRect(): Rect? {
+    if (!(right > left && bottom > top)) return null
+    return Rect(floor(left).toInt(), floor(top).toInt(), ceil(right).toInt(), ceil(bottom).toInt())
+}
+
+private fun Any.holdsMaskablePainter(): Boolean =
+    javaClass.painterFields().any { field -> (field.get(this) as? Painter).shouldMaskPainter() }
+
+private fun Class<*>.painterFields(): List<Field> = painterFields.getOrPut(this) {
+    generateSequence(this) { it.superclass }
+        .flatMap { it.declaredFields.asSequence() }
+        .filter { !Modifier.isStatic(it.modifiers) && Painter::class.java.isAssignableFrom(it.type) }
+        .onEach { it.isAccessible = true }
+        .toList()
+}
+
+// Same rule as Drawable.shouldMaskDrawable: vectors and plain fills are not images.
+private fun Painter?.shouldMaskPainter(): Boolean = when {
+    this == null -> false
+    this is VectorPainter || this is ColorPainter -> false
+    javaClass.name == "androidx.compose.ui.graphics.painter.BrushPainter" -> false
+    else -> true
+}

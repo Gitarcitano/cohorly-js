@@ -1314,4 +1314,31 @@ describe("eventProperties hook", () => {
     const after = client.track("Still Sent");
     expect(after.properties.$session_id).toBeUndefined();
   });
+  it("gets the event's final properties, super props included, as a copy it cannot edit", () => {
+    let received: Readonly<Record<string, unknown>> | undefined;
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      storage: makeStorage(),
+      transport: async () => {},
+      flushIntervalMs: 0,
+      eventProperties: (_event, properties) => {
+        // What it got, before it tries to edit it.
+        received = { ...properties };
+        (properties as Record<string, unknown>).plan = "edited";
+        return { $session_id: "s-hook" };
+      },
+    });
+    client.register({ plan: "free", app: "web-app" });
+
+    const tracked = client.track("Upgraded", { plan: "pro" });
+    expect(received).toMatchObject({
+      plan: "pro",
+      app: "web-app",
+      distinct_id: tracked.properties.distinct_id,
+      $insert_id: tracked.properties.$insert_id,
+    });
+    expect(received).not.toHaveProperty("$session_id");
+    expect(tracked.properties.plan).toBe("pro");
+    expect(tracked.properties.$session_id).toBe("s-hook");
+  });
 });

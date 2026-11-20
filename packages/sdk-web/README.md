@@ -198,6 +198,26 @@ buffers: a page without `sessionReplay`, with both rates at 0, opted out at
 - **Sampling** is decided once per session and kept with it. `sampleRate`
   picks sessions recorded whole ("session" mode); among the others,
   `onErrorSampleRate` picks sessions that buffer ("error" mode).
+- **Remote settings.** `remoteConfig: true` (default false) lets the rates
+  and minimum duration saved in Settings > Session replay win over the
+  code's, field by field (a field never saved keeps the code's value; with no
+  network and no cached copy the code decides). Masking, blocking and iframe
+  origins always come from the code. The settings are kept in `localStorage`
+  for 1 hour per token and apply to new sessions only; a new session has its
+  `$session_id` at once and is sampled when they arrive, at most 3 s later.
+  With a minimum duration, session mode sends nothing until the recording is
+  that long, so a shorter one is never sent; error mode always sends.
+- **Triggers** (with `remoteConfig: true` only). The event, URL and flag
+  triggers saved in Settings > Session replay start recording a session that
+  is not recording (or only buffering for errors): an event with that exact
+  name whose properties pass the filters, a page path matching the pattern
+  (on load and on SPA navigation; query and fragment never count), or a flag
+  that loads on (with the variant asked for). Each draws its rate once per
+  session, hit or miss; a hit records the rest of the session from a full
+  snapshot (a buffered session sends its buffer first), and the minimum
+  duration counts from the snapshot the hit starts. Flag triggers read
+  the loaded flags without sending `$feature_flag_called`, and never fire
+  with `loadFeatureFlags: false`.
 - **Session mode** sends chunks to `POST /replay` every 5 seconds or 1000
   rrweb events (split before sending past 1 MB), gzipped with
   `CompressionStream` where the browser has it. When the tab is hidden,

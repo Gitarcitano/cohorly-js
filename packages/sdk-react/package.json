@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/react",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "React bindings for Cohorly, hosted product analytics (Mixpanel-style). <CohorlyProvider> and useCohorly() on top of @cohorly/web.",
   "type": "module",
   "main": "dist/index.js",

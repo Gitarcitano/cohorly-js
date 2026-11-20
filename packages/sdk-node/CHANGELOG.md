@@ -1,5 +1,12 @@
 # @cohorly/node
 
+## 0.5.2
+
+### Patch Changes
+
+- Updated dependencies [b15ca9e]
+  - @cohorly/core@0.6.0
+
 ## 0.5.1
 
 ### Patch Changes

@@ -20,6 +20,19 @@
  *   `console: false`.
  * - Requests become `$network` events; headers and bodies only with the
  *   `network` option, for URLs in its `allowUrls` (network-record.ts).
+ * - With a remote minimum duration (VEL-2185, decided with the session's
+ *   mode and kept in its record), session mode sends nothing until the
+ *   recording, from its first event (`recStart`, kept across the session's
+ *   pages) to its last, is that long; a shorter one dies with the page. Past
+ *   {@link MIN_DURATION_HOLD_MAX_BYTES} held it is sent anyway (the outbox
+ *   bound would otherwise drop its snapshot), and once sent a recording never
+ *   holds again. Error mode always sends.
+ * - A trigger hit (VEL-2187, session.ts) promotes an `off` or `error` session
+ *   to session mode: `promote()` queues the error buffer at once, as an error
+ *   would, then the recorder restarts in session mode from a new full
+ *   snapshot on the next task, so the minimum duration counts from there.
+ *   Every switch from error to session mode in the same session (the tick
+ *   included, at the end of a quota pause) sends the buffer first.
  */
 import { CONSOLE_LEVELS, observeConsole } from "../console.js";
 import { absoluteWithoutQuery, observeNetwork, sdkRequestMatcher } from "../network.js";
@@ -28,7 +41,7 @@ import { CONSOLE_TAG, consoleRecorder } from "./console-record.js";
 import { iframeBridge } from "./iframes.js";
 import { networkRecorder } from "./network-record.js";
 import type { ChunkMode, ReplayChunk } from "./sender.js";
-import { MAX_CHUNK_BYTES, ReplaySender } from "./sender.js";
+import { MAX_CHUNK_BYTES, MAX_OUTBOX_BYTES, ReplaySender } from "./sender.js";
 import type {
   Recording,
   RecordingContext,
@@ -53,6 +66,8 @@ export const ERROR_BUFFER_MAX_BYTES = 10 * 1024 * 1024;
 export const ERROR_SEND_GAP_MS = 5000;
 export const NETWORK_TAG = "$network";
 export { CONSOLE_TAG };
+/** A recording held by its minimum duration is sent anyway past this much (serialized). */
+export const MIN_DURATION_HOLD_MAX_BYTES = MAX_OUTBOX_BYTES / 2;
 
 /** Every input type rrweb knows, plus `hidden`: no input value is ever recorded. */
 export const MASK_INPUT_OPTIONS: Readonly<Record<string, true>> = {
@@ -245,7 +260,16 @@ export function startRecording(
   let recorder: { mode: ChunkMode; sessionId: string; stop: () => void } | null = null;
   let record: RecordFn | null = null;
   let generation = 0;
-  let pending: RrwebEvent[] = [];
+  /** Session mode's events not queued yet, serialized once, with their size and the last one's timestamp. */
+  let pending: string[] = [];
+  let pendingBytes = 0;
+  let lastPendingAt: number | undefined;
+  /** The session-mode recording's first event (the session's `recStart`). */
+  let recStart: number | undefined;
+  /** The minimum duration of the recording's session (0 outside session mode). */
+  let minDuration = 0;
+  /** Reached once (by time or by size): this recording never holds again. */
+  let minReached = true;
   let segments: Segment[] = [];
   let bufferBytes = 0;
   /** Something besides page state was buffered since the last checkout / the last error send. */
@@ -307,7 +331,7 @@ export function startRecording(
       ctx.localStorage.set(QUOTA_PAUSE_KEY, String(Date.now() + retryAfterMs));
       ctx.log("replay quota exceeded, session recording paused");
       if (recorder?.mode === "session") {
-        pending = [];
+        clearPending();
         restart();
       }
     },
@@ -377,16 +401,27 @@ export function startRecording(
     sender.enqueue(chunks, send);
   };
 
+  function clearPending(): void {
+    pending = [];
+    pendingBytes = 0;
+    lastPendingAt = undefined;
+  }
+
+  /** Shorter than the minimum duration: nothing leaves, no seq is taken, the snapshot stays first. */
+  const heldByMinDuration = (): boolean => {
+    if (minReached) return false;
+    const long =
+      recStart !== undefined && lastPendingAt !== undefined && lastPendingAt - recStart >= minDuration;
+    if (long || pendingBytes > MIN_DURATION_HOLD_MAX_BYTES) minReached = true;
+    return !minReached;
+  };
+
   const flushPending = (send = true) => {
     if (!recorder || recorder.mode !== "session" || pending.length === 0) return;
+    if (heldByMinDuration()) return;
     const events = pending;
-    pending = [];
-    enqueue(
-      recorder.sessionId,
-      "session",
-      events.map((e) => JSON.stringify(e)),
-      send,
-    );
+    clearPending();
+    enqueue(recorder.sessionId, "session", events, send);
   };
 
   const pushToBuffer = (event: RrwebEvent) => {
@@ -485,9 +520,18 @@ export function startRecording(
   function accept(event: RrwebEvent): void {
     if (!recorder) return;
     if (recorder.mode === "session") {
-      pending.push(event);
+      if (recStart === undefined) {
+        recStart = event.timestamp;
+        store.setRecStart(recorder.sessionId, recStart);
+      }
+      const json = JSON.stringify(event);
+      pending.push(json);
+      pendingBytes += json.length;
+      lastPendingAt = event.timestamp;
       // A Meta waits for its FullSnapshot (rrweb emits it right after): the pair goes in one chunk.
-      if (pending.length >= MAX_CHUNK_EVENTS && event.type !== META) flushPending();
+      const due =
+        pending.length >= MAX_CHUNK_EVENTS || (!minReached && pendingBytes > MIN_DURATION_HOLD_MAX_BYTES);
+      if (due && event.type !== META) flushPending();
     } else {
       pushToBuffer(event);
     }
@@ -557,7 +601,7 @@ export function startRecording(
       }
     }
     recorder = null;
-    pending = [];
+    clearPending();
     segments = [];
     bufferBytes = 0;
   };
@@ -569,6 +613,9 @@ export function startRecording(
         if (halted || mine !== generation) return;
         record = mod.record;
         recorder = { mode, sessionId: session.id, stop: () => {} };
+        recStart = mode === "session" ? session.recStart : undefined;
+        minDuration = mode === "session" ? (session.minDurationMs ?? 0) : 0;
+        minReached = minDuration <= 0;
         dirtySinceSend = true;
         dirtySinceCheckout = false;
         // Before record(): its message filter must run ahead of rrweb's listener.
@@ -625,8 +672,10 @@ export function startRecording(
       armWake();
       return;
     }
-    // The quota pause ran out (or began in another tab): switch modes.
+    // The quota pause ran out (or began in another tab), or a trigger promoted
+    // the session before its own switch ran: switch modes.
     if (recorder && session.id === recorder.sessionId && ctx.effectiveMode(session) !== recorder.mode) {
+      sendBufferBeforeSession(session);
       restart();
     }
   }, FLUSH_INTERVAL_MS);
@@ -670,7 +719,7 @@ export function startRecording(
   function halt(keep: boolean): void {
     if (halted) return;
     if (keep) flushPending(false);
-    else pending = [];
+    else clearPending();
     segments = [];
     stopRecorder();
     iframes?.release();
@@ -686,7 +735,7 @@ export function startRecording(
    * 60 s (else at the oldest snapshot inside the last 60 s), and runs to now,
    * so the event that led to the error is always in it.
    */
-  const sendErrorBuffer = () => {
+  const sendErrorBuffer = (keepBuffering = true) => {
     if (halted || !recorder || recorder.mode !== "error") return;
     if (!dirtySinceSend) return; // nothing new since the previous error's send
     const now = Date.now();
@@ -733,8 +782,23 @@ export function startRecording(
     batches += 1;
     enqueue(sessionId, "error", events, true, batches);
     // Keep buffering for the next error, again from a full snapshot.
-    takeSnapshot();
+    if (keepBuffering) takeSnapshot();
   };
+
+  /**
+   * The recorder is leaving error mode for session mode in the same session
+   * (a trigger hit, or the end of a quota pause): its buffer is sent first, as
+   * on an error (its own chunks, mode "error"), or restart() would drop it.
+   * The session-mode recording that follows starts from its own snapshot.
+   * The one path for that switch; a no-op once the buffer is sent.
+   */
+  function sendBufferBeforeSession(session: ReplaySession): void {
+    if (!recorder || recorder.mode !== "error" || recorder.sessionId !== session.id) return;
+    if (ctx.effectiveMode(session) !== "session") return;
+    if (errorSendTimer) clearTimeout(errorSendTimer);
+    errorSendTimer = null;
+    sendErrorBuffer(false);
+  }
 
   /** The SDK captured an exception stamped with the running recorder's session. */
   function handleException(readsDone = false): void {
@@ -790,6 +854,32 @@ export function startRecording(
       // recorder restarts on the next task, with a full snapshot.
       setTimeout(() => {
         if (!halted && targetSessionId !== store.active()?.id) restart();
+      }, 0);
+    },
+    onModeChange() {
+      setTimeout(() => {
+        const session = store.active();
+        if (!halted && session && ctx.effectiveMode(session) !== (recorder?.mode ?? "off")) restart();
+      }, 0);
+    },
+    promote() {
+      if (halted) return;
+      const session = store.active();
+      // During a quota pause the session still buffers: the tick switches (and sends) when it ends.
+      if (!session || ctx.effectiveMode(session) !== "session") return;
+      if (recorder?.mode === "session" && recorder.sessionId === session.id) return;
+      // Queued now, inside the track() that fired the trigger: a pagehide,
+      // reset() or init() right after it finds the buffer in the sender.
+      sendBufferBeforeSession(session);
+      // The restart waits for the next task (it may run inside rrweb's emit),
+      // for this session only, and only if nothing restarted the recorder
+      // since (the tick, a rotation). The new recorder takes recStart from its
+      // first event and holds by the session's minimum duration from there.
+      const sessionId = session.id;
+      const mine = generation;
+      setTimeout(() => {
+        if (halted || generation !== mine || store.active()?.id !== sessionId) return;
+        restart();
       }, 0);
     },
     beforeReset() {

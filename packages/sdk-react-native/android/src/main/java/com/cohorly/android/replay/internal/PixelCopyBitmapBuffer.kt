@@ -1,0 +1,135 @@
+// Adapted from PostHog/posthog-android (MIT): posthog-android/src/main/java/com/posthog/android/replay/internal/PixelCopyBitmapBuffer.kt
+// Changed: package.
+
+package com.cohorly.android.replay.internal
+
+import android.graphics.Bitmap
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Owns the reusable destination bitmap used by session replay PixelCopy requests.
+ *
+ * One bitmap is cached per recording run and reconfigured across dimensions and pixel
+ * formats. Its allocation grows when needed and retains that capacity until the run closes.
+ * Captures while that bitmap is in use receive
+ * uncached leases, so a timed-out request does not block later capture attempts.
+ * Closing a run recycles the idle bitmap and detaches in-flight leases so late callbacks
+ * cannot return their bitmaps to a later run.
+ */
+internal class PixelCopyBitmapBuffer {
+    private var isOpen = false
+    private var generation = 0L
+    private var nextLeaseId = 0L
+    private var activeLeaseId: Long? = null
+    private var idleBitmap: Bitmap? = null
+    private var rgb565Rejected = false
+
+    @Synchronized
+    fun open() {
+        if (!isOpen) {
+            generation++
+            isOpen = true
+        }
+    }
+
+    @Synchronized
+    fun acquire(width: Int, height: Int, requestedConfig: Bitmap.Config): Lease? {
+        if (!isOpen) {
+            return null
+        }
+
+        val bitmapConfig =
+            if (rgb565Rejected && requestedConfig == Bitmap.Config.RGB_565) Bitmap.Config.ARGB_8888 else requestedConfig
+        val canCache = activeLeaseId == null
+        val bitmap =
+            if (canCache) {
+                obtainBitmap(
+                    width,
+                    height,
+                    bitmapConfig,
+                )
+            } else {
+                Bitmap.createBitmap(width, height, bitmapConfig)
+            }
+        val leaseId = ++nextLeaseId
+        if (canCache) {
+            activeLeaseId = leaseId
+        }
+        return Lease(this, bitmap, generation, leaseId)
+    }
+
+    @Synchronized
+    fun fallbackToArgb8888(): Boolean {
+        if (rgb565Rejected) {
+            return false
+        }
+        rgb565Rejected = true
+        if (idleBitmap?.config == Bitmap.Config.RGB_565) {
+            idleBitmap?.recycle()
+            idleBitmap = null
+        }
+        return true
+    }
+
+    @Synchronized
+    fun close() {
+        if (!isOpen && idleBitmap == null && activeLeaseId == null) {
+            return
+        }
+        isOpen = false
+        activeLeaseId = null
+        idleBitmap?.recycle()
+        idleBitmap = null
+    }
+
+    @Synchronized
+    private fun release(lease: Lease) {
+        val ownsActiveLease = lease.generation == generation && lease.id == activeLeaseId
+        if (ownsActiveLease) {
+            activeLeaseId = null
+        }
+        if (isOpen && ownsActiveLease && !(rgb565Rejected && lease.bitmap.config == Bitmap.Config.RGB_565)) {
+            idleBitmap = lease.bitmap
+        } else {
+            lease.bitmap.recycle()
+        }
+    }
+
+    private fun obtainBitmap(width: Int, height: Int, bitmapConfig: Bitmap.Config): Bitmap {
+        require(width > 0 && height > 0) { "PixelCopy bitmap dimensions must be positive" }
+
+        val bitmap = idleBitmap
+        idleBitmap = null
+        if (bitmap == null || bitmap.isRecycled) {
+            bitmap?.recycle()
+            return Bitmap.createBitmap(width, height, bitmapConfig)
+        }
+        return try {
+            if (bitmap.width != width || bitmap.height != height || bitmap.config != bitmapConfig) {
+                // Reconfiguration keeps the backing allocation, including capacity grown for
+                // a larger window. Only insufficient capacity requires a replacement bitmap.
+                bitmap.reconfigure(width, height, bitmapConfig)
+            }
+            bitmap.setHasAlpha(bitmapConfig == Bitmap.Config.ARGB_8888)
+            bitmap
+        } catch (_: IllegalArgumentException) {
+            bitmap.recycle()
+            Bitmap.createBitmap(width, height, bitmapConfig)
+        }
+    }
+
+    internal class Lease internal constructor(
+        private val owner: PixelCopyBitmapBuffer,
+        val bitmap: Bitmap,
+        internal val generation: Long,
+        internal val id: Long,
+    ) {
+        private val released = AtomicBoolean(false)
+
+        fun release() {
+            if (released.compareAndSet(false, true)) {
+                owner.release(this)
+            }
+        }
+    }
+}

@@ -1,5 +1,11 @@
 # @cohorly/core
 
+## 0.6.0
+
+### Minor Changes
+
+- b15ca9e: The `eventProperties` hook receives the event's final properties as a second argument (VEL-2187): super props, the caller's properties and the SDK-owned fields, as a copy, before the hook's own keys are merged. Hooks that take only the event name are unchanged.
+
 ## 0.5.0
 
 ### Minor Changes

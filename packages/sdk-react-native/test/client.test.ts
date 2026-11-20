@@ -6,6 +6,7 @@ import {
   FakeStorage,
   requestsTo,
 } from "./helpers.js";
+import { HeldStorage } from "./replay-helpers.js";
 
 describe("track payload shape", () => {
   it("includes distinct_id, time, $insert_id, $lib and merges super props", async () => {
@@ -859,5 +860,58 @@ describe("timed events ($duration)", () => {
 
     const events = requests.flatMap((r) => r.body as any[]);
     expect(events.every((e) => !("$duration" in e.properties))).toBe(true);
+  });
+});
+
+describe("hydration", () => {
+  it("keeps events tracked before the stored queue was read, after the stored ones", async () => {
+    const storage = new FakeStorage();
+    storage.store.set(
+      "cohorly:queue",
+      JSON.stringify([{ event: "Stored", properties: { distinct_id: "u1", time: 1, $insert_id: "stored-1" } }]),
+    );
+    const { fetchImpl, requests } = createFakeFetch();
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      storage,
+      fetch: fetchImpl,
+      flushInterval: 600_000,
+      flushAt: 1000,
+      loadFeatureFlags: false,
+    });
+    client.track("Early"); // the stored queue is still being read
+    await client.ready;
+    expect(JSON.parse(storage.store.get("cohorly:queue") as string).map((e: { event: string }) => e.event)).toEqual([
+      "Stored",
+      "Early",
+    ]);
+    await client.flush();
+    client.stop();
+    const sent = requestsTo(requests, "/track").flatMap((r) => r.body as Array<{ event: string }>);
+    expect(sent.map((e) => e.event)).toEqual(["Stored", "Early"]);
+  });
+
+  it("restores a people op made before the stored engage queue was read exactly once, and keeps the stored ops", async () => {
+    const storage = new HeldStorage();
+    storage.store.set("cohorly:engage_queue", JSON.stringify([{ distinct_id: "u1", $set: { plan: "pro" } }]));
+    storage.hold("cohorly:engage_queue", "get");
+    const { fetchImpl, requests } = createFakeFetch();
+    const client = new CohorlyClient({
+      apiHost: "http://localhost:4000",
+      storage,
+      fetch: fetchImpl,
+      flushInterval: 600_000,
+      flushAt: 1000,
+      loadFeatureFlags: false,
+    });
+    client.people.increment({ logins: 1 }); // any write of it lands before the held read
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    storage.open();
+    await client.ready;
+    await client.flush();
+    client.stop();
+    const ops = requestsTo(requests, "/engage").flatMap((r) => r.body as Array<Record<string, unknown>>);
+    expect(ops.filter((op) => "$add" in op)).toHaveLength(1);
+    expect(ops.filter((op) => (op.$set as { plan?: string } | undefined)?.plan === "pro")).toHaveLength(1);
   });
 });

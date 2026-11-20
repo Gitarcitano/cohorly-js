@@ -137,8 +137,9 @@ export interface CohorlyWebOptions {
    * the last 30 to 60 seconds in memory and sends them when an exception is
    * captured (needs `captureExceptions` or `captureException()`). Inputs are always masked, `[data-cohorly-mask]` text is masked
    * and `[data-cohorly-block]` elements are never recorded. When set (with a
-   * rate above 0), every event carries `$session_id`. `allowedIframeOrigins`
+   * rate above 0, or `remoteConfig`), every event carries `$session_id`. `allowedIframeOrigins`
    * records cross-origin iframes that run the SDK and list this page back.
+   * `remoteConfig: true` lets the project's saved settings override the rates.
    */
   sessionReplay?: SessionReplayOptions;
 }
@@ -429,6 +430,8 @@ export const cohorly: Cohorly = {
 };
 
 let unloadTeardown: (() => void) | null = null;
+/** The SPA pageview subscription of the current init() (a later init() replaces it). */
+let pageviewTeardown: (() => void) | null = null;
 
 function setupUnloadFlush(client: CohorlyClient): () => void {
   if (typeof window === "undefined") return () => {};
@@ -487,8 +490,9 @@ export function init(options: CohorlyWebOptions): Cohorly {
     maxExceptionQueueSize: options.maxExceptionQueueSize,
     captureExceptions: options.captureExceptions,
     metrics: options.metrics,
-    // $session_id while session replay is on (the controller of THIS init).
-    eventProperties: (event) => replayController?.eventProperties(event) ?? {},
+    // $session_id while session replay is on (the controller of THIS init),
+    // which also matches replay event triggers on the final properties.
+    eventProperties: (event, properties) => replayController?.eventProperties(event, properties) ?? {},
   });
   debugEnabled = options.debug ?? false;
 
@@ -542,6 +546,9 @@ export function init(options: CohorlyWebOptions): Cohorly {
         random: Math.random,
         // replay.ts, the sender and rrweb load only when a session records.
         loadReplay: () => import("./replay/replay.js"),
+        fetch: (input, requestInit) => fetch(input, requestInit),
+        // Flag triggers read the loaded map, never getFeatureFlag() (no $feature_flag_called).
+        onFeatureFlags: options.loadFeatureFlags !== false ? (cb) => client.onFeatureFlags(cb) : undefined,
       });
     };
     startOwnReplay();
@@ -576,8 +583,10 @@ export function init(options: CohorlyWebOptions): Cohorly {
 
   if (options.trackPageviews) trackPageview();
 
+  pageviewTeardown?.();
+  pageviewTeardown = null;
   if (options.trackPageviews || autocapture) {
-    setupPageviewAutotrack(() => {
+    pageviewTeardown = setupPageviewAutotrack(() => {
       autocapture?.resetScroll();
       if (options.trackPageviews) trackPageview();
     });

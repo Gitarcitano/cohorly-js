@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/react-native",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Standalone React Native SDK for Cohorly, hosted product analytics (Mixpanel-style). No hard dependency on react-native; works out of the box with in-memory storage and upgrades to AsyncStorage when injected. Ships an autolinked native module for device-info auto-capture.",
   "type": "module",
   "main": "dist/index.js",
@@ -24,13 +24,15 @@
     "app.plugin.cjs",
     "react-native.config.js",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepublishOnly": "pnpm run build",
     "test": "vitest run",
-    "sync:crash": "node scripts/sync-crash-core.mjs"
+    "sync:crash": "node scripts/sync-crash-core.mjs",
+    "sync:replay": "node scripts/sync-replay-core.mjs"
   },
   "keywords": [
     "analytics",

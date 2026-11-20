@@ -141,8 +141,19 @@ export interface ExceptionHost {
    * yet (see CohorlyClient.identityAtCapture).
    */
   identityAtCapture(): () => Identity;
-  /** Device defaults and super properties, as track() merges them. */
-  eventProperties(): Properties;
+  /**
+   * Device defaults and super properties, as track() merges them, with
+   * `sessionId` as the session replay `$session_id` when it is given.
+   */
+  eventProperties(sessionId?: string): Properties;
+  /**
+   * Called at capture time, like identityAtCapture(): the result gives the
+   * replay `$session_id` of that moment once the engine replays the capture,
+   * so a reset() in between does not move it to the new session.
+   */
+  sessionAtCapture?(): () => string | undefined;
+  /** An exception was recorded: `beforeSendException` kept it, and this is its final form. */
+  onCaptured?(event: TrackedEvent): void;
 }
 
 export interface ExceptionEngineConfig {
@@ -164,12 +175,15 @@ type PendingOp =
       options: CaptureExceptionOptions;
       time: number;
       identity: () => Identity;
+      session: (() => string | undefined) | undefined;
     }
   | { kind: "breadcrumb"; crumb: BreadcrumbInput };
 
 interface CaptureContext {
   identity: Identity;
   time?: number;
+  /** The replay `$session_id` of the capture's moment. */
+  sessionId?: string;
 }
 
 export class ExceptionEngine {
@@ -321,7 +335,7 @@ export class ExceptionEngine {
       if (op.kind === "breadcrumb") this.core.addBreadcrumb(op.crumb);
       // Stamped with the identity of the moment it was captured, which may
       // only be known now that the stored identity was read.
-      else this.captureNow(op.list, op.options, { identity: op.identity(), time: op.time });
+      else this.captureNow(op.list, op.options, { identity: op.identity(), time: op.time, sessionId: op.session?.() });
     }
     // Opted out before the core existed: its constructor read the queue a
     // previous launch persisted, which must be discarded, not sent.
@@ -333,7 +347,7 @@ export class ExceptionEngine {
   capture(list: ExceptionListEntry[], options: CaptureExceptionOptions): void {
     if (this.retired || this.optedOut) return;
     if (this.core) {
-      this.captureNow(list, options, { identity: this.host.identity() });
+      this.captureNow(list, options, { identity: this.host.identity(), sessionId: this.host.sessionAtCapture?.()() });
       return;
     }
     this.pending.push({
@@ -342,6 +356,7 @@ export class ExceptionEngine {
       options,
       time: Date.now(),
       identity: this.host.identityAtCapture(),
+      session: this.host.sessionAtCapture?.(),
     });
     this.trimPending("capture", MAX_PENDING_CAPTURES);
   }
@@ -418,17 +433,26 @@ export class ExceptionEngine {
     const core = this.core;
     if (!core) return;
     this.context = context;
+    let recorded: TrackedEvent | null = null;
     try {
-      core.captureExceptionList(list, {
+      recorded = core.captureExceptionList(list, {
         ...options,
         properties: {
-          ...this.host.eventProperties(),
+          ...this.host.eventProperties(context.sessionId),
           ...this.config?.properties,
           ...options.properties,
         },
       });
     } finally {
       this.context = undefined;
+    }
+    // Only an exception that is really queued (not dropped by the hook) sends its replay.
+    if (recorded) {
+      try {
+        this.host.onCaptured?.(recorded);
+      } catch {
+        // The replay hook must never undo the capture.
+      }
     }
   }
 

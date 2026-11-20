@@ -2,6 +2,7 @@ import type {
   BreadcrumbInput,
   CaptureExceptionOptions,
   ExceptionListEntry,
+  TrackedEvent,
 } from "@cohorly/core";
 import {
   TransportError as CoreTransportError,
@@ -25,6 +26,7 @@ import {
 } from "./exceptions/hermes-stack.js";
 import { buildNativeCrashConfig, writeNativeCrashConfig } from "./exceptions/native-crashes.js";
 import { readExpoUpdates, resolveRelease } from "./exceptions/release.js";
+import { createReplay, type ReplayController } from "./replay/replay.js";
 import { InMemoryStorage } from "./storage.js";
 import type {
   AppStateLike,
@@ -332,6 +334,20 @@ export class CohorlyClient {
    * go out without the key rather than with a guess.
    */
   private releaseDefaults: { release?: string; dist?: string } | undefined;
+  /**
+   * Session replay (`sessionReplay`), null when it is off: no option, both
+   * rates 0, or no native recorder. Owns `$session_id`.
+   */
+  private readonly replay: ReplayController | null;
+  /**
+   * Resolves once the stored replay session was read and the events queued
+   * before it re-stamped with the session it resolved to; null without
+   * replay. A flush waits for it, so no event leaves with the provisional
+   * `$session_id`.
+   */
+  private readonly replayLoaded: Promise<void> | null;
+  /** The provisional replay session id and the stored one adopted in its place. */
+  private adoptedSession: { from: string; to: string } | null = null;
 
   constructor(options: CohorlyOptions) {
     // Before reading globalThis.fetch: a previous client's fetch wrapper
@@ -384,6 +400,36 @@ export class CohorlyClient {
     }
     this.appStateModule = resolveAppState(options.appState, mods.rn);
 
+    // Read only when `sessionReplay` asks for it: without it the native
+    // replay module is never touched and no event carries `$session_id`.
+    this.replay = createReplay(
+      options.sessionReplay,
+      mods.rn,
+      {
+        apiHost: this.apiHost,
+        token: this.token,
+        storage: this.storage,
+        fetch: () => this.fetchImpl,
+        maxRetryDelayMs: this.maxRetryDelayMs,
+        distinctId: () => this.distinctId,
+        onRotate: () => this.syncNativeCrashConfig(),
+      },
+      this.currentAppState(),
+    );
+    // The persisted replay session is part of `ready`: the crash config and
+    // exceptions replayed after it carry the session it resolves to. Events
+    // tracked before it was read carry the provisional id: they belong to
+    // the session it resolved to.
+    this.replayLoaded = this.replay
+      ? this.replay
+          .load()
+          .catch(() => null)
+          .then((adopted) => {
+            this.adoptedSession = adopted;
+            if (adopted) this.restampSession(adopted.from, adopted.to);
+          })
+      : null;
+
     // Highest-precedence auto-derived tier: this package's own autolinked
     // native module (when the host app has rebuilt with it linked). Resolves
     // async, so it's folded into `ready` - explicit options still win over it,
@@ -405,10 +451,13 @@ export class CohorlyClient {
     const loadFlags = options.loadFeatureFlags !== false;
     this.initialFlagsPending = loadFlags;
     const expoUpdates = readExpoUpdates(mods.expoUpdates);
-    this.ready = Promise.all([this.hydrate(), nativeReady]).then(() => {
+    this.ready = Promise.all([this.hydrate(), nativeReady, this.replayLoaded]).then(() => {
       // The release is fixed here, before `ready` resolves, so every event
       // tracked after `await ready` carries it.
       this.resolveReleaseDefaults(options, expoUpdates.dist);
+      // Recording starts once the persisted opt-out is known; `disabled`
+      // (no network) never records.
+      if (this.replay && !this.stopped && !this.optedOut && !this.disabled) this.replay.start();
       if (loadFlags) {
         void this.reloadFeatureFlags().finally(() => {
           this.initialFlagsPending = false;
@@ -442,7 +491,13 @@ export class CohorlyClient {
       isDisabled: () => this.disabled,
       identity: () => this.currentIdentity(),
       identityAtCapture: () => this.identityAtCapture(),
-      eventProperties: () => ({ ...this.getDeviceDefaultProperties(), ...this.superProps }),
+      eventProperties: (sessionId) => ({
+        ...(sessionId !== undefined ? { $session_id: sessionId } : {}),
+        ...this.getDeviceDefaultProperties(),
+        ...this.superProps,
+      }),
+      sessionAtCapture: () => this.sessionAtCapture(),
+      onCaptured: (event) => this.onExceptionRecorded(event),
     });
     // release/dist are construction options of the engine, so it is built
     // once the version from the native module is known.
@@ -530,9 +585,65 @@ export class CohorlyClient {
       const list = build();
       // A render loop or a timer throwing every frame must not fill the queue.
       if (!this.exceptionRateLimiter.allow(list)) return;
+      // The engine reports it back once it is recorded (onExceptionRecorded).
       this.exceptions.capture(list, options);
     } catch {
       // Capturing must never become a second error.
+    }
+  }
+
+  /**
+   * The replay session of an exception captured now, resolved when the
+   * engine records it: the id of this moment, or the stored session adopted
+   * in place of the provisional one, never a session started since.
+   */
+  private sessionAtCapture(): () => string | undefined {
+    const id = this.replay?.sessionId();
+    return () => {
+      const adopted = this.adoptedSession;
+      return id !== undefined && adopted?.from === id ? adopted.to : id;
+    };
+  }
+
+  /**
+   * An exception was recorded (it passed `beforeSendException`): the error
+   * buffer of the session its final properties carry goes out, a fatal one
+   * at once (the app is about to die), never awaited.
+   */
+  private onExceptionRecorded(event: TrackedEvent): void {
+    if (!this.replay) return;
+    const props = event.properties as Record<string, unknown>;
+    const sessionId = typeof props.$session_id === "string" ? props.$session_id : undefined;
+    const time = typeof props.time === "number" ? props.time : Date.now();
+    this.replay.onException(sessionId, props.$exception_level === "fatal", time);
+  }
+
+  /** `$session_id` from session replay, unless the event already has one (the caller's wins, as on the web). */
+  private stampSession(event: string, props: Properties): void {
+    if (!this.replay) return;
+    const sessionId = this.replay.eventProperties(event).$session_id;
+    if (props.$session_id === undefined && sessionId !== undefined) props.$session_id = sessionId;
+  }
+
+  /** Queued events stamped with the provisional replay session move to the one adopted from storage. */
+  private restampSession(from: string, to: string): void {
+    let changed = false;
+    for (const evt of this.queue) {
+      if (evt.properties.$session_id === from) {
+        evt.properties.$session_id = to;
+        changed = true;
+      }
+    }
+    if (changed && !this.stopped) this.persistQueue();
+  }
+
+  /** AppState's state at construction, when it has one. */
+  private currentAppState(): string | undefined {
+    try {
+      const state = this.appStateModule?.currentState;
+      return typeof state === "string" ? state : undefined;
+    } catch {
+      return undefined;
     }
   }
 
@@ -692,6 +803,7 @@ export class CohorlyClient {
       this.sessionStartedAt = Date.now();
     }
 
+    this.replay?.onAppState(state);
     this.appStateStatus = state;
   }
 
@@ -828,20 +940,33 @@ export class CohorlyClient {
       // the snapshot is stale even if an opt-in followed.
       const discarded = this.optOutEpoch !== epochAtRead;
       if (storedQueue && !discarded) {
+        let stored: TrackEvent[] = [];
         try {
-          this.queue = JSON.parse(storedQueue);
+          const parsed: unknown = JSON.parse(storedQueue);
+          if (Array.isArray(parsed)) stored = parsed as TrackEvent[];
         } catch {
-          this.queue = [];
+          stored = [];
         }
+        // Events tracked while the reads were in flight stay, after the
+        // stored ones (older); one that is already stored is not doubled.
+        const early = this.queue;
+        const storedIds = new Set(stored.map((evt) => evt?.properties?.$insert_id));
+        this.queue = [...stored, ...early.filter((evt) => !storedIds.has(evt.properties.$insert_id))];
         // Enforce the persisted cap on load in case a larger queue was stored.
-        if (this.enforceQueueCap()) this.persistQueue();
+        const trimmed = this.enforceQueueCap();
+        if (trimmed || early.length > 0) this.persistQueue();
       }
       if (storedEngageQueue && !discarded) {
+        let stored: EngagePayload[] = [];
         try {
-          this.engageQueue = JSON.parse(storedEngageQueue);
+          const parsed: unknown = JSON.parse(storedEngageQueue);
+          if (Array.isArray(parsed)) stored = parsed as EngagePayload[];
         } catch {
-          this.engageQueue = [];
+          stored = [];
         }
+        const early = this.engageQueue;
+        this.engageQueue = [...stored, ...early];
+        if (early.length > 0) this.persistEngageQueue();
       }
     }
 
@@ -963,6 +1088,7 @@ export class CohorlyClient {
         distinctId: this.distinctId,
         deviceId: this.deviceId,
         build: this.appBuild,
+        sessionId: this.replay?.sessionId(),
       }),
     );
   }
@@ -1037,6 +1163,7 @@ export class CohorlyClient {
     this.teardownCapture?.();
     this.teardownCapture = undefined;
     this.exceptions.retire();
+    this.replay?.stop();
   }
 
   private persistQueue(): void {
@@ -1111,10 +1238,16 @@ export class CohorlyClient {
     this.discardPendingData();
     this.metrics.discard();
     this.exceptions.setOptedOut(true);
+    // Recording stops and what it held is dropped; optInTracking() does not
+    // restart it (the next init() does), like the web SDK.
+    this.replay?.optOut();
     this.emitCaptureChange();
   }
 
-  /** Resume collecting after optOutTracking(). Discarded data is not restored. */
+  /**
+   * Resume collecting after optOutTracking(). Discarded data is not restored,
+   * and session replay stays off until the next init().
+   */
   optInTracking(): void {
     this.optedOut = false;
     this.optOutTouched = true;
@@ -1197,6 +1330,7 @@ export class CohorlyClient {
     if (!this.anonymous && props.$user_id === undefined) {
       props.$user_id = this.distinctId;
     }
+    this.stampSession(event, props);
     const payload: TrackEvent = { event, properties: props };
     this.queue.push(payload);
     this.enforceQueueCap();
@@ -1246,6 +1380,7 @@ export class CohorlyClient {
     if (!this.anonymous && props.$user_id === undefined) {
       props.$user_id = this.distinctId;
     }
+    this.stampSession(event, props);
     this.queue.push({ event, properties: props });
     this.enforceQueueCap();
     this.persistQueue();
@@ -1339,6 +1474,10 @@ export class CohorlyClient {
    * pending timed events, then assigns a fresh anonymous distinct id (and a
    * matching new device id). Mirrors mixpanel's `reset()`. */
   reset(): void {
+    // A new replay session (new id, draw and seq) first, while the outgoing
+    // identity is still current: what the old session captured is uploaded
+    // under that identity. Its rotation re-sends the crash config too.
+    this.replay?.reset();
     // The queue is cleared below, so the pending window is dropped with it
     // instead of being queued and erased, or attributed to the new identity.
     this.metrics.discard();
@@ -1646,7 +1785,9 @@ export class CohorlyClient {
     this.engageQueue.push(
       this.token !== undefined ? { ...payload, token: this.token } : payload,
     );
-    this.persistEngageQueue();
+    // Before hydration a write would race the stored read (the op restored
+    // twice) or clobber the stored queue; hydrate() persists the merge.
+    if (this.hydrated) this.persistEngageQueue();
     if (this.engageQueue.length >= this.flushAt) {
       this.maybeFlush();
     }
@@ -1708,6 +1849,12 @@ export class CohorlyClient {
 
   private async doFlush(force: boolean): Promise<void> {
     if (this.disabled || this.optedOut) return;
+    // With replay, no event leaves before the stored session was read and
+    // the queue re-stamped (it would carry the provisional `$session_id`).
+    if (this.replayLoaded) {
+      await this.replayLoaded;
+      if (this.disabled || this.optedOut) return;
+    }
 
     // Exceptions first, on their own retry state (not the events' backoff).
     // Like the core, events wait for the next flush when the exceptions could

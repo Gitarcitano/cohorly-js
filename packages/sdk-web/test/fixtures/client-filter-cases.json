@@ -1,0 +1,1126 @@
+{
+  "version": 1,
+  "description": "Semantics of the client-evaluated FilterSpec subset (docs/QUERY-IR.md \"Client-evaluated subset\"): each case is one filter, one event's properties and whether the filter matches that event. The expectations are what compile() returns in Postgres (apps/server/src/replays/client-filter-cases.test.ts runs every case there); an SDK that evaluates these filters must give the same answers. An absent key is a property missing from `properties`. Comparing an object or array property with eq, neq or contains is left out on purpose: Postgres compares the jsonb text form, which an SDK cannot reproduce byte for byte.",
+  "cases": [
+    {
+      "name": "eq string matches the same string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": "pro"
+      },
+      "expected": true
+    },
+    {
+      "name": "eq string is case sensitive",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": "Pro"
+      },
+      "expected": false
+    },
+    {
+      "name": "eq string does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "pro"
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "eq string does not match JSON null",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": null
+      },
+      "expected": false
+    },
+    {
+      "name": "eq empty string matches an empty string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": ""
+      },
+      "properties": {
+        "p": ""
+      },
+      "expected": true
+    },
+    {
+      "name": "eq empty string does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": ""
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "eq number matches the same number",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": 10
+      },
+      "properties": {
+        "p": 10
+      },
+      "expected": true
+    },
+    {
+      "name": "eq number matches its text in a string property",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": 10
+      },
+      "properties": {
+        "p": "10"
+      },
+      "expected": true
+    },
+    {
+      "name": "eq numeric string matches a number property",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "10"
+      },
+      "properties": {
+        "p": 10
+      },
+      "expected": true
+    },
+    {
+      "name": "eq 1 does not match 1.5",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": 1
+      },
+      "properties": {
+        "p": 1.5
+      },
+      "expected": false
+    },
+    {
+      "name": "eq 1 does not match the string 1.0 (text comparison)",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": 1
+      },
+      "properties": {
+        "p": "1.0"
+      },
+      "expected": false
+    },
+    {
+      "name": "eq 1.5 matches the number 1.5",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": 1.5
+      },
+      "properties": {
+        "p": 1.5
+      },
+      "expected": true
+    },
+    {
+      "name": "eq true matches boolean true",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": true
+      },
+      "properties": {
+        "p": true
+      },
+      "expected": true
+    },
+    {
+      "name": "eq true matches the string true",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": true
+      },
+      "properties": {
+        "p": "true"
+      },
+      "expected": true
+    },
+    {
+      "name": "eq the string true matches boolean true",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "true"
+      },
+      "properties": {
+        "p": true
+      },
+      "expected": true
+    },
+    {
+      "name": "eq false matches boolean false",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": false
+      },
+      "properties": {
+        "p": false
+      },
+      "expected": true
+    },
+    {
+      "name": "eq false does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": false
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "eq 0 does not match boolean false",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": 0
+      },
+      "properties": {
+        "p": false
+      },
+      "expected": false
+    },
+    {
+      "name": "eq true does not match the number 1",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": true
+      },
+      "properties": {
+        "p": 1
+      },
+      "expected": false
+    },
+    {
+      "name": "neq matches a different string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": "free"
+      },
+      "expected": true
+    },
+    {
+      "name": "neq does not match the same string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": "pro"
+      },
+      "expected": false
+    },
+    {
+      "name": "neq matches an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": "pro"
+      },
+      "properties": {},
+      "expected": true
+    },
+    {
+      "name": "neq matches JSON null",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": null
+      },
+      "expected": true
+    },
+    {
+      "name": "neq number does not match its text in a string property",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": 10
+      },
+      "properties": {
+        "p": "10"
+      },
+      "expected": false
+    },
+    {
+      "name": "neq true does not match boolean true",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": true
+      },
+      "properties": {
+        "p": true
+      },
+      "expected": false
+    },
+    {
+      "name": "neq is case sensitive",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "neq",
+        "value": "pro"
+      },
+      "properties": {
+        "p": "PRO"
+      },
+      "expected": true
+    },
+    {
+      "name": "contains is case sensitive",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "Pro"
+      },
+      "properties": {
+        "p": "pro"
+      },
+      "expected": false
+    },
+    {
+      "name": "contains matches a substring",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "ro"
+      },
+      "properties": {
+        "p": "pro"
+      },
+      "expected": true
+    },
+    {
+      "name": "contains matches the text of a number",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "1"
+      },
+      "properties": {
+        "p": 210
+      },
+      "expected": true
+    },
+    {
+      "name": "contains matches the text of a boolean",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "ru"
+      },
+      "properties": {
+        "p": true
+      },
+      "expected": true
+    },
+    {
+      "name": "contains does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "a"
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "contains does not match JSON null",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "a"
+      },
+      "properties": {
+        "p": null
+      },
+      "expected": false
+    },
+    {
+      "name": "contains percent is literal, not a wildcard",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "50%"
+      },
+      "properties": {
+        "p": "500"
+      },
+      "expected": false
+    },
+    {
+      "name": "contains percent matches a literal percent",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "50%"
+      },
+      "properties": {
+        "p": "save 50% now"
+      },
+      "expected": true
+    },
+    {
+      "name": "contains underscore is literal, not a wildcard",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "a_c"
+      },
+      "properties": {
+        "p": "abc"
+      },
+      "expected": false
+    },
+    {
+      "name": "contains underscore matches a literal underscore",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "a_c"
+      },
+      "properties": {
+        "p": "xa_cx"
+      },
+      "expected": true
+    },
+    {
+      "name": "contains backslash matches a literal backslash",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "a\\b"
+      },
+      "properties": {
+        "p": "a\\b"
+      },
+      "expected": true
+    },
+    {
+      "name": "contains backslash is not an escape",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": "a\\b"
+      },
+      "properties": {
+        "p": "ab"
+      },
+      "expected": false
+    },
+    {
+      "name": "contains empty string matches any present value",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": ""
+      },
+      "properties": {
+        "p": "x"
+      },
+      "expected": true
+    },
+    {
+      "name": "contains empty string matches an empty string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": ""
+      },
+      "properties": {
+        "p": ""
+      },
+      "expected": true
+    },
+    {
+      "name": "contains empty string does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "contains",
+        "value": ""
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "set does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "set does not match JSON null",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {
+        "p": null
+      },
+      "expected": false
+    },
+    {
+      "name": "set matches an empty string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {
+        "p": ""
+      },
+      "expected": true
+    },
+    {
+      "name": "set matches boolean false",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {
+        "p": false
+      },
+      "expected": true
+    },
+    {
+      "name": "set matches the number 0",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {
+        "p": 0
+      },
+      "expected": true
+    },
+    {
+      "name": "set matches an object",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {
+        "p": {
+          "a": 1
+        }
+      },
+      "expected": true
+    },
+    {
+      "name": "set matches an empty array",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "set"
+      },
+      "properties": {
+        "p": []
+      },
+      "expected": true
+    },
+    {
+      "name": "not_set matches an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "not_set"
+      },
+      "properties": {},
+      "expected": true
+    },
+    {
+      "name": "not_set matches JSON null",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "not_set"
+      },
+      "properties": {
+        "p": null
+      },
+      "expected": true
+    },
+    {
+      "name": "not_set does not match an empty string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "not_set"
+      },
+      "properties": {
+        "p": ""
+      },
+      "expected": false
+    },
+    {
+      "name": "not_set does not match boolean false",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "not_set"
+      },
+      "properties": {
+        "p": false
+      },
+      "expected": false
+    },
+    {
+      "name": "not_set does not match the number 0",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "not_set"
+      },
+      "properties": {
+        "p": 0
+      },
+      "expected": false
+    },
+    {
+      "name": "gt compares numbers",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 5
+      },
+      "properties": {
+        "p": 10
+      },
+      "expected": true
+    },
+    {
+      "name": "gt counts a numeric string as its number",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 5
+      },
+      "properties": {
+        "p": "10"
+      },
+      "expected": true
+    },
+    {
+      "name": "gt compares numerically, not as text",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 9
+      },
+      "properties": {
+        "p": "10"
+      },
+      "expected": true
+    },
+    {
+      "name": "gt is strict",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 5
+      },
+      "properties": {
+        "p": 5
+      },
+      "expected": false
+    },
+    {
+      "name": "gt compares decimals",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 5
+      },
+      "properties": {
+        "p": 5.5
+      },
+      "expected": true
+    },
+    {
+      "name": "gt compares a decimal numeric string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 0.5
+      },
+      "properties": {
+        "p": "0.75"
+      },
+      "expected": true
+    },
+    {
+      "name": "gt counts leading zeros numerically",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 4
+      },
+      "properties": {
+        "p": "05"
+      },
+      "expected": true
+    },
+    {
+      "name": "gt does not match a non-numeric string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 5
+      },
+      "properties": {
+        "p": "abc"
+      },
+      "expected": false
+    },
+    {
+      "name": "lt does not match a non-numeric string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 5
+      },
+      "properties": {
+        "p": "abc"
+      },
+      "expected": false
+    },
+    {
+      "name": "gt does not match exponent notation in a string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 5
+      },
+      "properties": {
+        "p": "1e3"
+      },
+      "expected": false
+    },
+    {
+      "name": "lt does not match exponent notation in a string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 5
+      },
+      "properties": {
+        "p": "1e3"
+      },
+      "expected": false
+    },
+    {
+      "name": "lt matches a negative numeric string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 0
+      },
+      "properties": {
+        "p": "-2"
+      },
+      "expected": true
+    },
+    {
+      "name": "lt matches a negative number",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 0
+      },
+      "properties": {
+        "p": -2
+      },
+      "expected": true
+    },
+    {
+      "name": "lt with a negative comparand",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": -3
+      },
+      "properties": {
+        "p": -2
+      },
+      "expected": false
+    },
+    {
+      "name": "gt with a negative comparand",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": -3
+      },
+      "properties": {
+        "p": "-2"
+      },
+      "expected": true
+    },
+    {
+      "name": "gt does not match a leading space",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 1
+      },
+      "properties": {
+        "p": " 5"
+      },
+      "expected": false
+    },
+    {
+      "name": "gt does not match a trailing space",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 1
+      },
+      "properties": {
+        "p": "5 "
+      },
+      "expected": false
+    },
+    {
+      "name": "gt does not match a trailing dot",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 1
+      },
+      "properties": {
+        "p": "5."
+      },
+      "expected": false
+    },
+    {
+      "name": "lt does not match a leading dot",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 1
+      },
+      "properties": {
+        "p": ".5"
+      },
+      "expected": false
+    },
+    {
+      "name": "gt does not match a plus sign",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 1
+      },
+      "properties": {
+        "p": "+5"
+      },
+      "expected": false
+    },
+    {
+      "name": "gt does not match boolean true",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 0
+      },
+      "properties": {
+        "p": true
+      },
+      "expected": false
+    },
+    {
+      "name": "lt does not match boolean false",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 1
+      },
+      "properties": {
+        "p": false
+      },
+      "expected": false
+    },
+    {
+      "name": "gt does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 0
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "lt does not match an absent key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 0
+      },
+      "properties": {},
+      "expected": false
+    },
+    {
+      "name": "gt does not match JSON null",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "gt",
+        "value": 0
+      },
+      "properties": {
+        "p": null
+      },
+      "expected": false
+    },
+    {
+      "name": "lt does not match an empty string",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "lt",
+        "value": 1
+      },
+      "properties": {
+        "p": ""
+      },
+      "expected": false
+    },
+    {
+      "name": "a key with a dot is a literal key",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "a.b",
+        "op": "eq",
+        "value": "x"
+      },
+      "properties": {
+        "a.b": "x"
+      },
+      "expected": true
+    },
+    {
+      "name": "a key with a dot is not a path",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "a.b",
+        "op": "eq",
+        "value": "x"
+      },
+      "properties": {
+        "a": {
+          "b": "x"
+        }
+      },
+      "expected": false
+    },
+    {
+      "name": "keys are case sensitive",
+      "filter": {
+        "kind": "property",
+        "scope": "event",
+        "key": "p",
+        "op": "eq",
+        "value": "x"
+      },
+      "properties": {
+        "P": "x"
+      },
+      "expected": false
+    }
+  ]
+}

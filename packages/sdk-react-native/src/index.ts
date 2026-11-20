@@ -36,6 +36,8 @@ export {
 } from "./CohorlyErrorBoundary.js";
 export { CohorlyClient, TransportError } from "./client.js";
 export type { NavigationRefLike } from "./exceptions/navigation.js";
+export { CohorlyMask, type CohorlyMaskProps } from "./replay/mask.js";
+export type { SessionReplayMode, SessionReplayOptions } from "./replay/options.js";
 export { InMemoryStorage } from "./storage.js";
 export type {
   AppStateLike,

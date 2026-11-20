@@ -1,4 +1,5 @@
 import type { CohorlyMetricsOptions, TrackedEvent } from "@cohorly/core";
+import type { SessionReplayOptions } from "./replay/options.js";
 
 export type Properties = Record<string, unknown>;
 
@@ -195,6 +196,18 @@ export interface CohorlyOptions {
    * after init with `setNativeCrashReporting()`.
    */
   metricKitDiagnostics?: boolean;
+  /**
+   * Session replay (iOS; Android follows). Needs the native module, so an
+   * app rebuilt with this version (not Expo Go). With a rate above 0 every
+   * event, `$exception` included, carries `$session_id`; each new session is
+   * drawn once: recorded whole (`sampleRate`), kept in memory for 30 to 60 s
+   * and sent when the SDK captures an exception (`onErrorSampleRate`, of the
+   * sessions not recorded whole), or not recorded. A session ends after more
+   * than 30 min in background or without activity, after 24 h, and on
+   * `reset()`. Wrap views that must never be recorded in `<CohorlyMask>`.
+   * Off without this option or with both rates at 0.
+   */
+  sessionReplay?: SessionReplayOptions;
 }
 
 /**

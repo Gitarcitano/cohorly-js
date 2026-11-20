@@ -12,11 +12,47 @@
  * activity (a tracked event or a recorded interaction) or 24 hours of total
  * length, but only when activity arrives: an idle tab keeps its expired
  * session until something happens. `reset()` rotates at once.
+ *
+ * With `remoteConfig` (VEL-2185) the project's saved settings
+ * (remote-config.ts) win field by field over the code's. A new session born
+ * before they are known is `pending`: it has its id at once, and `settle`
+ * decides it when they arrive (or after 3 s). A session minted when the
+ * settings in memory are an hour old, or older than the stored copy, reads
+ * them again first. The minimum duration is decided with the mode and kept
+ * in the session's record, so a session never changes it.
+ *
+ * The saved triggers (VEL-2187, triggers.ts) exist only with `remoteConfig`
+ * and come from the settings in `effective`: until they are adopted there is
+ * none, so an event tracked before that never fires one. In a session that is
+ * `off` or `error`, a matching event (a `track()`, never `$exception` or
+ * `$metric`, on its final properties, `$session_id` included), path (on load
+ * and on each SPA navigation; a match in an expired session opens the next
+ * one, as a tracked event does) or flag (each time the flags load) draws the
+ * trigger's rate once and marks it used for the session, hit or miss, in the
+ * session's record: a reload never fires it again. A hit promotes the session
+ * to `session` mode for good (a trigger never stops a recording); a session
+ * already recording ignores triggers.
  */
-import type { CohorlyStorage } from "@cohorly/core";
+import type { CohorlyStorage, FlagResult } from "@cohorly/core";
 import { uuid } from "@cohorly/core";
+import { onNavigation } from "../navigation.js";
+import type { RemoteReplayConfig, ReplayConfigLoad } from "./remote-config.js";
+import { loadReplayConfig, REPLAY_CONFIG_TTL_MS, readReplayConfig } from "./remote-config.js";
+import type { ReplayTrigger } from "./triggers.js";
+import { eventMatches, flagMatches, matchesUrlPattern, NON_TRIGGER_EVENTS } from "./triggers.js";
 
 export interface SessionReplayOptions {
+  /**
+   * Reads the project's replay settings (Settings > Session replay) from the
+   * server (VEL-2185). Default false: the code decides and the settings are
+   * ignored. With true, each field the project saved (`sampleRate`,
+   * `onErrorSampleRate`, the minimum duration) wins over the code's, a field it
+   * never saved keeps the code's value, and with no network and no cached copy
+   * the code's values apply. Kept for 1 hour per token; applies to new
+   * sessions only. Masking, blocking and iframe origins always come from the
+   * code. Replay starts even with both rates at 0 here.
+   */
+  remoteConfig?: boolean;
   /** Share of sessions recorded whole, 0..1. Default 0. */
   sampleRate?: number;
   /**
@@ -123,14 +159,22 @@ const INTERNAL_EVENTS = new Set(["$metric", "$feature_flag_called", "$exception"
 
 /** What a session records: everything, the buffer sent on errors, or nothing. */
 export type ReplayMode = "session" | "error" | "off";
+/** A session's mode as stored: `pending` until the remote settings decide it (VEL-2185). */
+export type SessionMode = ReplayMode | "pending";
 
 export interface ReplaySession {
   id: string;
   startedAt: number;
   lastActivity: number;
-  mode: ReplayMode;
+  mode: SessionMode;
   /** The next chunk seq to use. */
   seq: number;
+  /** Timestamp of the first rrweb event recorded in session mode (the minimum duration counts from it). */
+  recStart?: number;
+  /** Session mode holds its events until the recording is this long; decided with the mode, absent = 0. */
+  minDurationMs?: number;
+  /** Ids of the triggers already drawn in this session, hit or miss (VEL-2187); a record without it reads as []. */
+  triggered: string[];
 }
 
 function isSession(value: unknown): value is ReplaySession {
@@ -142,10 +186,15 @@ function isSession(value: unknown): value is ReplaySession {
     /^[A-Za-z0-9_-]{1,64}$/.test(v.id) &&
     typeof v.startedAt === "number" &&
     typeof v.lastActivity === "number" &&
-    (v.mode === "session" || v.mode === "error" || v.mode === "off") &&
+    (v.mode === "session" || v.mode === "error" || v.mode === "off" || v.mode === "pending") &&
     typeof v.seq === "number" &&
     Number.isInteger(v.seq) &&
-    v.seq >= 0
+    v.seq >= 0 &&
+    (v.recStart === undefined || (typeof v.recStart === "number" && Number.isFinite(v.recStart))) &&
+    (v.minDurationMs === undefined ||
+      (typeof v.minDurationMs === "number" && Number.isFinite(v.minDurationMs) && v.minDurationMs >= 0)) &&
+    (v.triggered === undefined ||
+      (Array.isArray(v.triggered) && v.triggered.every((id) => typeof id === "string")))
   );
 }
 
@@ -170,8 +219,10 @@ function currentNavigationType(): string {
 export interface SessionStoreOptions {
   /** Per-tab storage (sessionStorage). */
   storage: CohorlyStorage;
-  /** Decides the mode of a NEW session, once. */
-  decideMode: () => ReplayMode;
+  /** Decides the mode of a NEW session, once (`pending` leaves it to `setMode`). */
+  decideMode: () => SessionMode;
+  /** The minimum duration a NEW session decided now records with (read right after `decideMode`). Default 0. */
+  minDurationMs?: () => number;
   /** Called after a rotation (activity after expiry, or reset()), with the new session. */
   onRotate?: (session: ReplaySession) => void;
   now?: () => number;
@@ -187,7 +238,8 @@ export class ReplaySessionStore {
   /** Next seq of sessions rotated out on this page whose chunks may still be queued. */
   private readonly retired = new Map<string, number>();
   private readonly storage: CohorlyStorage;
-  private readonly decideMode: () => ReplayMode;
+  private readonly decideMode: () => SessionMode;
+  private readonly minDurationMs?: () => number;
   private readonly onRotate?: (session: ReplaySession) => void;
   private readonly now: () => number;
   private readonly pageToken: string;
@@ -204,6 +256,7 @@ export class ReplaySessionStore {
   constructor(options: SessionStoreOptions) {
     this.storage = options.storage;
     this.decideMode = options.decideMode;
+    this.minDurationMs = options.minDurationMs;
     this.onRotate = options.onRotate;
     this.now = options.now ?? Date.now;
     this.pageToken = options.pageToken ?? PAGE_TOKEN;
@@ -278,6 +331,41 @@ export class ReplaySessionStore {
     return seq;
   }
 
+  /** Sets the live session's mode and minimum duration (a pending decision settling), persisted. */
+  setMode(sessionId: string, mode: ReplayMode, minDurationMs = 0): void {
+    if (sessionId !== this.current.id) return;
+    this.current.mode = mode;
+    if (minDurationMs > 0) this.current.minDurationMs = minDurationMs;
+    else delete this.current.minDurationMs;
+    this.write(this.current);
+  }
+
+  /** Marks a trigger drawn in the live session (hit or miss), persisted: it never fires again in it. */
+  markTriggered(sessionId: string, triggerId: string): void {
+    if (sessionId !== this.current.id || this.current.triggered.includes(triggerId)) return;
+    this.current.triggered = [...this.current.triggered, triggerId];
+    this.write(this.current);
+  }
+
+  /**
+   * A trigger hit: the live session records whole from now on, persisted. Its
+   * minimum duration stays the one decided with it, and counts from the new
+   * recording's first event (no `recStart` yet).
+   */
+  promote(sessionId: string): void {
+    if (sessionId !== this.current.id || this.current.mode === "session") return;
+    this.current.mode = "session";
+    delete this.current.recStart;
+    this.write(this.current);
+  }
+
+  /** The live session's first session-mode rrweb event, once (later pages of the session keep it). */
+  setRecStart(sessionId: string, at: number): void {
+    if (sessionId !== this.current.id || this.current.recStart !== undefined) return;
+    this.current.recStart = at;
+    this.write(this.current);
+  }
+
   /** Removes the page listeners (a later init() builds a new store). */
   dispose(): void {
     if (typeof window !== "undefined") {
@@ -293,7 +381,11 @@ export class ReplaySessionStore {
   }
 
   private mint(now: number): ReplaySession {
-    return { id: uuid(), startedAt: now, lastActivity: now, mode: this.decideMode(), seq: 0 };
+    const mode = this.decideMode();
+    const session: ReplaySession = { id: uuid(), startedAt: now, lastActivity: now, mode, seq: 0, triggered: [] };
+    const minDurationMs = mode === "pending" ? 0 : (this.minDurationMs?.() ?? 0);
+    if (minDurationMs > 0) session.minDurationMs = minDurationMs;
+    return session;
   }
 
   private read(): ReplaySession | null {
@@ -301,7 +393,9 @@ export class ReplaySessionStore {
       const raw = this.storage.get(SESSION_KEY);
       if (!raw) return null;
       const parsed: unknown = JSON.parse(raw);
-      return isSession(parsed) ? parsed : null;
+      if (!isSession(parsed)) return null;
+      parsed.triggered ??= [];
+      return parsed;
     } catch {
       return null;
     }
@@ -342,15 +436,48 @@ export function canvasSettings(value: unknown): { fps: number; quality: number }
   };
 }
 
-/** Whether replay can do anything with these options (some rate above 0). */
+/** Whether replay can do anything with these options (some rate above 0, or the remote settings may set one). */
 export function replayWanted(options: SessionReplayOptions | undefined): boolean {
-  return !!options && (rate(options.sampleRate) > 0 || rate(options.onErrorSampleRate) > 0);
+  return (
+    !!options &&
+    (options.remoteConfig === true || rate(options.sampleRate) > 0 || rate(options.onErrorSampleRate) > 0)
+  );
+}
+
+/** The settings a session is decided and recorded with. */
+export interface EffectiveReplayConfig {
+  sampleRate: number;
+  onErrorSampleRate: number;
+  /** Session mode sends nothing until the recording is this long; remote only (0 from the code). Stored per session. */
+  minDurationMs: number;
+  /** Remote only (none from the code). */
+  triggers: ReplayTrigger[];
+}
+
+/** The code's values with each field the project saved on top, those three fields only. */
+export function effectiveConfig(
+  options: SessionReplayOptions,
+  remote: RemoteReplayConfig | null,
+): EffectiveReplayConfig {
+  return {
+    sampleRate: remote?.sampleRate ?? rate(options.sampleRate),
+    onErrorSampleRate: remote?.onErrorSampleRate ?? rate(options.onErrorSampleRate),
+    minDurationMs: remote?.minDurationMs ?? 0,
+    triggers: remote?.triggers ?? [],
+  };
+}
+
+/** The sampling draw of a new session. */
+export function decideMode(effective: EffectiveReplayConfig, random: () => number): ReplayMode {
+  if (effective.sampleRate > 0 && random() < effective.sampleRate) return "session";
+  if (effective.onErrorSampleRate > 0 && random() < effective.onErrorSampleRate) return "error";
+  return "off";
 }
 
 export interface ReplayDeps {
   apiHost: string;
   token: string | undefined;
-  /** localStorage: only the quota pause (shared by every tab of the origin). */
+  /** localStorage: the quota pause (shared by every tab of the origin) and the remote settings copy. */
   localStorage: CohorlyStorage;
   /** sessionStorage: the tab's session record. */
   sessionStorage: CohorlyStorage;
@@ -361,10 +488,18 @@ export interface ReplayDeps {
   random: () => number;
   /** Loads replay.ts (and with it the sender and rrweb). */
   loadReplay: () => Promise<ReplayModule>;
+  /** The request for the remote settings (only with `remoteConfig`). */
+  fetch: typeof fetch;
+  /**
+   * The client's flag listener (`client.onFeatureFlags`), for flag triggers;
+   * absent with `loadFeatureFlags: false`, which never fires one.
+   */
+  onFeatureFlags?: (cb: (flags: Record<string, FlagResult>) => void) => () => void;
 }
 
 /** What replay.ts gets from this module. */
-export interface RecordingContext extends Omit<ReplayDeps, "loadReplay" | "random"> {
+export interface RecordingContext
+  extends Omit<ReplayDeps, "loadReplay" | "random" | "fetch" | "onFeatureFlags"> {
   store: ReplaySessionStore;
   /** The mode a session records in now (session mode buffers like error mode during a quota pause). */
   effectiveMode: (session: ReplaySession) => ReplayMode;
@@ -375,6 +510,16 @@ export interface Recording {
   onException(): void;
   /** The store rotated (reset(), or activity after expiry): restart for the new session. */
   onRotate(): void;
+  /** The live session's mode was set after it began (a pending decision settled): restart if it differs. */
+  onModeChange(): void;
+  /**
+   * A trigger promoted the live session to `session` mode (VEL-2187): an
+   * error-mode buffer is queued at once, as on an error, and the recorder
+   * restarts in session mode from a full snapshot on the next task (for that
+   * session only). Nothing while the quota pause keeps it in error mode: the
+   * switch, buffer first, comes when the pause ends.
+   */
+  promote(): void;
   /** reset() is about to rotate: queue what belongs to the outgoing session. */
   beforeReset(): void;
   optOut(): void;
@@ -386,8 +531,11 @@ export interface ReplayModule {
 }
 
 export interface ReplayController {
-  /** `$session_id` for an event being built now (activity unless SDK-internal). */
-  eventProperties(event: string): Record<string, unknown>;
+  /**
+   * `$session_id` for an event being built now (activity unless SDK-internal).
+   * `properties` are its final properties: event triggers are matched on them.
+   */
+  eventProperties(event: string, properties?: Record<string, unknown>): Record<string, unknown>;
   /** The SDK queued an `$exception`. */
   onException(): void;
   /** reset(): rotate the session. */
@@ -403,11 +551,54 @@ export function startSessionReplay(
   deps: ReplayDeps,
 ): ReplayController | null {
   if (typeof window === "undefined" || typeof document === "undefined") return null;
-  const sampleRate = rate(options.sampleRate);
-  const onErrorSampleRate = rate(options.onErrorSampleRate);
-  if (sampleRate === 0 && onErrorSampleRate === 0) return null;
+  const remoteOn = options.remoteConfig === true && !!deps.token;
+  const code = effectiveConfig(options, null);
+  if (!remoteOn && code.sampleRate === 0 && code.onErrorSampleRate === 0) return null;
 
   let stopped = false;
+  /** The settings new sessions are decided with; null while the remote ones are awaited. */
+  let effective: EffectiveReplayConfig | null = remoteOn ? null : code;
+  /** When `effective` was fetched (a stored copy) or resolved (an answer, or the fallback after one). */
+  let resolvedAt = Number.NEGATIVE_INFINITY;
+  /** Bumped by each load: an older load resolving late changes nothing. */
+  let loads = 0;
+
+  const loadRemote = () =>
+    loadReplayConfig({
+      apiHost: deps.apiHost,
+      token: deps.token as string,
+      storage: deps.localStorage,
+      fetch: deps.fetch,
+      now: Date.now,
+    });
+  /** Takes a load's settings: at once from a fresh copy, else new sessions wait (`pending`) for `ready`. */
+  const adopt = (load: ReplayConfigLoad) => {
+    const mine = ++loads;
+    if (load.fresh) {
+      effective = effectiveConfig(options, load.cached);
+      resolvedAt = load.fetchedAt ?? Date.now();
+      return;
+    }
+    effective = null;
+    void load.ready.then((resolved) => {
+      if (stopped || mine !== loads) return;
+      effective = effectiveConfig(options, resolved);
+      resolvedAt = Date.now();
+      settle();
+      onSettings();
+    });
+  };
+  /** Before a new session is decided: reads the settings again when they are an hour old or a newer copy was stored. */
+  const refreshIfStale = () => {
+    if (!remoteOn || !effective) return;
+    const now = Date.now();
+    const copy = readReplayConfig(deps.localStorage, deps.token as string, now);
+    if (now - resolvedAt >= REPLAY_CONFIG_TTL_MS || (copy !== null && copy.fetchedAt > resolvedAt)) {
+      adopt(loadRemote());
+    }
+  };
+  if (remoteOn) adopt(loadRemote());
+
   let recording: Recording | null = null;
   let loading = false;
   /** An exception captured while replay.ts was loading: handed over once it runs. */
@@ -417,15 +608,10 @@ export function startSessionReplay(
     const raw = Number(deps.localStorage.get(QUOTA_PAUSE_KEY));
     return Number.isFinite(raw) ? raw : 0;
   };
-  const effectiveMode = (session: ReplaySession): ReplayMode =>
-    session.mode === "session" && Date.now() < quotaPausedUntil() ? "error" : session.mode;
-
-  const decideMode = (): ReplayMode => {
-    if (sampleRate > 0 && deps.random() < sampleRate) return "session";
-    if (onErrorSampleRate > 0 && deps.random() < onErrorSampleRate) return "error";
-    return "off";
+  const effectiveMode = (session: ReplaySession): ReplayMode => {
+    if (session.mode === "pending") return "off";
+    return session.mode === "session" && Date.now() < quotaPausedUntil() ? "error" : session.mode;
   };
-
   /** Loads replay.ts the first time a session needs it. */
   const ensureRecording = () => {
     if (stopped || recording || loading) return;
@@ -439,7 +625,7 @@ export function startSessionReplay(
         const missed = exceptionWhileLoading;
         exceptionWhileLoading = false;
         if (stopped || recording) return;
-        const { loadReplay: _load, random: _random, ...rest } = deps;
+        const { loadReplay: _load, random: _random, fetch: _fetch, onFeatureFlags: _flags, ...rest } = deps;
         recording = mod.startRecording(options, { ...rest, store, effectiveMode });
         // Its recorder is starting: it sends for this error once it is up.
         if (missed) recording.onException();
@@ -453,12 +639,80 @@ export function startSessionReplay(
 
   const store = new ReplaySessionStore({
     storage: deps.sessionStorage,
-    decideMode,
+    decideMode: () => {
+      refreshIfStale();
+      return effective ? decideMode(effective, deps.random) : "pending";
+    },
+    minDurationMs: () => effective?.minDurationMs ?? 0,
     onRotate: () => {
       if (recording) recording.onRotate();
       else ensureRecording();
+      checkUrl();
     },
   });
+
+  /** Decides the tab's session when it is still pending; the one place a pending mode is resolved. */
+  const settle = () => {
+    if (stopped || !effective) return;
+    const session = store.last();
+    if (session.mode !== "pending") return;
+    store.setMode(session.id, decideMode(effective, deps.random), effective.minDurationMs);
+    if (recording) recording.onModeChange();
+    else ensureRecording();
+  };
+
+  /**
+   * Draws a trigger that matched: once per session, hit or miss, and only in
+   * a live session that is `off` or `error` (a pending one has no settings yet,
+   * a recording one needs nothing).
+   */
+  const fire = (trigger: ReplayTrigger) => {
+    if (stopped) return;
+    const session = store.active();
+    if (!session || (session.mode !== "off" && session.mode !== "error")) return;
+    if (session.triggered.includes(trigger.id)) return;
+    const hit = deps.random() < trigger.rate;
+    store.markTriggered(session.id, trigger.id);
+    if (!hit) return;
+    deps.log("replay trigger fired", trigger.kind, trigger.id);
+    store.promote(session.id);
+    if (recording) recording.promote();
+    else ensureRecording();
+  };
+  /** The triggers of the settings in use; none before they are adopted. */
+  const triggers = (): ReplayTrigger[] => (remoteOn && effective ? effective.triggers : []);
+  const checkEvent = (event: string, properties: Record<string, unknown>) => {
+    for (const t of triggers()) if (t.kind === "event" && eventMatches(t, event, properties)) fire(t);
+  };
+  /** The path only: query and fragment never count. */
+  const checkUrl = () => {
+    if (stopped || typeof location === "undefined") return;
+    const path = location.pathname;
+    const matched = triggers().filter((t) => t.kind === "url" && matchesUrlPattern(t.pattern, path));
+    if (matched.length === 0) return;
+    if (!store.active()) {
+      // Expired (before this load, or idle before a programmatic navigation):
+      // the match opens the next session where a tracked event would, and
+      // that rotation checks the URL again (onRotate) in the new session.
+      store.touch();
+      return;
+    }
+    for (const t of matched) fire(t);
+  };
+  /** The flags as last loaded (never read through getFeatureFlag(), which sends `$feature_flag_called`). */
+  let flags: Record<string, FlagResult> | null = null;
+  const checkFlags = () => {
+    if (!flags) return;
+    for (const t of triggers()) if (t.kind === "flag" && flagMatches(t, flags)) fire(t);
+  };
+  /** Settings adopted (load, or an answer that arrived): the page and the flags as they are now. */
+  const onSettings = () => {
+    checkUrl();
+    checkFlags();
+  };
+
+  // A session left pending by a page that closed before deciding is decided here.
+  settle();
 
   // The tab's session expired before this page load: recording starts at the
   // first interaction (or tracked event), which rotates it.
@@ -482,10 +736,38 @@ export function startSessionReplay(
     }
   }
 
+  // Triggers exist only with the remote settings: without them, no navigation
+  // observer and no flag listener.
+  const unsubscribe: (() => void)[] = [];
+  if (remoteOn) {
+    unsubscribe.push(onNavigation(checkUrl));
+    if (deps.onFeatureFlags) {
+      unsubscribe.push(
+        deps.onFeatureFlags((loaded) => {
+          flags = loaded;
+          checkFlags();
+        }),
+      );
+    }
+    onSettings();
+  }
+  const unsubscribeAll = () => {
+    for (const off of unsubscribe.splice(0)) off();
+  };
+
   return {
-    eventProperties(event) {
+    eventProperties(event, properties) {
       if (stopped) return {};
       const session = INTERNAL_EVENTS.has(event) ? store.last() : store.touch();
+      // After the session is known: a hit promotes it, the id stays the same.
+      // Matched on the properties the event is queued with: the caller's
+      // `$session_id` when it passed one, else the one returned here.
+      if (properties && !NON_TRIGGER_EVENTS.has(event)) {
+        checkEvent(
+          event,
+          properties.$session_id === undefined ? { ...properties, $session_id: session.id } : properties,
+        );
+      }
       return { $session_id: session.id };
     },
     onException() {
@@ -502,6 +784,7 @@ export function startSessionReplay(
       if (stopped) return;
       stopped = true;
       disarmWake();
+      unsubscribeAll();
       recording?.optOut();
       recording = null;
       store.dispose();
@@ -510,6 +793,7 @@ export function startSessionReplay(
       if (stopped) return;
       stopped = true;
       disarmWake();
+      unsubscribeAll();
       recording?.stop();
       recording = null;
       store.dispose();

@@ -134,7 +134,9 @@ export class CohorlyClient {
   private readonly release: string | undefined;
   private readonly dist: string | undefined;
   private readonly appVersion: string | undefined;
-  private readonly eventProperties: ((event: string) => Record<string, unknown>) | undefined;
+  private readonly eventProperties:
+    | ((event: string, properties: Readonly<Record<string, unknown>>) => Record<string, unknown>)
+    | undefined;
   private readonly beforeSendException:
     | ((event: TrackedEvent) => TrackedEvent | null)
     | undefined;
@@ -484,7 +486,8 @@ export class CohorlyClient {
     if (this.eventProperties) {
       let extra: Record<string, unknown> = {};
       try {
-        extra = this.eventProperties(event) ?? {};
+        // A copy: the hook reads the final properties, it never edits them.
+        extra = this.eventProperties(event, { ...props }) ?? {};
       } catch (err) {
         this.log("eventProperties threw, ignored", err);
       }

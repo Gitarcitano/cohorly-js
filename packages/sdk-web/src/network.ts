@@ -173,7 +173,7 @@ export function absoluteWithoutQuery(url: string): string | undefined {
 }
 
 /** Paths under apiHost the SDK itself calls (breadcrumbs and `$network` both skip them). */
-export const SDK_ENDPOINTS = ["/track", "/engage", "/alias", "/flags/evaluate", "/replay"];
+export const SDK_ENDPOINTS = ["/track", "/engage", "/alias", "/flags/evaluate", "/replay", "/replay/config"];
 
 /**
  * Whether a URL is one of the SDK's own requests to `apiHost`. Only the SDK's

@@ -112,9 +112,17 @@ describe("session replay", () => {
     await vi.waitFor(() => expect(rr.record).toHaveBeenCalledTimes(times));
   }
 
+  /** Like recording(), without moving the fake clock (vi.waitFor advances it on each check). */
+  async function recordingWithoutClock(times = 1) {
+    for (let i = 0; i < 200 && rr.record.mock.calls.length < times; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(rr.record).toHaveBeenCalledTimes(times);
+  }
+
   function sentChunks(host = API_HOST): SentChunk[] {
     return fetchMock.mock.calls
-      .filter(([url]) => String(url).startsWith(`${host}/replay`))
+      .filter(([url]) => String(url).startsWith(`${host}/replay`) && !String(url).includes("/replay/config"))
       .map(([url, req]) => {
         const { headers, body, keepalive } = req as {
           headers: Record<string, string>;
@@ -706,6 +714,236 @@ describe("session replay", () => {
     });
   });
 
+  describe("minimum duration (VEL-2185)", () => {
+    /** A fresh copy of the project's settings: decided at once, no request to /replay/config. */
+    const saveRemote = (config: Record<string, number>) =>
+      window.localStorage.setItem("chl_replay_config:tok-web", JSON.stringify({ fetchedAt: Date.now(), config }));
+    const storedSession = () => JSON.parse(window.sessionStorage.getItem("chl_replay_session") as string);
+    const replayRequests = () => fetchMock.mock.calls.filter(([url]) => String(url).includes("/replay"));
+
+    it("a session recording shorter than the minimum sends nothing: not on the tick, the 1000-event cut, hiding or closing", async () => {
+      saveRemote({ sampleRate: 1, minDurationMs: 10_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction();
+      await vi.advanceTimersByTimeAsync(5000);
+      for (let i = 0; i < 1200; i += 1) interaction(10 + i);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(replayRequests()).toHaveLength(0);
+
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+      try {
+        document.dispatchEvent(new Event("visibilitychange"));
+        window.dispatchEvent(new Event("pagehide"));
+        await vi.advanceTimersByTimeAsync(0);
+      } finally {
+        delete (document as { visibilityState?: unknown }).visibilityState;
+      }
+      expect(replayRequests()).toHaveLength(0);
+      expect(storedSession().seq).toBe(0);
+    });
+
+    it("past the minimum, the first chunk sent is seq 0 and starts with the Meta and FullSnapshot", async () => {
+      saveRemote({ sampleRate: 1, minDurationMs: 5000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      interaction(2);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const chunks = sentChunks();
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].chunk).toMatchObject({ seq: 0, mode: "session" });
+      expect(chunks[0].chunk.events.map((e) => e.type)).toEqual([4, 2, 3, 3]);
+      expect(chunks[0].chunk.events.some(isMarked(1))).toBe(true);
+    });
+
+    it("error mode sends its buffer on an exception whatever the minimum", async () => {
+      saveRemote({ onErrorSampleRate: 1, minDurationMs: 30_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(999);
+      cohorly.captureException(new Error("boom"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [sent] = sentChunks();
+      expect(sent.chunk.mode).toBe("error");
+      expect(sent.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(sent.chunk.events.some(isMarked(999))).toBe(true);
+    });
+
+    it("counts from the session's first recorded event across its pages", async () => {
+      saveRemote({ sampleRate: 1, minDurationMs: 10_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction();
+      const { recStart } = storedSession();
+      expect(typeof recStart).toBe("number");
+      await vi.advanceTimersByTimeAsync(4000);
+
+      start({ sampleRate: 0, remoteConfig: true }); // the session's next page
+      await recording(2);
+      expect(storedSession().recStart).toBe(recStart);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      interaction(3); // 11 s after the first page's first event
+      await vi.advanceTimersByTimeAsync(5000);
+      const [first] = sentChunks();
+      expect(first.chunk.seq).toBe(0);
+      expect(first.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(first.chunk.events.some(isMarked(3))).toBe(true);
+    });
+
+    it("a session keeps the minimum it was decided with: a stored 10 s still holds when the settings now say 0", async () => {
+      window.sessionStorage.setItem(
+        "chl_replay_session",
+        JSON.stringify({ id: "held-1", startedAt: T0, lastActivity: T0, mode: "session", seq: 0, minDurationMs: 10_000 }),
+      );
+      saveRemote({ sampleRate: 1, minDurationMs: 0 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(5000);
+      interaction(2);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()[0].chunk).toMatchObject({ session_id: "held-1", seq: 0 });
+    });
+
+    it("a record without a minimum (written before it existed) never holds, whatever the settings", async () => {
+      window.sessionStorage.setItem(
+        "chl_replay_session",
+        JSON.stringify({ id: "old-1", startedAt: T0, lastActivity: T0, mode: "session", seq: 0 }),
+      );
+      saveRemote({ sampleRate: 1, minDurationMs: 10_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()[0].chunk).toMatchObject({ session_id: "old-1", seq: 0 });
+    });
+
+    it("a held recording past half the outbox bound is sent anyway, its first chunk holding the snapshot", async () => {
+      const enqueued = vi.spyOn(ReplaySender.prototype, "enqueue");
+      saveRemote({ sampleRate: 1, minDurationMs: 30_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      const pad = "x".repeat(700_000);
+      for (let id = 1; id <= 3; id += 1) interaction(id, { pad });
+      expect(enqueued).not.toHaveBeenCalled();
+
+      interaction(4, { pad });
+      expect(enqueued).toHaveBeenCalledTimes(1);
+      const [chunks] = enqueued.mock.calls[0] as [ReplayChunk[], boolean | undefined];
+      expect(chunks[0]).toMatchObject({ seq: 0, mode: "session", hasSnapshot: true });
+      expect(chunks.reduce((sum, c) => sum + c.count, 0)).toBe(6);
+
+      await vi.advanceTimersByTimeAsync(0);
+      const [first] = sentChunks();
+      expect(first.chunk.seq).toBe(0);
+      expect(first.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+    });
+
+    it("once past the minimum a recording never holds again, even for an event stamped earlier", async () => {
+      saveRemote({ sampleRate: 1, minDurationMs: 5000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(1);
+      await vi.advanceTimersByTimeAsync(6000);
+      interaction(2);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(1);
+
+      rr.state.emit?.({ type: 3, timestamp: T0 + 1, data: { source: 2, type: 2, id: 3 } });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(2);
+      expect(sentChunks()[1].chunk.events.some(isMarked(3))).toBe(true);
+    });
+
+    it("hiding the tab while held sends and drops nothing: past the minimum the snapshot still goes first", async () => {
+      saveRemote({ sampleRate: 1, minDurationMs: 10_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(1);
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" });
+      try {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await vi.advanceTimersByTimeAsync(0);
+      } finally {
+        delete (document as { visibilityState?: unknown }).visibilityState;
+      }
+      expect(replayRequests()).toHaveLength(0);
+
+      document.dispatchEvent(new Event("visibilitychange"));
+      await vi.advanceTimersByTimeAsync(10_000);
+      interaction(2);
+      await vi.advanceTimersByTimeAsync(5000);
+      const [first] = sentChunks();
+      expect(first.chunk.seq).toBe(0);
+      expect(first.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(first.chunk.events.some(isMarked(1))).toBe(true);
+      expect(first.chunk.events.some(isMarked(2))).toBe(true);
+    });
+
+    it("session mode paused by the quota buffers like error mode and sends on an exception, whatever the minimum", async () => {
+      window.localStorage.setItem("chl_replay_quota_until", String(T0 + 60 * 60_000));
+      saveRemote({ sampleRate: 1, minDurationMs: 30_000 });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      expect(storedSession()).toMatchObject({ mode: "session", minDurationMs: 30_000 });
+      interaction(7);
+      cohorly.captureException(new Error("boom"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [sent] = sentChunks();
+      expect(sent.chunk.mode).toBe("error");
+      expect(sent.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(sent.chunk.events.some(isMarked(7))).toBe(true);
+    });
+
+    it("a recording session that rotates into a pending decision stops, then records in the mode decided", async () => {
+      saveRemote({ sampleRate: 1 });
+      let release: (res: Response) => void = () => {};
+      const base = fetchMock.getMockImplementation();
+      fetchMock.mockImplementation((url: string, requestInit?: RequestInit) =>
+        String(url).includes("/replay/config")
+          ? new Promise<Response>((resolve) => {
+              release = resolve;
+            })
+          : base?.(url, requestInit),
+      );
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      const first = storedSession().id;
+
+      vi.setSystemTime(T0 + 61 * 60_000);
+      cohorly.reset();
+      expect(storedSession().mode).toBe("pending");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rr.state.stops).toBe(1);
+
+      release(ok({ config: { sampleRate: 0, onErrorSampleRate: 1 } }));
+      await recording(2);
+      expect(storedSession().mode).toBe("error");
+      interaction(5);
+      cohorly.captureException(new Error("after"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const [sent] = sentChunks().filter((c) => c.chunk.mode === "error");
+      expect(sent.chunk.session_id).toBe(storedSession().id);
+      expect(sent.chunk.session_id).not.toBe(first);
+      expect(sent.chunk.events.some(isMarked(5))).toBe(true);
+    });
+  });
+
   describe("privacy (K6)", () => {
     it("masks every input type (hidden included) and always applies the Cohorly mask and block selectors", async () => {
       start({ sampleRate: 1 });
@@ -1258,6 +1496,173 @@ describe("session replay", () => {
       const third = sessionOf("three");
       expect(third).not.toBe(second);
       expect(third).not.toBe(first);
+    });
+  });
+
+  describe("triggers (VEL-2187)", () => {
+    const TRIGGER_ID = "11111111-1111-4111-8111-111111111111";
+    const trigger = { id: TRIGGER_ID, kind: "event", event: "Checkout Started", filters: [], rate: 1 };
+    /** A fresh copy of the project's settings: adopted at once, no request to /replay/config. */
+    const saveRemote = (config: Record<string, unknown>) =>
+      window.localStorage.setItem("chl_replay_config:tok-web", JSON.stringify({ fetchedAt: Date.now(), config }));
+    const storedSession = () => JSON.parse(window.sessionStorage.getItem("chl_replay_session") as string);
+
+    it("off: the hit loads rrweb and records the session from a full snapshot, its first chunk marked hasSnapshot", async () => {
+      const enqueued = vi.spyOn(ReplaySender.prototype, "enqueue");
+      saveRemote({ triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(rr.record).not.toHaveBeenCalled();
+      const { id } = storedSession();
+
+      cohorly.track("Checkout Started");
+      await recording();
+      interaction(1);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(storedSession()).toMatchObject({ id, mode: "session", triggered: [TRIGGER_ID] });
+      const [first] = sentChunks();
+      expect(first.chunk).toMatchObject({ session_id: id, seq: 0, mode: "session" });
+      expect(first.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(first.chunk.events.some(isMarked(1))).toBe(true);
+      expect(enqueued.mock.calls[0][0][0].hasSnapshot).toBe(true);
+    });
+
+    it("error: the hit sends the error buffer as an error would, then records the session from a new snapshot", async () => {
+      saveRemote({ onErrorSampleRate: 1, triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(5);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(sentChunks()).toHaveLength(0);
+
+      cohorly.track("Checkout Started");
+      await vi.advanceTimersByTimeAsync(0);
+      const [buffer] = sentChunks();
+      expect(buffer.chunk.mode).toBe("error");
+      expect(buffer.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(buffer.chunk.events.some(isMarked(5))).toBe(true);
+
+      await recording(2);
+      interaction(6);
+      await vi.advanceTimersByTimeAsync(5000);
+      const chunks = sentChunks();
+      expect(chunks.map((c) => c.chunk.mode)).toEqual(["error", "session"]);
+      expect(chunks[1].chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(chunks[1].chunk.events.some(isMarked(5))).toBe(false);
+      expect(chunks[1].chunk.events.some(isMarked(6))).toBe(true);
+      expect(storedSession()).toMatchObject({ mode: "session", triggered: [TRIGGER_ID] });
+    });
+
+    it("session: nothing changes, nothing is drawn or marked", async () => {
+      saveRemote({ sampleRate: 1, triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      cohorly.track("Checkout Started");
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(rr.record).toHaveBeenCalledTimes(1);
+      expect(rr.state.stops).toBe(0);
+      expect(storedSession()).toMatchObject({ mode: "session", triggered: [] });
+    });
+
+    it("the minimum duration counts from the hit, not from the session's start", async () => {
+      saveRemote({ minDurationMs: 10_000, triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      await vi.advanceTimersByTimeAsync(20_000);
+      cohorly.track("Checkout Started");
+      await recording();
+      interaction(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(6000);
+      interaction(2);
+      await vi.advanceTimersByTimeAsync(5000);
+      const [first] = sentChunks();
+      expect(first.chunk).toMatchObject({ seq: 0, mode: "session" });
+      expect(first.chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+    });
+
+    it("a hit during a quota pause keeps buffering; when the pause ends the buffer is sent before the session records", async () => {
+      window.localStorage.setItem("chl_replay_quota_until", String(T0 + 7000));
+      saveRemote({ triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      cohorly.track("Checkout Started");
+      expect(storedSession().mode).toBe("session");
+      await recording();
+      interaction(7);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(sentChunks()).toHaveLength(0);
+
+      await vi.advanceTimersByTimeAsync(5000); // the first tick after the pause
+      await recording(2);
+      interaction(8);
+      await vi.advanceTimersByTimeAsync(5000);
+      const chunks = sentChunks();
+      expect(chunks.map((c) => c.chunk.mode)).toEqual(["error", "session"]);
+      expect(chunks[0].chunk.events.some(isMarked(7))).toBe(true);
+      expect(chunks[1].chunk.events.slice(0, 2).map((e) => e.type)).toEqual([4, 2]);
+      expect(chunks[1].chunk.events.some(isMarked(7))).toBe(false);
+      expect(chunks[1].chunk.events.some(isMarked(8))).toBe(true);
+    });
+
+    it("error: a tick between the hit and the promotion's restart still sends the buffer first", async () => {
+      saveRemote({ onErrorSampleRate: 1, triggers: [trigger] });
+      // Due with the recorder's first tick and scheduled before it, so it runs
+      // first: the tick then comes between the hit and the next task.
+      setTimeout(() => cohorly.track("Checkout Started"), 5000);
+      start({ sampleRate: 0, remoteConfig: true });
+      await recordingWithoutClock();
+      interaction(5);
+      await vi.advanceTimersByTimeAsync(5000);
+      await recording(2);
+      interaction(6);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      const chunks = sentChunks();
+      expect(chunks.map((c) => c.chunk.mode)).toEqual(["error", "session"]);
+      expect(chunks[0].chunk.events.some(isMarked(5))).toBe(true);
+      expect(chunks[1].chunk.events.some(isMarked(6))).toBe(true);
+      // One switch: the promotion's own restart found it done.
+      expect(rr.record).toHaveBeenCalledTimes(2);
+    });
+
+    it("error: a pagehide right after the hit, before any timer, sends the buffer with keepalive", async () => {
+      saveRemote({ onErrorSampleRate: 1, triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      interaction(5);
+      replayResponses.push(new Promise<Response>(() => {})); // a regular send never answers: the page closes first
+
+      cohorly.track("Checkout Started");
+      window.dispatchEvent(new Event("pagehide"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      const kept = sentChunks().filter((c) => c.keepalive);
+      expect(kept.map((c) => c.chunk.mode)).toEqual(["error"]);
+      expect(kept[0].chunk.events.some(isMarked(5))).toBe(true);
+    });
+
+    it("error: reset() right after the hit queues the old session's buffer and never promotes the new session", async () => {
+      saveRemote({ onErrorSampleRate: 1, triggers: [trigger] });
+      start({ sampleRate: 0, remoteConfig: true });
+      await recording();
+      const { id: old } = storedSession();
+      interaction(5);
+
+      cohorly.track("Checkout Started");
+      cohorly.reset();
+      const fresh = storedSession();
+      expect(fresh.id).not.toBe(old);
+      await recording(2);
+      interaction(6);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(storedSession()).toMatchObject({ id: fresh.id, mode: "error", triggered: [] });
+      const chunks = sentChunks();
+      expect(chunks.map((c) => [c.chunk.session_id, c.chunk.mode])).toEqual([[old, "error"]]);
+      expect(chunks[0].chunk.events.some(isMarked(5))).toBe(true);
+      expect(rr.record).toHaveBeenCalledTimes(2);
     });
   });
 });

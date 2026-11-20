@@ -338,9 +338,14 @@ export interface CohorlyClientOptions {
    * such as `$feature_flag_called` and `$metric`, and `$exception`). Its keys
    * are stamped on the event unless the caller passed them. Used by platform
    * SDKs for per-event state such as the web `$session_id`. Receives the
-   * event name. A hook that throws is ignored.
+   * event name and, as a copy, its final properties (super props, the
+   * caller's properties and the SDK-owned fields, before the hook's own keys
+   * are merged). A hook that throws is ignored.
    */
-  eventProperties?: (event: string) => Record<string, unknown>;
+  eventProperties?: (
+    event: string,
+    properties: Readonly<Record<string, unknown>>,
+  ) => Record<string, unknown>;
 }
 
 export interface CohorlyMetricsOptions {

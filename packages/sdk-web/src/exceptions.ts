@@ -21,7 +21,8 @@ import {
   stringifyValue,
 } from "@cohorly/core";
 import { observeConsole } from "./console.js";
-import { observeNetwork, patchMethod, safely, sdkRequestMatcher } from "./network.js";
+import { onNavigation } from "./navigation.js";
+import { observeNetwork, safely, sdkRequestMatcher } from "./network.js";
 
 export { EXCEPTION_DEDUP_WINDOW_MS, MAX_EXCEPTIONS_PER_FINGERPRINT } from "@cohorly/core";
 
@@ -263,25 +264,14 @@ export function setupExceptionCapture(hooks: ExceptionCaptureHooks): () => void 
       crumb({ category: "navigation", message: `${lastRoute} -> ${to}`, level: "info" });
       lastRoute = to;
     });
-  if (typeof history !== "undefined") {
-    for (const method of ["pushState", "replaceState"]) {
-      cleanups.push(
-        patchMethod(history, method, (original) =>
-          function patchedHistory(this: unknown, ...args: unknown[]) {
-            const result = original.apply(this, args);
-            if (active) onNavigate();
-            return result;
-          },
-        ),
-      );
-    }
-  }
-  window.addEventListener("popstate", onNavigate);
+  // pushState, replaceState and popstate through the shared observer (navigation.ts).
+  cleanups.push(
+    onNavigation(() => {
+      if (active) onNavigate();
+    }),
+  );
   window.addEventListener("hashchange", onNavigate);
-  cleanups.push(() => {
-    window.removeEventListener("popstate", onNavigate);
-    window.removeEventListener("hashchange", onNavigate);
-  });
+  cleanups.push(() => window.removeEventListener("hashchange", onNavigate));
 
   const onClick = (event: Event) =>
     safely(() => {

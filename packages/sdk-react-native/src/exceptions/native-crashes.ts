@@ -26,6 +26,11 @@ export interface NativeCrashConfig {
    * differs; Android stamps its own versionCode over it on write.
    */
   build: string | null;
+  /**
+   * The session replay `$session_id` (VEL-2153), only while session replay
+   * is configured; re-sent on every rotation. Absent: no replay session.
+   */
+  sessionId?: string;
 }
 
 export interface NativeCrashInputs {
@@ -39,6 +44,8 @@ export interface NativeCrashInputs {
   distinctId: string;
   deviceId: string;
   build: string | undefined;
+  /** The replay session; omitted (or empty) when session replay is not configured. */
+  sessionId?: string;
 }
 
 /**
@@ -56,6 +63,7 @@ export function buildNativeCrashConfig(input: NativeCrashInputs): NativeCrashCon
     distinctId: input.distinctId,
     deviceId: input.deviceId,
     build: input.build ?? null,
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
   };
 }
 
