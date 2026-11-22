@@ -62,12 +62,22 @@ enum ReplayViewIds {
 
 /// Text views the user may type in.
 enum ReplayTextViews {
-    /// True when `textView` is editable or first responder now, or was in
-    /// any earlier capture (remembered on the view): text typed while it was
-    /// editable stays masked after it turns read-only. Main thread only.
+    /// The text view of a React Native `TextInput` (`multiline`), found by
+    /// name so React is not linked. Always an input, even with
+    /// `editable={false}`, like a field on web and Android.
+    private static let reactNativeInputName = "RCTUITextView"
+    /// Main thread only (resolved lazily: React may load after the recorder).
+    private static var reactNativeInput: AnyClass?
+
+    /// True when `textView` is a React Native `TextInput`, is editable or
+    /// first responder now, or was in any earlier capture (remembered on the
+    /// view): text typed while it was editable stays masked after it turns
+    /// read-only. Main thread only.
     static func isTypedInput(_ textView: UITextView) -> Bool {
         if objc_getAssociatedObject(textView, &replayTypedInputKey) != nil { return true }
-        guard textView.isEditable || textView.isFirstResponder else { return false }
+        if reactNativeInput == nil { reactNativeInput = NSClassFromString(reactNativeInputName) }
+        let isReactNativeInput = reactNativeInput.map { textView.isKind(of: $0) } ?? false
+        guard isReactNativeInput || textView.isEditable || textView.isFirstResponder else { return false }
         objc_setAssociatedObject(textView, &replayTypedInputKey, NSNumber(value: true), .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         return true
     }

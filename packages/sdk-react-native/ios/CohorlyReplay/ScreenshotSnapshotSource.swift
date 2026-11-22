@@ -38,8 +38,9 @@ import UIKit
 
 /// What a screenshot must cover, in window points, by the wireframe
 /// recorder's rule (`ReplayMasking`):
-/// - every `UITextField`, `UISearchBar` and editable (or once editable)
-///   `UITextView`, and a secure text view;
+/// - every `UITextField`, `UISearchBar`, editable (or once editable)
+///   `UITextView` and React Native `TextInput` (`RCTUITextView`), and a
+///   secure text view;
 /// - with `maskAllImages`, every `UIImageView` showing an image;
 /// - a view marked `cohorlyNoCapture` (or `cohorly-no-capture` in its
 ///   `accessibilityIdentifier`) and its whole subtree;
