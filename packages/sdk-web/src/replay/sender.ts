@@ -105,9 +105,20 @@ export function encodeBodySync(json: string): Encoded {
 
 const META = 4;
 const FULL_SNAPSHOT = 2;
+const INCREMENTAL = 3;
+/** rrweb's `IncrementalSource.CanvasMutation`. */
+const CANVAS_MUTATION = 9;
 
 function eventType(event: unknown): unknown {
   return typeof event === "object" && event !== null ? (event as { type?: unknown }).type : undefined;
+}
+
+/** A canvas frame (rrweb `CanvasMutation`, VEL-2155). */
+function isCanvasFrame(event: unknown): boolean {
+  return (
+    eventType(event) === INCREMENTAL &&
+    ((event as { data?: { source?: unknown } }).data?.source ?? null) === CANVAS_MUTATION
+  );
 }
 
 /** A Meta and the FullSnapshot right after it are one unit: never cut between them. */
@@ -167,6 +178,9 @@ export class ReplaySender {
   private epoch = 0;
   private closed = false;
   private keepaliveBytes = 0;
+  /** Lone canvas frames whose keepalive body is over the budget, each counted once. */
+  private readonly tooBigForKeepalive = new WeakSet<ReplayChunk>();
+  private canvasKeepaliveMisses = 0;
   private readonly random: () => number;
 
   constructor(private readonly options: SenderOptions) {
@@ -175,6 +189,16 @@ export class ReplaySender {
 
   get pending(): readonly ReplayChunk[] {
     return this.outbox;
+  }
+
+  /**
+   * Chunks holding a lone canvas frame whose gzip body is over
+   * {@link KEEPALIVE_BUDGET_BYTES}: no keepalive request can carry them, so
+   * they are lost if the page closes before the regular sender gets to them
+   * (VEL-2176). Debug log and tests only; nothing is sent about it.
+   */
+  get canvasFramesTooBigForKeepalive(): number {
+    return this.canvasKeepaliveMisses;
   }
 
   /** Builds a chunk with its seq taken now, from its own session. */
@@ -401,20 +425,52 @@ export class ReplaySender {
       }
     }
     if (cut < 0) return null;
-    const first = events.slice(0, cut);
-    const second = events.slice(cut);
+    return this.pieces(chunk, [events.slice(0, cut), events.slice(cut)]) as [ReplayChunk, ReplayChunk];
+  }
+
+  /** Chunks of these runs of the chunk's events: the first keeps its seq, the others take new ones. */
+  private pieces(chunk: ReplayChunk, parts: unknown[][]): ReplayChunk[] {
     const holds = (part: unknown[]) => part.some((e) => eventType(e) === FULL_SNAPSHOT);
     const base = { ...chunk, inFlight: false, keepalive: false, claimed: false };
-    return [
-      { ...base, eventsJson: JSON.stringify(first), count: first.length, hasSnapshot: holds(first) },
-      {
-        ...base,
-        eventsJson: JSON.stringify(second),
-        count: second.length,
-        hasSnapshot: holds(second),
-        seq: this.options.nextSeq(chunk.sessionId),
-      },
-    ];
+    return parts.map((part, i) => ({
+      ...base,
+      eventsJson: JSON.stringify(part),
+      count: part.length,
+      hasSnapshot: holds(part),
+      ...(i > 0 ? { seq: this.options.nextSeq(chunk.sessionId) } : {}),
+    }));
+  }
+
+  /**
+   * Keepalive only: the chunk cut around its first canvas frame (what comes
+   * before, the frame alone, what comes after), so a frame that fits the
+   * budget alone goes in its own request (VEL-2176). Only the first: a later
+   * frame is cut out on a later turn of the pass, and only while budget is
+   * left, so a closing page never fragments a chunk it cannot send. A Meta
+   * and its FullSnapshot are never cut apart (a frame is never between
+   * them). Null without a frame or when the chunk is one already.
+   */
+  private isolateFrames(chunk: ReplayChunk): ReplayChunk[] | null {
+    if (chunk.count < 2) return null;
+    const events = JSON.parse(chunk.eventsJson) as unknown[];
+    const at = events.findIndex(isCanvasFrame);
+    if (at < 0) return null;
+    const parts = [events.slice(0, at), [events[at]], events.slice(at + 1)].filter((part) => part.length > 0);
+    return parts.length < 2 ? null : this.pieces(chunk, parts);
+  }
+
+  /** A chunk of one canvas frame whose keepalive body is over the whole budget: counted once, logged. */
+  private countTooBig(chunk: ReplayChunk, encoded: Encoded): boolean {
+    if (encoded.bytes <= KEEPALIVE_BUDGET_BYTES || chunk.count !== 1) return false;
+    if (!isCanvasFrame((JSON.parse(chunk.eventsJson) as unknown[])[0])) return false;
+    if (!this.tooBigForKeepalive.has(chunk)) {
+      this.tooBigForKeepalive.add(chunk);
+      this.canvasKeepaliveMisses += 1;
+      this.options.log(
+        `replay canvas frame of ${encoded.bytes} bytes${encoded.gzip ? " gzipped" : ""} cannot fit a keepalive request, left queued (${this.canvasKeepaliveMisses} on this page)`,
+      );
+    }
+    return true;
   }
 
   /**
@@ -428,7 +484,10 @@ export class ReplaySender {
    * {@link MAX_CHUNK_BYTES} (UTF-8) is not even compressed (it cannot fit).
    * Only on `split` (pagehide) is a chunk too big split, and only while
    * enough budget is left; what does not fit stays queued whole for the
-   * regular sender if the page comes back.
+   * regular sender if the page comes back. A chunk holding a canvas frame is
+   * first cut so that the frame goes alone (VEL-2176); a lone frame whose
+   * gzip is over the whole budget can never go and is counted
+   * ({@link canvasFramesTooBigForKeepalive}).
    *
    * The start of a session never goes without its snapshot: the chunks of a
    * session up to and including the first one holding a FullSnapshot still
@@ -476,10 +535,10 @@ export class ReplaySender {
       return encoded;
     };
     const left = () => KEEPALIVE_BUDGET_BYTES - this.keepaliveBytes;
-    const replace = (chunk: ReplayChunk, halves: [ReplayChunk, ReplayChunk]) => {
-      for (const half of halves) half.claimed = true;
-      this.outbox.splice(this.outbox.indexOf(chunk), 1, ...halves);
-      claimed.splice(claimed.indexOf(chunk), 1, ...halves);
+    const replace = (chunk: ReplayChunk, parts: ReplayChunk[]) => {
+      for (const part of parts) part.claimed = true;
+      this.outbox.splice(this.outbox.indexOf(chunk), 1, ...parts);
+      claimed.splice(claimed.indexOf(chunk), 1, ...parts);
     };
     /**
      * Sends the head of the session of `claimed[from]` whole, or holds the
@@ -530,7 +589,7 @@ export class ReplaySender {
           if (sendHead(i)) continue;
         }
         const encoded = encode(chunk);
-        if (!encoded) {
+        if (!encoded || this.countTooBig(chunk, encoded)) {
           leave(chunk);
           continue;
         }
@@ -545,12 +604,13 @@ export class ReplaySender {
           leave(chunk);
           continue;
         }
-        const halves = this.split(chunk);
-        if (!halves) {
+        // A canvas frame goes alone first (it fits on its own or never does), then halves.
+        const parts = this.isolateFrames(chunk) ?? this.split(chunk);
+        if (!parts) {
           leave(chunk);
           continue;
         }
-        replace(chunk, halves);
+        replace(chunk, parts);
         i -= 1;
       }
     } finally {

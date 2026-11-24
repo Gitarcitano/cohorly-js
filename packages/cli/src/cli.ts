@@ -12,7 +12,7 @@ import { buildIndex, type DecodedMap, serializeIndex } from "./index-format.js";
 import { parsePgMapId } from "./r8.js";
 import { composeHermes, decodeSourceMap } from "./sourcemap.js";
 import { type SymcacheBuilder, type SymcacheSliceResult, xcodeSymcacheBuilder } from "./symcache/macho.js";
-import { type SymbolKind, type UploadDeps, uploadArtifact } from "./upload.js";
+import { type SymbolKind, type UploadDeps, type UploadResult, uploadArtifact } from "./upload.js";
 import { UsageError } from "./usage-error.js";
 import { VERSION } from "./version.js";
 
@@ -99,7 +99,9 @@ const DEBUG_FILES_UPLOAD_HELP = `Usage: cohorly debug-files upload --release <re
     slice and only the symcache is uploaded, keyed by the slice's LC_UUID.
     The raw dSYM never leaves the build machine. This needs macOS with the
     Xcode command line tools (xcrun dwarfdump); anywhere else a path with a
-    dSYM fails before any upload.
+    dSYM fails before any upload. A slice whose LC_UUID the server already
+    holds (an unchanged framework rebuilt under another path) is reported
+    "already uploaded" and is not a failure.
 
 Options:
   --release <release>         Must equal $exception_release sent by the SDK (required)
@@ -124,8 +126,9 @@ plugin adds it). Reads the Xcode build environment:
   - Waits up to COHORLY_DSYM_WAIT_SECONDS (default 30) for the app's dSYM
     ($DWARF_DSYM_FILE_NAME) while Xcode is still writing it.
 
-A missing map or dSYM, or any failed upload, exits 1 and fails the build.
-COHORLY_UPLOAD_DISABLED=1 is the only way to skip the upload.
+A missing map or dSYM, or any failed upload, exits 1 and fails the build. A
+dSYM slice the server already holds (same LC_UUID) is "already uploaded", not
+a failure. COHORLY_UPLOAD_DISABLED=1 is the only way to skip the upload.
 `;
 
 const REACT_NATIVE_GRADLE_HELP = `Usage: cohorly react-native gradle --release <release> --sourcemap <map> [--mapping <mapping.txt>]
@@ -328,8 +331,17 @@ interface Job {
   skip?: string;
 }
 
+// The server's 409 for a debug id it already holds with other bytes. For a
+// symcache that is the same binary (same LC_UUID) built under another path
+// (DerivedData moves between builds), so the copy on the server serves it.
+// A source map index's debug id hashes its content, so there it stays a failure.
+function alreadyUploaded(job: Job, result: UploadResult): boolean {
+  return job.kind === "symcache" && !result.ok && result.status === 409 && result.error.includes("debug_id already uploaded");
+}
+
 async function runJobs(jobs: Iterable<Job> | AsyncIterable<Job>, target: Target, io: Io): Promise<number> {
   let uploaded = 0;
+  let present = 0;
   let failed = 0;
   let skipped = 0;
   for await (const job of jobs) {
@@ -350,12 +362,15 @@ async function runJobs(jobs: Iterable<Job> | AsyncIterable<Job>, target: Target,
     if (result.ok) {
       uploaded++;
       io.stdout(`uploaded ${job.label}${result.id ? ` (${result.id})` : ""}\n`);
+    } else if (alreadyUploaded(job, result)) {
+      present++;
+      io.stdout(`already uploaded ${job.label}\n`);
     } else {
       failed++;
       io.stderr(`failed ${job.label}: ${result.error}\n`);
     }
   }
-  io.stdout(`${uploaded} uploaded, ${failed} failed${skipped > 0 ? `, ${skipped} skipped` : ""}\n`);
+  io.stdout(`${uploaded} uploaded, ${failed} failed${present > 0 ? `, ${present} already uploaded` : ""}${skipped > 0 ? `, ${skipped} skipped` : ""}\n`);
   return failed > 0 ? 1 : 0;
 }
 

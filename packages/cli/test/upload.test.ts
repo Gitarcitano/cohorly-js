@@ -434,6 +434,48 @@ describe("debug-files upload", () => {
     expect(out.stdout).toContain("1 uploaded, 2 failed");
   });
 
+  it("counts a symcache the server already holds (409 on its debug id) as already uploaded and exits 0", async () => {
+    const s = await server((req) =>
+      req.query.debug_id === X86_SLICE.debugId
+        ? { status: 409, body: { error: "debug_id already uploaded with different content" } }
+        : { status: 201, body: { id: "ok" } },
+    );
+    const dir = await tempDir();
+    await writeFiles(dir, { "FirebaseCore.framework.dSYM/Contents/Resources/DWARF/FirebaseCore": DWARF_BYTES });
+    const fake = fakeSymcache({ FirebaseCore: [ARM64_SLICE, X86_SLICE] });
+    const { io, out } = makeIo({ COHORLY_UPLOAD_TOKEN: TOKEN, COHORLY_API_URL: s.url }, { platform: "darwin", symcache: fake.builder });
+
+    expect(await main(["debug-files", "upload", "--release", "r1", dir], io)).toBe(0);
+    // A 409 is an answer, never retried.
+    expect(s.requests.map((r) => r.query.debug_id)).toEqual([ARM64_SLICE.debugId, X86_SLICE.debugId]);
+    expect(out.stdout).toMatch(new RegExp(`^already uploaded \\S*FirebaseCore \\(x86_64 ${X86_SLICE.debugId}\\)$`, "m"));
+    expect(out.stderr).not.toContain("failed");
+    expect(out.stdout).toContain("1 uploaded, 0 failed, 1 already uploaded");
+  });
+
+  it("still fails on a symcache answered with another status, and on a 409 for a source map index", async () => {
+    const symcache = await server((req) =>
+      // Same text as the 409, another status: only the 409 means the server holds it.
+      req.query.debug_id === X86_SLICE.debugId
+        ? { status: 400, body: { error: "debug_id already uploaded with different content" } }
+        : { status: 201, body: { id: "ok" } },
+    );
+    const dir = await tempDir();
+    await writeFiles(dir, { "App.app.dSYM/Contents/Resources/DWARF/App": DWARF_BYTES });
+    const fake = fakeSymcache({ App: [ARM64_SLICE, X86_SLICE] });
+    const a = makeIo({ COHORLY_UPLOAD_TOKEN: TOKEN, COHORLY_API_URL: symcache.url }, { platform: "darwin", symcache: fake.builder });
+    expect(await main(["debug-files", "upload", "--release", "r1", dir], a.io)).toBe(1);
+    expect(a.out.stderr).toMatch(new RegExp(`^failed \\S*App \\(x86_64 ${X86_SLICE.debugId}\\): HTTP 400`, "m"));
+    expect(a.out.stdout).toContain("1 uploaded, 1 failed");
+    expect(a.out.stdout).not.toContain("already uploaded");
+
+    const index = await server(() => ({ status: 409, body: { error: "debug_id already uploaded with different content" } }));
+    const b = makeIo({ COHORLY_UPLOAD_TOKEN: TOKEN, COHORLY_API_URL: index.url });
+    expect(await main(["sourcemaps", "upload", "--release", "r1", await sourcemapDir()], b.io)).toBe(1);
+    expect(b.out.stderr).toContain("HTTP 409: debug_id already uploaded");
+    expect(b.out.stdout).toContain("0 uploaded, 2 failed");
+  });
+
   it("skips an unsupported 32-bit slice (watchOS arm64_32) with a warning and still exits 0", async () => {
     const s = await server();
     const dir = await tempDir();

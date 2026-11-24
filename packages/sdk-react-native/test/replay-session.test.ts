@@ -18,10 +18,12 @@ import type { CohorlyOptions } from "../src/types.js";
 import { FakeStorage } from "./helpers.js";
 import {
   type AnyEvent,
+  advance,
   fakeAppState,
   fakeReplayModule,
   HeldStorage,
   replayFetch,
+  StuckStorage,
   settle,
   useClock,
 } from "./replay-helpers.js";
@@ -456,5 +458,59 @@ describe("native crash config sessionId", () => {
     const sessions = linked.configs().map((config) => config.sessionId);
     expect(sessions[0]).toBe(first);
     expect(sessions.at(-1)).toBe(second);
+  });
+});
+
+describe("seq reservation", () => {
+  const KEY = "replay-key";
+  const storedSeq = (storage: FakeStorage) => JSON.parse(storage.store.get(KEY) as string).seq;
+
+  it("persisted() gives up after 5 s of a write that never answers, waits for a new write once storage answers, and never hands out a seq twice", async () => {
+    const storage = new StuckStorage(KEY);
+    const store = new ReplaySessionStore({ storage, key: KEY, draw: () => "session", now: () => Date.now() });
+    await store.load();
+    await store.persisted();
+    storage.stuck = true;
+    const id = store.last().id;
+    expect(store.takeSeq(id)).toBe(0);
+    const outcome = vi.fn();
+    store.persisted().then(
+      () => outcome("persisted"),
+      () => outcome("timeout"),
+    );
+    await advance(4999);
+    expect(outcome).not.toHaveBeenCalled();
+    await advance(1);
+    expect(outcome).toHaveBeenCalledWith("timeout");
+    // The first write and the one sent again when it expired with a wait still open.
+    expect(storage.hangingWrites).toBe(2);
+
+    // That second write expires too, with nobody waiting: nothing more is sent.
+    await advance(5000);
+    expect(storage.hangingWrites).toBe(2);
+
+    // Storage answers again; both writes still hang. A new wait writes the record again.
+    storage.stuck = false;
+    await expect(store.persisted()).resolves.toBeUndefined();
+    expect(storedSeq(storage)).toBe(1);
+    expect(store.takeSeq(id)).toBe(1);
+    await store.persisted();
+    expect(storedSeq(storage)).toBe(2);
+
+    // The write stuck since seq 0 lands now, older than what storage holds: the newest record is written back.
+    storage.release();
+    await settle();
+    expect(storedSeq(storage)).toBe(2);
+    await expect(store.persisted()).resolves.toBeUndefined();
+  });
+
+  it("a write that fails still counts as done: the in-memory session goes on", async () => {
+    const storage = new FakeStorage();
+    const store = new ReplaySessionStore({ storage, key: KEY, draw: () => "session", now: () => Date.now() });
+    await store.load();
+    vi.spyOn(storage, "setItem").mockRejectedValue(new Error("full"));
+    expect(store.takeSeq(store.last().id)).toBe(0);
+    await expect(store.persisted()).resolves.toBeUndefined();
+    expect(store.takeSeq(store.last().id)).toBe(1);
   });
 });

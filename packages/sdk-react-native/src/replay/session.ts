@@ -21,8 +21,14 @@
  * session never draws. Nothing is written before `load()`, so the
  * provisional session never overwrites a stored one it has not read yet; a
  * background transition seen meanwhile is kept by the adopted session.
- * Writes reach storage one at a time, in order; `persisted()` waits for
- * them (a chunk's seq is persisted before the chunk is sent).
+ * Writes reach storage one at a time, newest record only; `persisted()`
+ * waits until storage holds the record as it is at the call (a chunk's seq
+ * is persisted before the chunk is sent) and fails after
+ * {@link SEQ_WRITE_TIMEOUT_MS}, which the sender retries with backoff
+ * (VEL-2215). A write that has not answered within that time no longer holds
+ * the next one back; if it lands after a newer one, the current record is
+ * written again, so an older record never stays last. A write that fails
+ * (storage full or broken) counts as done: the in-memory session goes on.
  *
  * With the project's settings (`remoteConfig`, VEL-2238) a new session may
  * be born `pending`: it has its id at once and `settle()` decides it later,
@@ -38,6 +44,8 @@ export const SESSION_IDLE_MS = 30 * 60 * 1000;
 export const SESSION_MAX_MS = 24 * 60 * 60 * 1000;
 /** Activity is persisted at most this often (the in-memory value is exact). */
 const ACTIVITY_WRITE_MS = 5000;
+/** How long `persisted()` waits for storage, and a write holds the next one back. */
+export const SEQ_WRITE_TIMEOUT_MS = 5000;
 
 export function replayStorageKey(token: string | undefined): string {
   return `cohorly:replay_session:${token ?? ""}`;
@@ -112,6 +120,29 @@ export interface SessionStoreOptions {
   now: () => number;
   /** After a rotation (not at launch), with the new session and the one it replaced. */
   onRotate?: (session: ReplaySessionState, previous: ReplaySessionState) => void;
+  /** Default {@link SEQ_WRITE_TIMEOUT_MS}. */
+  writeTimeoutMs?: number;
+}
+
+/** A `setItem` issued and not answered yet. */
+interface PendingWrite {
+  /** Issue order. */
+  index: number;
+  /** The record version it carries. */
+  version: number;
+  /** Unanswered past the timeout: the next write no longer waits for it. */
+  expired: boolean;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface PersistWaiter {
+  version: number;
+  resolve: () => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+function unref(timer: unknown): void {
+  (timer as { unref?: () => void } | null)?.unref?.();
 }
 
 export class ReplaySessionStore {
@@ -121,7 +152,21 @@ export class ReplaySessionStore {
   /** reset() ran before load(): the stored session is the outgoing one. */
   private rotatedBeforeLoad = false;
   private lastWrite = Number.NEGATIVE_INFINITY;
-  private writes: Promise<void> = Promise.resolve();
+  /** Version of the record in memory, bumped by every write(). */
+  private version = 0;
+  /** The record of `version`, serialized (null before the first write). */
+  private json: string | null = null;
+  /** Version of the newest record issued to storage. */
+  private issuedVersion = 0;
+  /** Version storage holds for sure (answered, with nothing older left to land after it). */
+  private confirmed = 0;
+  private issued = 0;
+  /** Issue order of the newest write answered. */
+  private landed = 0;
+  /** An older record landed after a newer one: the current one is written again. */
+  private rewrite = false;
+  private readonly inFlight = new Set<PendingWrite>();
+  private readonly waiters = new Set<PersistWaiter>();
   /** The provisional session's draw is not made yet (it is, in load(), unless a stored session is adopted). */
   private undrawn = true;
   /** Next seq of sessions rotated out in this process whose chunks may still be built. */
@@ -177,9 +222,31 @@ export class ReplaySessionStore {
     return adopted;
   }
 
-  /** Resolves once every write issued so far reached storage (or failed). */
+  /**
+   * Resolves once storage holds the record as it is now (or its write
+   * failed); rejects when that takes more than the write timeout. Never
+   * changes a seq: a caller that retries waits for the same record again.
+   */
   persisted(): Promise<void> {
-    return this.writes;
+    const version = this.version;
+    if (this.confirmed >= version) return Promise.resolve();
+    // Every write sent is past its timeout (or none is left): send the current record again.
+    if (!this.writing()) {
+      this.rewrite = true;
+      this.pumpWrites();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter: PersistWaiter = {
+        version,
+        resolve,
+        timer: setTimeout(() => {
+          this.waiters.delete(waiter);
+          reject(new Error("replay session not persisted in time"));
+        }, this.writeTimeoutMs()),
+      };
+      unref(waiter.timer);
+      this.waiters.add(waiter);
+    });
   }
 
   /** The current session (stamped on every event). */
@@ -303,12 +370,71 @@ export class ReplaySessionStore {
       ...this.current,
       ...(this.quotaUntil > 0 ? { quotaPausedUntil: this.quotaUntil } : {}),
     };
-    const json = JSON.stringify(record);
-    // In order: an older record must never land after a newer one.
-    this.writes = this.writes
+    this.version += 1;
+    this.json = JSON.stringify(record);
+    this.pumpWrites();
+  }
+
+  private writeTimeoutMs(): number {
+    return this.options.writeTimeoutMs ?? SEQ_WRITE_TIMEOUT_MS;
+  }
+
+  /** A write is in flight and within its timeout. */
+  private writing(): boolean {
+    for (const pending of this.inFlight) if (!pending.expired) return true;
+    return false;
+  }
+
+  /** Sends the current record when it is not sent yet (or must be again) and no live write is in flight. */
+  private pumpWrites(): void {
+    const json = this.json;
+    if (json === null || this.writing()) return;
+    if (this.version <= this.issuedVersion && !this.rewrite) return;
+    this.rewrite = false;
+    this.issuedVersion = this.version;
+    this.issued += 1;
+    const pending: PendingWrite = {
+      index: this.issued,
+      version: this.version,
+      expired: false,
+      timer: setTimeout(() => {
+        pending.expired = true;
+        // No longer counted as in flight; answered() still sees it land.
+        this.inFlight.delete(pending);
+        // Someone waits for a record storage has not confirmed: try again now.
+        if (this.waiters.size > 0 && this.confirmed < this.version) this.rewrite = true;
+        this.pumpWrites();
+      }, this.writeTimeoutMs()),
+    };
+    unref(pending.timer);
+    this.inFlight.add(pending);
+    Promise.resolve()
       .then(() => this.options.storage.setItem(this.options.key, json))
       .catch(() => {
         // storage full or broken: the in-memory session still works
-      });
+      })
+      .then(() => this.answered(pending));
+  }
+
+  private answered(pending: PendingWrite): void {
+    clearTimeout(pending.timer);
+    this.inFlight.delete(pending);
+    if (pending.index < this.landed) {
+      // Landed after a newer record (it had timed out): storage holds this older one now.
+      this.confirmed = Math.min(this.confirmed, pending.version);
+      this.rewrite = true;
+    } else {
+      // Anything that landed before it is overwritten, and older writes still out are past their timeout.
+      this.landed = pending.index;
+      this.confirmed = pending.version;
+      this.rewrite = false;
+    }
+    this.pumpWrites();
+    for (const waiter of this.waiters) {
+      if (this.confirmed < waiter.version) continue;
+      clearTimeout(waiter.timer);
+      this.waiters.delete(waiter);
+      waiter.resolve();
+    }
   }
 }

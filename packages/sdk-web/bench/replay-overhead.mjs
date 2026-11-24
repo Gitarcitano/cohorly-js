@@ -10,7 +10,13 @@
 // variants of the 1000 element page plus an 800x600 2D <canvas> redrawn 20
 // times a second during the interaction: session mode with
 // `canvas: { fps: 2 }` (`canvas`) and the same without the option
-// (`canvas-off`), and session mode on the 1000 element page that also logs 10
+// (`canvas-off`), and (VEL-2176) `canvas-capped`, the `canvas` variant in a
+// session whose canvas budget is already spent: the page is loaded once and
+// init() runs, the harness marks the session's `chl_replay_canvas` record in
+// sessionStorage as full (64 MiB), then reloads the tab, so the measured page
+// load continues that session and its recorder starts without canvas (the CPU
+// left after the ceiling, no public option involved), and session mode on the
+// 1000 element page that also logs 10
 // console lines a second (log, info, warn and error, an object now and then:
 // `$console`, VEL-2144, `session-console`), and (VEL-2145) two session-mode
 // variants of the 1000 element page that also fetch 1 MB of JSON from the
@@ -35,7 +41,8 @@
 // (or BENCH_BROWSER). Chromium is the default and the only one with CPU
 // numbers: CDP Performance.getMetrics does not exist in Firefox or WebKit, so
 // there only the bytes sent (and that the SDK runs at all) are reported.
-// (10 variants x runs x about DURATION_S + 11 s each). For the canvas variants it
+// (11 variants x runs x about DURATION_S + 11 s each; `canvas-capped` adds a
+// page load and 1.5 s). For the canvas variants it
 // also prints the canvas frames received (rrweb source 9 events) and the mean
 // serialized bytes per frame, and for the fetch variants the `$network` events
 // received and their mean serialized size.
@@ -68,6 +75,7 @@ const VARIANTS = [
   { name: "session-5k", replay: "session", cards: 800 },
   { name: "canvas-off", replay: "canvas-off", cards: 150, animate: true },
   { name: "canvas", replay: "canvas", cards: 150, animate: true },
+  { name: "canvas-capped", replay: "canvas", cards: 150, animate: true, capped: true },
   { name: "session-fetch", replay: "session", cards: 150, fetching: true },
   { name: "session-network", replay: "session-network", cards: 150, fetching: true },
 ];
@@ -281,6 +289,19 @@ async function run(variant) {
   if (cdp) await cdp.send("Performance.enable", { timeDomain: "threadTicks" });
   await p.goto(`${ORIGIN}/?replay=${variant.replay ?? ""}&cards=${variant.cards}${variant.animate ? "&animate=1" : ""}`);
   await p.waitForFunction(() => window.ready === true);
+  if (variant.capped) {
+    // A first page load of the session, then its canvas budget marked spent
+    // (what 64 MiB of frames would have left) and a reload: the same session goes on.
+    await p.evaluate(() => window.startSdk());
+    await p.waitForTimeout(1500);
+    await p.evaluate(() => {
+      const { id } = JSON.parse(sessionStorage.getItem("chl_replay_session"));
+      sessionStorage.setItem("chl_replay_canvas", JSON.stringify({ id, chars: 64 * 1024 * 1024, full: true }));
+    });
+    await p.reload();
+    await p.waitForFunction(() => window.ready === true);
+    resetStats();
+  }
   await p.waitForTimeout(500);
   const elements = await p.evaluate(() => window.elementCount());
   const beforeInit = await getMetrics();
@@ -354,6 +375,8 @@ compare("off", "session-console");
 compare("session", "session-console");
 compare("off-5k", "session-5k");
 compare("canvas-off", "canvas");
+compare("canvas-off", "canvas-capped");
+compare("canvas", "canvas-capped");
 compare("session", "session-fetch");
 compare("session-fetch", "session-network");
 for (const name of ["session-fetch", "session-network"]) {
@@ -362,7 +385,7 @@ for (const name of ["session-fetch", "session-network"]) {
     `${name} $network events: ${fmt(count, 0)} per run, ${count > 0 ? fmt(avg(results[name], "networkChars") / count / 1024, 2) : "n/a"} KiB mean serialized per event`,
   );
 }
-for (const name of ["canvas-off", "canvas"]) {
+for (const name of ["canvas-off", "canvas", "canvas-capped"]) {
   const frames = avg(results[name], "canvasFrames");
   console.log(
     `${name} canvas frames: ${fmt(frames, 0)} per run, ${frames > 0 ? fmt(avg(results[name], "canvasChars") / frames / 1024, 1) : "n/a"} KiB mean serialized per frame`,

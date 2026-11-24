@@ -190,7 +190,8 @@ final class ReplayTouchPublisher {
 
 /// `ReplayTouchSource` over `ReplayTouchPublisher`: touch starts, ends and
 /// cancellations, positions in points in the touch's window, with that
-/// window's key (the recorder keeps only those of the window it records).
+/// window's key and whether it is the key window a capture records (the
+/// recorder keeps only those of the window it records).
 /// `start` and `stop` hold one lock across the subscription change, so a
 /// `stop` racing a `start` never leaves a subscriber behind.
 final class SendEventTouchSource: ReplayTouchSource {
@@ -207,6 +208,9 @@ final class SendEventTouchSource: ReplayTouchSource {
         defer { lock.unlock() }
         if let previous = subscription { publisher.unsubscribe(previous) }
         subscription = publisher.subscribe { event in
+            // Read once per event, by the rule the captures use.
+            var keyWindow: UIWindow?
+            var keyWindowRead = false
             let touches = (event.allTouches ?? []).compactMap { touch -> ReplayRawTouch? in
                 let kind: ReplayEvents.TouchKind
                 switch touch.phase {
@@ -216,8 +220,13 @@ final class SendEventTouchSource: ReplayTouchSource {
                 }
                 guard let window = touch.window else { return nil }
                 let point = touch.location(in: window)
+                if !keyWindowRead {
+                    keyWindow = WireframeSnapshotSource.keyWindow()
+                    keyWindowRead = true
+                }
                 return ReplayRawTouch(kind: kind, x: Double(point.x), y: Double(point.y),
-                                      windowKey: ObjectIdentifier(window).hashValue)
+                                      windowKey: ObjectIdentifier(window).hashValue,
+                                      isKeyWindow: keyWindow === window)
             }
             if !touches.isEmpty { handler(touches) }
         }

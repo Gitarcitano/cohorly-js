@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Session replay recording for React Native on iOS (VEL-2153),
 /// `NativeModules.CohorlyReactNativeReplay`. The recorder under
@@ -63,6 +66,21 @@ final class CohorlyReactNativeReplay: NSObject {
         resolve(nil)
     }
 
+    /// Sets the shrink level (VEL-2215) of every capture that follows,
+    /// clamped to 0...3, and asks for a Meta + FullSnapshot like
+    /// `replayCheckout`: the JS layer dropped a snapshot too large to send.
+    /// `replayStart` sets it back to 0. No-op when stopped or owned by
+    /// another instance.
+    @objc(replayShrink:resolver:rejecter:)
+    func replayShrink(
+        _ level: NSNumber,
+        resolver resolve: @escaping (Any?) -> Void,
+        rejecter reject: @escaping (String?, String?, Error?) -> Void
+    ) {
+        ReactNativeReplayRecording.shared.shrink(to: level.intValue, by: instanceId)
+        resolve(nil)
+    }
+
     /// The pending batches in capture order, each a JSON string of an array of
     /// rrweb mobile events; the list is emptied. `[]` when stopped, empty or
     /// owned by another instance.
@@ -105,6 +123,13 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
     static let maxPendingBytes = 5 * 1024 * 1024
     /// The recorder keys its state by session; the JS layer owns the real one.
     static let placeholderSessionId = "react-native"
+    /// Highest shrink level (`MAX_SHRINK_LEVEL` in src/replay/native.ts).
+    static let maxShrinkLevel = 3
+    /// Scale and JPEG quality of the images at each shrink level; level 0 is
+    /// the recorder's own (full size, quality 0.3) and is never re-encoded.
+    static let shrinkSteps: [(scale: CGFloat, quality: CGFloat)] = [
+        (1, 0.3), (0.75, 0.25), (0.5, 0.2), (0.35, 0.15),
+    ]
 
     private let controlLock = NSLock()
     private var recorder: ReplayRecorder?
@@ -119,6 +144,8 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
     /// Bumped each time batches are dropped: the recorder's next capture is
     /// then full (`ReplayRecorderHost.droppedChunks`).
     private var dropped = 0
+    /// Shrink level of what is captured from now on, 0 at every start.
+    private var shrinkLevel = 0
 
     // MARK: - Module (the module's queue)
 
@@ -133,12 +160,16 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
         lock.lock()
         pending = []
         pendingBytes = 0
+        shrinkLevel = 0
         lock.unlock()
         let recorder = ReplayRecorder(
             host: self,
             source: config.makeSource(),
             touchSource: SendEventTouchSource(),
-            sinks: { mode, context in mode == .session ? ReactNativeReplaySink(context: context) : nil })
+            sinks: { [weak self] mode, context in
+                guard mode == .session else { return nil }
+                return ReactNativeReplaySink(context: context, shrinkLevel: { self?.currentShrinkLevel ?? 0 })
+            })
         let lifecycle = SystemReplayLifecycle()
         self.recorder = recorder
         self.lifecycle = lifecycle
@@ -178,6 +209,19 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
         controlLock.lock()
         defer { controlLock.unlock() }
         guard owner == instance else { return }
+        // Takes only the recorder's lock and `lock`, never `controlLock`.
+        recorder?.requestCapture(full: true)
+    }
+
+    /// The level applies to every capture encoded after it (the full
+    /// snapshot asked for here included), until the next start.
+    func shrink(to level: Int, by instance: UUID) {
+        controlLock.lock()
+        defer { controlLock.unlock() }
+        guard owner == instance else { return }
+        lock.lock()
+        shrinkLevel = min(max(level, 0), Self.maxShrinkLevel)
+        lock.unlock()
         // Takes only the recorder's lock and `lock`, never `controlLock`.
         recorder?.requestCapture(full: true)
     }
@@ -242,6 +286,14 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
 
     var nowMs: Int64 { ReplayUtil.millis(Date()) }
 
+    /// Shrink level of what is captured now (read by the sink on the
+    /// recorder's queue, before it delivers).
+    var currentShrinkLevel: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return shrinkLevel
+    }
+
     /// The recorder's queue, under the recorder's lock: encodes the delivery
     /// and appends it; over the cap, the oldest batches go and a full
     /// snapshot is asked for.
@@ -286,6 +338,51 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
         return .queued
     }
 
+    /// `value` with every JPEG or PNG data URI in it re-encoded smaller for
+    /// `level`. The wireframe keeps its width and height: the player draws the
+    /// image at the wireframe's size, not the image's own.
+    static func shrunk(_ value: ReplayJSON, level: Int) -> ReplayJSON {
+        switch value {
+        case .string(let text): return .string(shrunkImage(text, level: level) ?? text)
+        case .array(let items): return .array(items.map { shrunk($0, level: level) })
+        case .object(let fields): return .object(fields.mapValues { shrunk($0, level: level) })
+        default: return value
+        }
+    }
+
+    /// The image of a `data:image/jpeg` or `data:image/png` base64 URI scaled
+    /// and re-encoded as JPEG at `level`'s quality; nil when `text` is no such
+    /// image, does not decode, or would not get smaller (left as it is).
+    /// UIGraphicsImageRenderer is safe off the main thread.
+    static func shrunkImage(_ text: String, level: Int) -> String? {
+        #if os(iOS)
+        return autoreleasepool { () -> String? in
+            let prefixes = ["data:image/jpeg;base64,", "data:image/png;base64,"]
+            guard level > 0,
+                  let prefix = prefixes.first(where: { text.hasPrefix($0) }),
+                  let data = Data(base64Encoded: String(text.dropFirst(prefix.count))),
+                  let image = UIImage(data: data)
+            else { return nil }
+            let step = shrinkSteps[min(level, maxShrinkLevel)]
+            let size = CGSize(
+                width: max(1, (image.size.width * image.scale * step.scale).rounded()),
+                height: max(1, (image.size.height * image.scale * step.scale).rounded()))
+            let format = UIGraphicsImageRendererFormat.preferred()
+            format.scale = 1
+            format.opaque = true
+            let jpeg = UIGraphicsImageRenderer(size: size, format: format).jpegData(withCompressionQuality: step.quality) { _ in
+                image.draw(in: CGRect(origin: .zero, size: size))
+            }
+            // An encoding failure gives empty data: the image stays as it was.
+            guard !jpeg.isEmpty else { return nil }
+            let shrunk = "data:image/jpeg;base64," + jpeg.base64EncodedString()
+            return shrunk.utf8.count < text.utf8.count ? shrunk : nil
+        }
+        #else
+        return nil
+        #endif
+    }
+
     /// The JS layer owns the session and its expiry.
     func noteActivity() {}
 
@@ -299,13 +396,20 @@ final class ReactNativeReplayRecording: ReplayRecorderHost, @unchecked Sendable 
 /// buffer); the JS layer batches what it drains.
 final class ReactNativeReplaySink: ReplayEventSink {
     private let context: ReplaySinkContext
+    private let shrinkLevel: () -> Int
 
-    init(context: ReplaySinkContext) {
+    init(context: ReplaySinkContext, shrinkLevel: @escaping () -> Int) {
         self.context = context
+        self.shrinkLevel = shrinkLevel
     }
 
-    func add(_ group: [ReplayJSON], sessionId: String, distinctId: String, generation: UInt64) {
-        guard !group.isEmpty else { return }
+    /// The recorder's queue, outside the recorder's lock (which the main
+    /// thread takes on every touch): images are shrunk here, before the
+    /// delivery, never under that lock.
+    func add(_ recorded: [ReplayJSON], sessionId: String, distinctId: String, generation: UInt64) {
+        guard !recorded.isEmpty else { return }
+        let level = shrinkLevel()
+        let group = level > 0 ? recorded.map { ReactNativeReplayRecording.shrunk($0, level: level) } : recorded
         let admission = context.deliver(group, .session, sessionId, distinctId, generation)
         if admission != .queued { context.report(admission, sessionId) }
     }

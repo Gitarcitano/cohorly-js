@@ -49,6 +49,7 @@ export const ANDROID_REPLAY_FILES = [
   "ComposeImageMask.kt",
   "ComposeMask.kt",
   "ComposeWireframes.kt",
+  "Keyboard.kt",
   "RecorderTypes.kt",
   "ReplayRecorder.kt",
   "ScreenshotCapture.kt",

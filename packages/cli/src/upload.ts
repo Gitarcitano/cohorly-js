@@ -24,7 +24,8 @@ export interface UploadRequest {
   query: Record<string, string | undefined>;
 }
 
-export type UploadResult = { ok: true; id: string; attempts: number } | { ok: false; error: string; attempts: number };
+/** `status`: the HTTP status of the last answer, absent when no answer came (network error, too large to send). */
+export type UploadResult = { ok: true; id: string; attempts: number } | { ok: false; error: string; attempts: number; status?: number };
 
 export function symbolsUrl(apiUrl: string, kind: SymbolKind, query: Record<string, string | undefined>): string {
   const params = new URLSearchParams();
@@ -113,9 +114,9 @@ export async function uploadArtifact(req: UploadRequest, deps: UploadDeps): Prom
         attempt--;
         continue;
       }
-      return { ok: false, error: `${lastError} (still busy after ${Math.round(busyWaitedMs / 1000)} s)`, attempts: requests };
+      return { ok: false, error: `${lastError} (still busy after ${Math.round(busyWaitedMs / 1000)} s)`, attempts: requests, status: 429 };
     }
-    if (res.status < 500) return { ok: false, error: lastError, attempts: requests };
+    if (res.status < 500) return { ok: false, error: lastError, attempts: requests, status: res.status };
     wait = retryAfterMs(res);
   }
   return { ok: false, error: `${lastError} (gave up after ${MAX_ATTEMPTS} attempts)`, attempts: requests };

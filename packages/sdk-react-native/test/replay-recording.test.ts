@@ -12,6 +12,7 @@ import { CohorlyClient } from "../src/client.js";
 import { teardownExceptionCapture } from "../src/exceptions/handlers.js";
 import { CohorlyErrorBoundary, init } from "../src/index.js";
 import { MAX_CHUNK_BYTES, MAX_CHUNK_EVENTS } from "../src/replay/chunks.js";
+import { resolveNativeReplay } from "../src/replay/native.js";
 import { replayStorageKey } from "../src/replay/session.js";
 import type { CohorlyOptions } from "../src/types.js";
 import { LIB_VERSION } from "../src/version.js";
@@ -27,6 +28,7 @@ import {
   type ReplayRequest,
   type RrEvent,
   replayFetch,
+  StuckStorage,
   settle,
   touch,
   useClock,
@@ -100,6 +102,21 @@ const hugeFull = (timestamp: number): RrEvent => ({
   timestamp,
   data: { wireframes: [{ base64: "b".repeat(1_000_000) }] },
 });
+
+/**
+ * A linked module that can shrink: each `replayShrink(level)` captures the
+ * screen again at once, a snapshot too large to send unless `fits(level)`.
+ */
+function shrinkingModule(fits: (level: number) => boolean) {
+  const replay = fakeReplayModule();
+  const mod = Object.assign(replay.mod, {
+    replayShrink: vi.fn(async (level: number): Promise<void> => {
+      const at = Date.now();
+      replay.capture(meta(at), fits(level) ? full(at) : hugeFull(at));
+    }),
+  });
+  return { ...replay, mod };
+}
 
 const errorEvent = (timestamp: number) => ({ type: 5, timestamp, data: { tag: "error", payload: {} } });
 
@@ -303,6 +320,162 @@ describe("session draw", () => {
     await settle();
     expect(replays.map((r) => r.body.seq)).toEqual([0]);
     expect(storedSeqAtPost).toEqual([1]);
+  });
+
+  it("a session write that never answers holds the chunk only until storage answers again, and never repeats a seq", async () => {
+    const replay = link();
+    const key = replayStorageKey("proj_test");
+    const storage = new StuckStorage(key);
+    const storedSeqAtPost: number[] = [];
+    const { replays } = await makeClient({ storage }, () => {
+      storedSeqAtPost.push(JSON.parse(storage.store.get(key) as string).seq);
+      return new Response("", { status: 200 });
+    });
+    storage.stuck = true;
+    replay.capture(meta(T0), full(T0));
+    await advance(5000); // the drain takes seq 0; the write that reserves it hangs
+    await advance(4900);
+    expect(replays).toHaveLength(0);
+    // Past the 5 s wait the send is retried with backoff, and still never posted without its seq stored.
+    await advance(30_000);
+    expect(replays).toHaveLength(0);
+    // Each retry wrote the record again instead of waiting on the first write forever.
+    expect(storage.hangingWrites).toBeGreaterThan(1);
+
+    storage.stuck = false; // storage answers again; the writes made while stuck still hang
+    await advance(120_000);
+    expect(replays.map((r) => r.body.seq)).toEqual([0]);
+    replay.capture(touch(Date.now()));
+    await advance(5000);
+    // The stuck writes land now, after newer records.
+    storage.release();
+    await settle();
+
+    const seqs = replays.map((r) => r.body.seq);
+    expect(seqs).toEqual([0, 1]);
+    seqs.forEach((seq, i) => expect(storedSeqAtPost[i]).toBeGreaterThan(seq));
+    // The newest record is what storage keeps, never an older one that landed late.
+    expect(JSON.parse(storage.store.get(key) as string).seq).toBeGreaterThan(Math.max(...seqs));
+  });
+});
+
+describe("snapshot too large to send", () => {
+  it("is captured again smaller, one shrink level at a time, until it fits; the session gets a playable snapshot", async () => {
+    const replay = link(shrinkingModule((level) => level >= 2));
+    const { replays } = await makeClient();
+    replay.capture(meta(T0), hugeFull(T0));
+    for (let tick = 0; tick < 3; tick += 1) await advance(5000);
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [2]]);
+    expect(replays.flatMap((r) => r.body.events).map((e) => e.type)).toEqual([4, 2]);
+    await advance(30_000);
+    // A snapshot that fits asks for nothing more.
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [2]]);
+    expect(replay.mod.replayCheckout).not.toHaveBeenCalled();
+    // The level is kept: the next snapshot too large goes one level further, not back to 1.
+    replay.capture(meta(Date.now()), hugeFull(Date.now()));
+    await advance(5000);
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [2], [3]]);
+  });
+
+  it("past the last level asks for nothing more and warns once in development; a later snapshot that fits plays again", async () => {
+    g.__DEV__ = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const replay = link(shrinkingModule(() => false));
+    const { replays } = await makeClient();
+    replay.capture(meta(T0), hugeFull(T0));
+    for (let tick = 0; tick < 4; tick += 1) await advance(5000);
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [2], [3]]);
+    // Another screen, still too large: dropped, and nothing asked for.
+    replay.capture(meta(Date.now()), hugeFull(Date.now()), touch(Date.now() + 100));
+    await advance(10_000);
+    expect(replay.mod.replayShrink).toHaveBeenCalledTimes(3);
+    expect(replay.mod.replayCheckout).not.toHaveBeenCalled();
+    expect(replays).toHaveLength(0);
+    // Once CHECKOUT_EVERY_MS has passed since the last level, one more drop asks for one plain checkout, never more.
+    await advance(30_000);
+    replay.capture(meta(Date.now()), hugeFull(Date.now()));
+    await advance(5000);
+    replay.capture(meta(Date.now()), hugeFull(Date.now()));
+    await advance(5000);
+    expect(replay.mod.replayShrink).toHaveBeenCalledTimes(3);
+    expect(replay.mod.replayCheckout).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.filter(([m]) => String(m).includes("too large"))).toHaveLength(1);
+
+    const at = Date.now();
+    replay.capture(meta(at), full(at), touch(at + 100));
+    await advance(5000);
+    expect(replays.flatMap((r) => r.body.events)).toEqual([meta(at), full(at), touch(at + 100)]);
+  });
+
+  it("a snapshot too large followed by one that fits in the same drain asks for nothing", async () => {
+    const replay = link(shrinkingModule(() => true));
+    const { replays } = await makeClient();
+    replay.capture(meta(T0), hugeFull(T0));
+    replay.capture(meta(T0 + 100), full(T0 + 100));
+    await advance(5000);
+    expect(replay.mod.replayShrink).not.toHaveBeenCalled();
+    expect(replay.mod.replayCheckout).not.toHaveBeenCalled();
+    expect(replays.flatMap((r) => r.body.events)).toEqual([meta(T0 + 100), full(T0 + 100)]);
+  });
+
+  it("without shrink in the native module, every dropped snapshot asks for a checkout, as before", async () => {
+    const replay = link();
+    await makeClient();
+    for (let i = 1; i <= 4; i += 1) {
+      replay.capture(meta(Date.now()), hugeFull(Date.now()));
+      await advance(5000);
+      expect(replay.mod.replayCheckout).toHaveBeenCalledTimes(i);
+    }
+  });
+
+  it("error mode: an exception whose buffered snapshot is too large asks for it smaller; a later exception sends it", async () => {
+    const replay = link(shrinkingModule((level) => level >= 2));
+    const { client, replays } = await makeClient({ sessionReplay: { onErrorSampleRate: 1 } });
+    replay.capture(meta(T0), hugeFull(T0), touch(T0 + 100));
+    await advance(5000);
+    client.captureException(new Error("one"));
+    await settle();
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1]]);
+    replay.capture(touch(Date.now()));
+    await advance(5000);
+    client.captureException(new Error("two"));
+    await settle();
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [2]]);
+    expect(replays).toHaveLength(0);
+    replay.capture(touch(Date.now()));
+    await advance(5000);
+    client.captureException(new Error("three"));
+    await settle();
+    expect(replays).toHaveLength(1);
+    expect(replays[0].body.mode).toBe("error");
+    expect(replays[0].body.events.map((e) => e.type)).toContain(2);
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [2]]);
+  });
+
+  it("a new session's recording starts again at level 0", async () => {
+    const replay = link(shrinkingModule((level) => level >= 1));
+    const { client } = await makeClient();
+    replay.capture(meta(T0), hugeFull(T0));
+    await advance(5000);
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1]]);
+    client.reset();
+    await settle();
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [0]]);
+    expect(replay.mod.replayCheckout).not.toHaveBeenCalled();
+    // The level-0 snapshot of the new session is too large again: it asks for level 1, not 2.
+    await advance(5000);
+    expect(replay.mod.replayShrink.mock.calls).toEqual([[1], [0], [1]]);
+  });
+
+  it("resolveNativeReplay exposes shrink only when the module has replayShrink", async () => {
+    const plain = fakeReplayModule().mod;
+    const without = resolveNativeReplay({ NativeModules: { CohorlyReactNativeReplay: plain } });
+    expect(without).not.toBeNull();
+    expect(without?.shrink).toBeUndefined();
+    const replayShrink = vi.fn(async (_level: number) => {});
+    const resolved = resolveNativeReplay({ NativeModules: { CohorlyReactNativeReplay: { ...plain, replayShrink } } });
+    await resolved?.shrink?.(2);
+    expect(replayShrink).toHaveBeenCalledWith(2);
   });
 });
 

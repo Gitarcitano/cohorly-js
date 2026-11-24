@@ -40,7 +40,11 @@ export interface SenderOptions {
   onGone: () => void;
   /** The outbox bound or an unsplittable 413 dropped this chunk. */
   onDropped?: (chunk: ReplayChunk) => void;
-  /** Awaited before each request: the seqs taken so far are persisted. */
+  /**
+   * Awaited before each request: the seqs taken so far are persisted. A
+   * rejection (storage too slow, VEL-2215) is a retry with backoff: nothing is
+   * posted and the chunk keeps its seq.
+   */
   beforeSend?: () => Promise<void>;
   random?: () => number;
 }

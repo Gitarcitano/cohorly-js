@@ -98,6 +98,9 @@ struct ReplayRawTouch: Sendable {
     var y: Double
     /// `ReplaySourceFrame.windowKey` of the touch's window; nil if unknown.
     var windowKey: Int?
+    /// The touch's window is the one a capture records now (the key
+    /// window); nil if unknown.
+    var isKeyWindow: Bool?
 }
 
 /// Where touches come from (the `UIApplication.sendEvent` swizzle on iOS).
@@ -372,8 +375,9 @@ final class ReplayRecorder: @unchecked Sendable {
         guard active, let host else { return }
         // Checked here so a session that does not record costs no capture
         // and no throttle wake-up on every run loop cycle.
-        let mode = host.recordingState().mode
-        noteMode(mode)
+        let state = host.recordingState()
+        let mode = state.mode
+        noteMode(mode, sessionId: state.sessionId)
         guard recordableModes.contains(mode) else {
             markNeedsFull()
             return
@@ -394,7 +398,7 @@ final class ReplayRecorder: @unchecked Sendable {
         lock.unlock()
         guard active, let host else { return }
         let state = host.recordingState()
-        noteMode(state.mode)
+        noteMode(state.mode, sessionId: state.sessionId)
         guard recordableModes.contains(state.mode), source.isInForeground() else {
             markNeedsFull()
             return
@@ -434,15 +438,12 @@ final class ReplayRecorder: @unchecked Sendable {
         let generation = self.generation
         lock.unlock()
         let recordedWindow = recordedWindowKey
-        let ofRecordedWindow = touches.filter { touch in
-            guard let key = touch.windowKey, let recordedWindow else { return true }
-            return key == recordedWindow
-        }
+        let ofRecordedWindow = touches.filter { Self.isOfRecordedWindow($0, recordedWindowKey: recordedWindow) }
         guard !ofRecordedWindow.isEmpty, active, let host else { return }
         // First: a touch after the session expired belongs to the new one.
         host.noteActivity()
         let state = host.recordingState()
-        noteMode(state.mode)
+        noteMode(state.mode, sessionId: state.sessionId)
         // A touch in a mode with no sink is not recorded.
         guard recordableModes.contains(state.mode) else { return }
         let timestamp = host.nowMs
@@ -460,6 +461,19 @@ final class ReplayRecorder: @unchecked Sendable {
         }
     }
 
+    /// Whether `touch` lands on the window the recording shows. Once a frame
+    /// was captured, only touches of that window (`recordedWindowKey`) count.
+    /// Before the first frame, only touches of the key window, the one the
+    /// first capture will record: a touch of an alert or keyboard window
+    /// then is left out too. A touch whose window is unknown (no
+    /// `windowKey`, or before the first frame no `isKeyWindow`) is kept, as
+    /// it was before windows were told apart.
+    static func isOfRecordedWindow(_ touch: ReplayRawTouch, recordedWindowKey: Int?) -> Bool {
+        guard let key = touch.windowKey else { return true }
+        guard let recordedWindowKey else { return touch.isKeyWindow ?? true }
+        return key == recordedWindowKey
+    }
+
     /// Worker, from a sink: queues events of `generation` only while it is
     /// the live one. The check and the enqueue happen under `lock`, so an
     /// opt-out, pause or stop lands either before (refused) or after (and
@@ -473,9 +487,10 @@ final class ReplayRecorder: @unchecked Sendable {
         return host.enqueueRecorded(events, mode: mode, sessionId: sessionId, distinctId: distinctId)
     }
 
-    /// Flushes what the previous mode held when the session leaves it (to
-    /// `.off`, `.error`, or back).
-    private func noteMode(_ mode: ReplayMode) {
+    /// Flushes what the previous mode held when the live session
+    /// (`sessionId`) leaves it (to `.off`, `.error`, or back). Leaving error
+    /// mode for session mode sends that session's error buffer first.
+    private func noteMode(_ mode: ReplayMode, sessionId: String) {
         lock.lock()
         let previous = lastMode
         lastMode = mode
@@ -483,7 +498,7 @@ final class ReplayRecorder: @unchecked Sendable {
         guard let previous, previous != mode else { return }
         worker.async { [weak self] in
             guard let self else { return }
-            if previous == .error { self.pipeline.leaveErrorMode() }
+            if previous == .error { self.pipeline.leaveErrorMode(to: mode, sessionId: sessionId) }
             self.pipeline.flush()
         }
     }

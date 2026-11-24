@@ -165,3 +165,29 @@ export function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+/**
+ * Storage whose writes of one key hang while `stuck` is true, each until
+ * `release()`, and land (in the order they were made) only then.
+ */
+export class StuckStorage extends FakeStorage {
+  stuck = false;
+  private hung: (() => void)[] = [];
+
+  constructor(private readonly key: string) {
+    super();
+  }
+
+  get hangingWrites(): number {
+    return this.hung.length;
+  }
+
+  release(): void {
+    for (const land of this.hung.splice(0)) land();
+  }
+
+  override async setItem(key: string, value: string): Promise<void> {
+    if (key === this.key && this.stuck) await new Promise<void>((resolve) => this.hung.push(resolve));
+    return super.setItem(key, value);
+  }
+}

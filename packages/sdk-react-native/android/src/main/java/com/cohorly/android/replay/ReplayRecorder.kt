@@ -6,7 +6,8 @@
 // host (ReplaySessionSource: the Cohorly replay controller, or the React Native bridge), events are buffered into chunks (ChunkBuffer) instead of captured as
 // `$snapshot` events, a full snapshot is sent on every new session, return from background
 // and change of screen structure, and touches are resolved against the last snapshot sent.
-// Screenshots (VEL-2141) go through ScreenshotCapture.kt; no keyboard, logcat or network capture.
+// Screenshots (VEL-2141) go through ScreenshotCapture.kt; the keyboard (VEL-2174) through
+// Keyboard.kt; no logcat or network capture.
 
 package com.cohorly.android.replay
 
@@ -65,6 +66,11 @@ import kotlin.math.roundToInt
  *   one `screenshot` wireframe whose id is fixed for the recording run; a new
  *   image is a Mutation `updates` of it, the same image nothing. Touches land
  *   on that wireframe.
+ * - **Keyboard** (VEL-2174). Every capture, wireframe or screenshot, reads
+ *   the keyboard from the windows' insets ([keyboardReader], height in dp);
+ *   [KeyboardTracker] turns a change into `keyboard` custom events that
+ *   follow the capture's snapshot events, and sends an open keyboard again
+ *   after every full snapshot.
  * - **Touches.** Start/end with the position in dp, on the wireframe of the
  *   last snapshot sent under it (0 when none). A touch before its session's
  *   first full snapshot waits for it and follows it; a touch on a
@@ -108,6 +114,8 @@ internal class ReplayRecorder(
     chunkMaxBytes: Int = ChunkBuffer.MAX_BYTES,
     /** Screenshot mode when set (VEL-2141), else wireframes. */
     private val screenshots: ScreenshotCapturer? = null,
+    /** The keyboard over [capture]'s windows (bottom to top) at a density in px per dp (VEL-2174). */
+    private val keyboardReader: (roots: List<View>, density: Float) -> KeyboardState = KeyboardReader::read,
 ) {
     // MARK: main thread state
 
@@ -158,6 +166,7 @@ internal class ReplayRecorder(
     // MARK: recorder thread state
 
     private val status = ViewTreeSnapshotStatus()
+    private val keyboard = KeyboardTracker()
     private val buffer = ChunkBuffer(worker, { events, id -> deliver(events, id) }, chunkMaxAgeMs, chunkMaxBytes)
 
     private class PendingTouch(
@@ -281,6 +290,7 @@ internal class ReplayRecorder(
         bufferMode = RecorderMode.OFF
         checkoutGeneration++
         status.reset()
+        keyboard.reset()
         pendingTouches.clear()
     }
 
@@ -352,8 +362,9 @@ internal class ReplayRecorder(
         }
         val metrics = application.resources.displayMetrics
         val roots = zOrdered(rootViewSource.rootViews())
+        val keyboardState = readKeyboard(roots, metrics.density)
         if (screenshots != null) {
-            captureScreenshot(screenshots, sessionId, roots, metrics.density)
+            captureScreenshot(screenshots, sessionId, roots, metrics.density, keyboardState)
             return
         }
         builder.density = metrics.density
@@ -374,8 +385,16 @@ internal class ReplayRecorder(
         val screenKey: List<Any> = wireframes.map { it.id } + listOf(href, width, height)
         val forceFull = needsFull
         needsFull = false
-        val capture = ScreenCapture(sessionId, clock(), width, height, href, screenKey, wireframes, forceFull)
+        val capture =
+            ScreenCapture(sessionId, clock(), width, height, href, screenKey, wireframes, forceFull, keyboardState)
         worker.execute { record(capture) }
+    }
+
+    /** Main thread: the keyboard now; a reader that fails reads as closed, never stops the capture. */
+    private fun readKeyboard(roots: List<View>, density: Float): KeyboardState = try {
+        keyboardReader(roots, density)
+    } catch (_: Throwable) {
+        KeyboardState.CLOSED
     }
 
     /**
@@ -384,7 +403,13 @@ internal class ReplayRecorder(
      * wireframe; a discarded frame keeps the next one full when this one had
      * to be, and is tried again after the throttle.
      */
-    private fun captureScreenshot(capturer: ScreenshotCapturer, sessionId: String, roots: List<View>, density: Float) {
+    private fun captureScreenshot(
+        capturer: ScreenshotCapturer,
+        sessionId: String,
+        roots: List<View>,
+        density: Float,
+        keyboardState: KeyboardState,
+    ) {
         val topActivity = topActivity(roots)
         val (width, height) = screenSizeDp(topActivity, density)
         val (originX, originY) = windowOriginPx(topActivity)
@@ -410,7 +435,17 @@ internal class ReplayRecorder(
                 val wireframe = capturer.toScreenshotWireframe(base64, width, height)
                 val screenKey = listOf<Any>(ScreenshotCapturer.SCREENSHOT, href, width, height)
                 record(
-                    ScreenCapture(sessionId, timestamp, width, height, href, screenKey, listOf(wireframe), forceFull),
+                    ScreenCapture(
+                        sessionId,
+                        timestamp,
+                        width,
+                        height,
+                        href,
+                        screenKey,
+                        listOf(wireframe),
+                        forceFull,
+                        keyboardState,
+                    ),
                 )
             }
             mainHandler.post {
@@ -438,10 +473,13 @@ internal class ReplayRecorder(
         if (session.sessionId != capture.sessionId) return
         safely("record") {
             syncMode()
-            val events = status.snapshotEvents(capture)
+            val snapshot = status.snapshotEvents(capture)
+            val full = snapshot.firstOrNull()?.optInt("type") == RREventType.Meta.value
+            // After the snapshot, in the same group: a full snapshot clears the player's keyboard.
+            val events = snapshot + keyboard.events(capture.keyboard, capture.timestamp, full)
             if (events.isEmpty()) return@safely
             push(capture.sessionId, events)
-            if (events.first().optInt("type") == RREventType.Meta.value) releasePendingTouches(capture)
+            if (full) releasePendingTouches(capture)
         }
     }
 

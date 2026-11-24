@@ -37,8 +37,14 @@ interface Segment {
   lead: number;
   /** Timestamp of the first event that is not screen state, or null. */
   firstActivity: number | null;
+  /** Timestamp of its FullSnapshot while that is the last state event, else null (the keyboard sent with it is state). */
+  fullAt: number | null;
   bytes: number;
 }
+
+/** Tag of the Custom event of the software keyboard. */
+const KEYBOARD_TAG = "keyboard";
+const CUSTOM = 5;
 
 export type Cut =
   /** Nothing new since the previous send. */
@@ -80,7 +86,14 @@ export class ErrorBuffer {
     const timestamp = typeof event.timestamp === "number" ? event.timestamp : this.now();
     const bytes = utf8Length(json);
     if (event.type === META) {
-      this.segments.push({ start: timestamp, events: [{ json, type: META }], lead: 1, firstActivity: null, bytes });
+      this.segments.push({
+        start: timestamp,
+        events: [{ json, type: META }],
+        lead: 1,
+        firstActivity: null,
+        fullAt: null,
+        bytes,
+      });
       this.bytes += bytes;
       this.dirtySinceCheckout = false;
       // Nothing before the newest segment at least 30 s old can be sent again.
@@ -99,7 +112,17 @@ export class ErrorBuffer {
     current.bytes += bytes;
     this.bytes += bytes;
     const state = typeof event.type === "number" && STATE_TYPES.has(event.type);
-    if (state && current.firstActivity === null) {
+    // The open keyboard the recorder sends again with every full snapshot is that
+    // screen's state: an idle screen with the keyboard open must not look busy.
+    const snapshotKeyboard =
+      event.type === CUSTOM &&
+      current.firstActivity === null &&
+      current.fullAt !== null &&
+      current.fullAt === timestamp &&
+      (event as { data?: { tag?: unknown } }).data?.tag === KEYBOARD_TAG;
+    if (event.type === FULL_SNAPSHOT && current.firstActivity === null) current.fullAt = timestamp;
+    else if (!snapshotKeyboard) current.fullAt = null;
+    if ((state && current.firstActivity === null) || snapshotKeyboard) {
       current.lead += 1;
     } else if (!state) {
       if (current.firstActivity === null) current.firstActivity = timestamp;

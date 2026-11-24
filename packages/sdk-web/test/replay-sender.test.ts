@@ -284,6 +284,105 @@ describe("ReplaySender", () => {
       expect(s.pending.find((c) => c.seq === mid.seq)?.count).toBe(3);
     });
 
+    describe("canvas frames (VEL-2176)", () => {
+      /** Base64 of pseudo-random bytes (seeded): barely compressible, like a WebP frame. */
+      function noise(chars: number, seed: number): string {
+        let x = seed >>> 0;
+        const bytes = Buffer.alloc(Math.ceil((chars * 3) / 4));
+        for (let i = 0; i < bytes.length; i += 1) {
+          x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+          bytes[i] = x >>> 24;
+        }
+        return bytes.toString("base64").slice(0, chars);
+      }
+      /** An rrweb CanvasMutation carrying `chars` of base64 WebP, as rrweb 2.x emits it. */
+      const canvasFrame = (chars: number, seed = 7) => ({
+        type: 3,
+        timestamp: 3,
+        data: {
+          source: 9,
+          id: 7,
+          type: 0,
+          commands: [
+            {
+              property: "drawImage",
+              args: [
+                { rr_type: "ImageBitmap", args: [{ rr_type: "Blob", data: [{ rr_type: "ArrayBuffer", base64: noise(chars, seed) }], type: "image/webp" }] },
+                0,
+                0,
+              ],
+            },
+          ],
+        },
+      });
+      const isFrame = (e: unknown) => (e as { type?: number; data?: { source?: number } }).type === 3 && (e as { data?: { source?: number } }).data?.source === 9;
+      const gzipBytes = (c: ReplayChunk) => realFflate.gzipSync(realFflate.strToU8(chunkJson(c))).byteLength;
+
+      it("on pagehide a frame that fits the budget alone goes in a keepalive request of its own (C6)", async () => {
+        useRealGzip();
+        respond = () => new Promise(() => {});
+        const s = sender();
+        const before = Array.from({ length: 5 }, (_, i) => ({ type: 3, timestamp: 2, data: { source: 2, id: i } }));
+        const after = Array.from({ length: 30 }, (_, i) => ({ type: 3, timestamp: 4, data: { source: 0, i, text: noise(1000, i + 100) } }));
+        // An 800x600 frame (~65 KB of base64): about 50 KB gzipped, the chunk as a whole over the budget.
+        const pending = eventsChunk(s, [...before, canvasFrame(65_000), ...after]);
+        expect(gzipBytes(pending)).toBeGreaterThan(KEEPALIVE_BUDGET_BYTES);
+        s.enqueue([pending], false);
+        await s.flushKeepalive(true);
+
+        const keepalive = calls.filter((c) => c.keepalive);
+        expect(keepalive.reduce((sum, c) => sum + c.bytes, 0)).toBeLessThanOrEqual(KEEPALIVE_BUDGET_BYTES);
+        const withFrame = keepalive.filter((c) => c.chunk.events.some(isFrame));
+        expect(withFrame).toHaveLength(1);
+        expect(withFrame[0].chunk.events).toHaveLength(1);
+        // The events before it went first, in their own request; the seqs stay unique.
+        expect(keepalive[0].chunk.events).toHaveLength(5);
+        expect(new Set(keepalive.map((c) => c.chunk.seq)).size).toBe(keepalive.length);
+        expect(s.canvasFramesTooBigForKeepalive).toBe(0);
+      });
+
+      it("only the first frame is cut out: once the budget is spent, the rest of the chunk stays queued whole", async () => {
+        useRealGzip();
+        respond = () => new Promise(() => {});
+        const s = sender();
+        const small = (n: number) => Array.from({ length: 5 }, (_, i) => ({ type: 3, timestamp: 2, data: { source: 2, id: n + i } }));
+        const pending = eventsChunk(s, [...small(0), canvasFrame(65_000, 1), ...small(10), canvasFrame(65_000, 2), ...small(20)]);
+        s.enqueue([pending], false);
+        await s.flushKeepalive(true);
+
+        const keepalive = calls.filter((c) => c.keepalive);
+        expect(keepalive.map((c) => c.chunk.events.length)).toEqual([5, 1]);
+        expect(s.pending).toHaveLength(3);
+        const rest = s.pending.find((c) => !keepalive.some((k) => k.chunk.seq === c.seq));
+        expect(rest?.count).toBe(11);
+      });
+
+      it("a lone frame whose gzip is over 63 KiB is never sent by keepalive: it stays queued and is counted once (C7)", async () => {
+        useRealGzip();
+        respond = () => new Promise(() => {});
+        const log = vi.fn();
+        const s = sender({ log });
+        const lone = eventsChunk(s, [canvasFrame(90_000)]);
+        expect(gzipBytes(lone)).toBeGreaterThan(KEEPALIVE_BUDGET_BYTES);
+        s.enqueue([lone], false);
+        await s.flushKeepalive(false); // visibilitychange
+        await s.flushKeepalive(true); // pagehide: the same chunk, not counted again
+
+        expect(calls.filter((c) => c.keepalive)).toEqual([]);
+        expect(s.canvasFramesTooBigForKeepalive).toBe(1);
+        expect(log.mock.calls.filter(([message]) => String(message).includes("canvas frame"))).toHaveLength(1);
+        expect(s.pending.find((c) => c.seq === lone.seq)?.count).toBe(1);
+
+        // Cut out of a larger chunk, the same: its other events go, the frame is counted.
+        const mixed = eventsChunk(s, [incremental, canvasFrame(90_000, 9)]);
+        s.enqueue([mixed], false);
+        await s.flushKeepalive(true);
+        expect(calls.filter((c) => c.keepalive).map((c) => c.chunk.events.length)).toEqual([1]);
+        expect(calls.filter((c) => c.keepalive).some((c) => c.chunk.events.some(isFrame))).toBe(false);
+        expect(s.canvasFramesTooBigForKeepalive).toBe(2);
+      });
+    });
+
     it("measures MAX_CHUNK_BYTES in UTF-8: a chunk under it in UTF-16 but over in UTF-8 is never compressed", () => {
       useRealGzip();
       respond = () => new Promise(() => {});

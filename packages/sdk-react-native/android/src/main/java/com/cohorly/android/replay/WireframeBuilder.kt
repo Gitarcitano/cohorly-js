@@ -6,7 +6,8 @@
 // editable TextView) and password fields are always masked (no option to turn it off);
 // images follow maskAllImages only and are JPEG with a data: prefix; background colors are
 // also read through wrappers, ripples, state lists and ColorStateLists, and sampled from a
-// drawable of unknown type; the no-capture tag turns a whole subtree into one placeholder and
+// drawable of unknown type; a GradientDrawable's stroke is the border (read by reflection,
+// VEL-2174); the no-capture tag turns a whole subtree into one placeholder and
 // contentDescription is never read; a FLAG_SECURE window is one placeholder; Compose from its
 // semantics (ComposeWireframes.kt, not in PostHog); no Spinner options, no compound drawables.
 
@@ -17,6 +18,7 @@ import android.content.res.Resources
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.AnimatedVectorDrawable
@@ -57,7 +59,9 @@ import android.widget.TextView
 import com.cohorly.android.replay.rr.RRStyle
 import com.cohorly.android.replay.rr.RRWireframe
 import java.io.ByteArrayOutputStream
+import java.lang.reflect.Field
 import java.util.WeakHashMap
+import kotlin.math.roundToInt
 
 /**
  * Wireframe ids: an integer from [RRWireframe.FIRST_ID] up per view, and per
@@ -90,6 +94,34 @@ internal class ViewIdRegistry {
     fun existingId(view: View, nodeId: Int): Int? = nodeIds[view]?.get(nodeId)
 }
 
+/** The [GradientDrawable] a background is drawn with; [inset]: drawn offset inside the view, so no stroke border. */
+internal data class FoundGradient(val drawable: GradientDrawable, val inset: Boolean)
+
+/** A [GradientDrawable]'s stroke: its width in px and its color (ARGB). */
+internal class GradientStroke(val widthPx: Float, val color: Int)
+
+/**
+ * Reads a [GradientDrawable]'s stroke, which has no public getter: the
+ * private `mStrokePaint` field (null when no stroke was set), resolved once.
+ * Null when there is none or the field cannot be read (renamed, or refused by
+ * the hidden API checks); never throws.
+ */
+internal object GradientStrokeReader {
+    private val strokePaint: Field? by lazy {
+        try {
+            GradientDrawable::class.java.getDeclaredField("mStrokePaint").apply { isAccessible = true }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun read(drawable: GradientDrawable): GradientStroke? = try {
+        (strokePaint?.get(drawable) as? Paint)?.let { GradientStroke(it.strokeWidth, it.color) }
+    } catch (_: Throwable) {
+        null
+    }
+}
+
 /**
  * Turns a window's view tree into wireframes (docs/SESSION-REPLAY.md,
  * "Wireframes"). Main thread only: it reads the views.
@@ -113,6 +145,8 @@ internal class WireframeBuilder(
     private val maskAllImages: Boolean,
     private val compose: ComposeDetector = ComposeDetector.Default,
     private var composeNodes: ComposeNodeSource? = null,
+    /** A background gradient's stroke, the wireframe's border; tests replace it. */
+    private val strokeOf: (GradientDrawable) -> GradientStroke? = GradientStrokeReader::read,
 ) {
     /** px per dp, set before each capture (it follows the display settings). */
     var density: Float = 1f
@@ -371,11 +405,36 @@ internal class WireframeBuilder(
         } else if (!maskAllImages) {
             style = style.copy(backgroundImage = background.jpegBase64(view.width, view.height))
         }
-        background.gradient()?.let { gradient ->
+        background.gradient()?.let { (gradient, inset) ->
             val radius = gradient.cornerRadius
             if (radius > 0f) style = style.copy(borderRadius = radius.toInt().dp())
+            if (!inset) {
+                gradient.border()?.let { (width, color) ->
+                    style = style.copy(borderWidth = width, borderColor = color)
+                }
+            }
         }
         return style
+    }
+
+    /**
+     * The stroke as a border: its width in dp (rounded, at least 1) and its color as
+     * the background colors are (alpha dropped). Null with no stroke, a width
+     * of 0 or a transparent color, a shape that is not a rectangle, or when it
+     * cannot be read.
+     */
+    private fun GradientDrawable.border(): Pair<Int, String>? {
+        // A line, an oval or a ring is not the view's rectangle: no border is better than a wrong one.
+        if (shape != GradientDrawable.RECTANGLE) return null
+        val stroke = try {
+            strokeOf(this)
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        if (!(stroke.widthPx > 0f)) return null
+        val color = stroke.color.opaqueOrNull() ?: return null
+        // Rounded, not truncated: a 2dp stroke is 5 px at 2.625 px/dp, and 1.9 is a 2dp border.
+        return (stroke.widthPx / density).roundToInt().coerceAtLeast(1) to color
     }
 
     /** `android:backgroundTint` (a [android.content.res.ColorStateList]) in the view's current state, when set. */
@@ -459,6 +518,16 @@ internal class WireframeBuilder(
         }
     }
 
+    /** Start and end insets read [Int.MIN_VALUE] (undefined) when the layer has none. */
+    private fun Int.isSetInset(): Boolean = this != 0 && this != Int.MIN_VALUE
+
+    private fun LayerDrawable.isLayerInset(index: Int): Boolean = getLayerInsetLeft(index) != 0 ||
+        getLayerInsetTop(index) != 0 ||
+        getLayerInsetRight(index) != 0 ||
+        getLayerInsetBottom(index) != 0 ||
+        getLayerInsetStart(index).isSetInset() ||
+        getLayerInsetEnd(index).isSetInset()
+
     /** Bottom to top, with each layer's id. */
     private fun LayerDrawable.layers(): List<Pair<Int, Drawable>> =
         (0 until numberOfLayers).mapNotNull { i -> getDrawable(i)?.let { getId(i) to it } }
@@ -502,22 +571,45 @@ internal class WireframeBuilder(
         this is PictureDrawable ||
         (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && this is android.graphics.drawable.AnimatedImageDrawable)
 
-    private fun Drawable.gradient(): GradientDrawable? = when (this) {
-        is GradientDrawable -> this
-        is InsetDrawable -> drawable?.gradient()
-        is LayerDrawable -> try {
-            getFirstDrawable()?.gradient()
+    /**
+     * The [GradientDrawable] a background is drawn with (its corner radius
+     * and stroke): itself, or through a ripple's content, a layer list's
+     * lowest layer that has one, a state list's current state and the wrappers.
+     */
+    private fun Drawable.gradient(depth: Int = 0, inset: Boolean = false): FoundGradient? {
+        if (depth > MAX_DRAWABLE_DEPTH) return null
+        return try {
+            when (this) {
+                is GradientDrawable -> FoundGradient(this, inset)
+                is RippleDrawable -> layers().firstNotNullOfOrNull { (id, layer) ->
+                    if (id == android.R.id.mask) null else layer.gradient(depth + 1, inset)
+                }
+                // A layer inset on any side (an underline drawn by shifting a layer) is not the view's rectangle:
+                // a gradient in a plain layer wins, one in an inset layer still gives the corner radius.
+                is LayerDrawable -> (0 until numberOfLayers).firstNotNullOfOrNull { i ->
+                    if (isLayerInset(i)) null else getDrawable(i)?.gradient(depth + 1, inset)
+                } ?: (0 until numberOfLayers).firstNotNullOfOrNull { i -> getDrawable(i)?.gradient(depth + 1, true) }
+                is DrawableContainer -> current?.takeIf { it !== this }?.gradient(depth + 1, inset)
+                // An inset shape is not the view's rectangle either: its padding is the inset.
+                is InsetDrawable -> drawable?.gradient(depth + 1, inset || hasInset())
+                is DrawableWrapper -> drawable?.gradient(depth + 1, inset)
+                else -> null
+            }
         } catch (_: Exception) {
             null
         }
-        else -> null
     }
 
-    private fun LayerDrawable.getFirstDrawable(): Drawable? {
-        for (i in 0 until numberOfLayers) {
-            getDrawable(i)?.let { return it }
-        }
-        return null
+    /** An inset drawable's own inset: its padding minus the padding of the shape it wraps. */
+    private fun InsetDrawable.hasInset(): Boolean {
+        val outer = Rect()
+        getPadding(outer)
+        val inner = Rect()
+        drawable?.getPadding(inner)
+        return outer.left != inner.left ||
+            outer.top != inner.top ||
+            outer.right != inner.right ||
+            outer.bottom != inner.bottom
     }
 
     /** The theme's `windowBackground`: a color, or a drawable with one. */

@@ -1,5 +1,11 @@
 # @cohorly/web
 
+## 0.7.1
+
+### Patch Changes
+
+- 345190e: Session replay canvas: the 64 MiB of canvas frames is now a budget per session across its page loads (sessionStorage, falling back to a count per page load without it), and once it is spent the recorder restarts without canvas so rrweb stops encoding frames, while the DOM keeps being recorded. A snapshot or mutation over the chunk limit loses the pixels of its largest canvases first, only until it fits, instead of every canvas. On pagehide a canvas frame that fits the keepalive budget alone is sent in its own request; one that cannot fit any keepalive request is counted in the debug log.
+
 ## 0.7.0
 
 ### Minor Changes

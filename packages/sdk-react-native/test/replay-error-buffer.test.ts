@@ -14,7 +14,32 @@ function buffer() {
 
 const blob = (timestamp: number, size: number): RrEvent => ({ type: 3, timestamp, data: { source: 0, blob: "x".repeat(size) } });
 
+const keyboard = (timestamp: number, open = true): RrEvent => ({
+  type: 5,
+  timestamp,
+  data: { tag: "keyboard", payload: open ? { open: true, height: 300 } : { open: false } },
+});
+
 describe("ErrorBuffer", () => {
+  it("keeps the keyboard sent with a full snapshot as screen state, not activity", () => {
+    const { b, push } = buffer();
+    push(meta(T0));
+    push(full(T0));
+    push(keyboard(T0));
+    expect(b.dirtySinceCheckout).toBe(false);
+
+    push(keyboard(T0 + 60_000, false));
+    expect(b.dirtySinceCheckout).toBe(true);
+  });
+
+  it("treats a keyboard that does not share its full snapshot's timestamp as activity", () => {
+    const { b, push } = buffer();
+    push(meta(T0));
+    push(full(T0));
+    push(keyboard(T0 + 1_000));
+    expect(b.dirtySinceCheckout).toBe(true);
+  });
+
   it("drops whole oldest segments past 10 MB and sends from the snapshot that remains", () => {
     const { b, clock, push } = buffer();
     push(meta(T0));

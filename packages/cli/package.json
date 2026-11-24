@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/cli",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Cohorly command line and build plugins: inject debug ids, upload source map indexes, R8 mappings and dSYM symcaches so Cohorly can symbolicate errors. Includes Vite, Next.js and Expo (React Native) plugins, and imports Mixpanel event history.",
   "type": "module",
   "main": "dist/index.js",

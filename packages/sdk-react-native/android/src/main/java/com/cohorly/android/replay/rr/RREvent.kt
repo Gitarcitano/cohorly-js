@@ -4,7 +4,7 @@
 // RRMutatedNode.kt, RRRemovedNode.kt, RRIncrementalMouseInteractionData.kt,
 // RRIncrementalMouseInteractionEvent.kt
 // Changed: one file, events built straight into org.json objects (no Gson), only the
-// event types the wireframe recorder sends.
+// event types the wireframe recorder sends; the `keyboard` custom event (VEL-2174).
 
 package com.cohorly.android.replay.rr
 
@@ -16,6 +16,7 @@ internal enum class RREventType(val value: Int) {
     FullSnapshot(2),
     IncrementalSnapshot(3),
     Meta(4),
+    Custom(5),
 }
 
 /** rrweb incremental sources (`data.source`). */
@@ -89,8 +90,24 @@ internal object RREvent {
             .put("pointerType", POINTER_TOUCH),
     )
 
+    /**
+     * Type 5, tag `keyboard`: the keyboard opened, [height] dp tall, at the
+     * bottom of the screen. The player adds one keyboard node; it is removed
+     * only by [keyboardClosed] or a full snapshot.
+     */
+    fun keyboardOpened(height: Int, timestamp: Long): JSONObject =
+        keyboard(JSONObject().put("open", true).put("height", height), timestamp)
+
+    /** Type 5, tag `keyboard`: the keyboard closed (the payload is only `open`). */
+    fun keyboardClosed(timestamp: Long): JSONObject = keyboard(JSONObject().put("open", false), timestamp)
+
+    private fun keyboard(payload: JSONObject, timestamp: Long): JSONObject =
+        event(RREventType.Custom, timestamp, JSONObject().put("tag", KEYBOARD_TAG).put("payload", payload))
+
     private fun RRMutatedNode.toJson(): JSONObject =
         JSONObject().put("parentId", parentId).put("wireframe", wireframe.toJson())
 
     private const val POINTER_TOUCH = 2
+
+    const val KEYBOARD_TAG = "keyboard"
 }

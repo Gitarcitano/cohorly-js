@@ -6,11 +6,13 @@
 // per window; a full snapshot is also sent when the session or the screen structure
 // changes, when a view moved to another parent or children changed order (a Mutation
 // carries neither), and when an added or updated view overlaps a later sibling (the player
-// appends it on top); a touch is resolved against the last snapshot sent; no keyboard
-// detection; no screenshot state.
+// appends it on top); a touch is resolved against the last snapshot sent; the keyboard is
+// read with the capture and turned into events by KeyboardTracker (VEL-2174), not here;
+// no screenshot state.
 
 package com.cohorly.android.replay.internal
 
+import com.cohorly.android.replay.KeyboardState
 import com.cohorly.android.replay.rr.RREvent
 import com.cohorly.android.replay.rr.RRMutatedNode
 import com.cohorly.android.replay.rr.RRRemovedNode
@@ -26,6 +28,7 @@ import org.json.JSONObject
  *   FullSnapshot instead of a Mutation.
  * @param forceFull set by the recorder after a pause (background, a session
  *   that was not recording, a new session).
+ * @param keyboard the keyboard read with the capture (VEL-2174), its height in dp.
  */
 internal class ScreenCapture(
     val sessionId: String,
@@ -36,6 +39,7 @@ internal class ScreenCapture(
     val screenKey: List<Any>,
     val wireframes: List<RRWireframe>,
     val forceFull: Boolean,
+    val keyboard: KeyboardState = KeyboardState.CLOSED,
 )
 
 /**

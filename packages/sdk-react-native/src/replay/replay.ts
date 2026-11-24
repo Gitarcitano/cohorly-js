@@ -18,7 +18,14 @@
  *   stops on a `none` draw). A new recording drops what it drains until a
  *   Meta + FullSnapshot.
  * - A snapshot too large to send (session upload or error send) drops it and
- *   every IncrementalSnapshot after it until a snapshot that fits.
+ *   every IncrementalSnapshot after it until a snapshot that fits, and asks
+ *   native code for the same snapshot smaller (VEL-2215): one shrink level
+ *   more per dropped snapshot, up to {@link MAX_SHRINK_LEVEL}, kept for the
+ *   rest of the recording (a later screen that would fit at level 0 still
+ *   costs no dropped snapshot). Past the last level nothing more is asked
+ *   (one development warning per recording); the next checkout or screen
+ *   change may fit; one plain checkout per CHECKOUT_EVERY_MS mends a chain
+ *   a mutation too large broke. A native module without `shrink` gets a checkout.
  * - The replay quota pause (persisted) records a `session` draw like an
  *   `error` one until it ends, whatever `onErrorSampleRate` is; when it ends
  *   the buffer is sent first (mode `error`, no error marker), then session
@@ -59,7 +66,7 @@ import {
 } from "./chunks.js";
 import { CHECKOUT_EVERY_MS, ERROR_SEND_GAP_MS, ErrorBuffer } from "./error-buffer.js";
 import type { NativeReplay } from "./native.js";
-import { resolveNativeReplay, warnReplayUnavailable } from "./native.js";
+import { MAX_SHRINK_LEVEL, resolveNativeReplay, warnReplayUnavailable, warnSnapshotTooLarge } from "./native.js";
 import type { ReplayDraw, ReplaySettings, SessionReplayOptions } from "./options.js";
 import { drawSession, effectiveSettings, replaySettings } from "./options.js";
 import type { StoredReplayConfig } from "./remote-config.js";
@@ -116,6 +123,12 @@ interface Recording {
   suppress: boolean;
   /** Session mode waiting for its minimum duration: what it drained, not sent yet (null: it flows). */
   held: HeldRecording | null;
+  /** The native shrink level of its captures (0: as recorded); never lowered within the recording. */
+  shrink: number;
+  /** The snapshot-too-large warning was given for this recording. */
+  shrinkWarned: boolean;
+  /** When the last request (or the arrival at the last level) was made once no shrink level was left. */
+  floorAt: number;
 }
 
 interface HeldRecording {
@@ -504,7 +517,9 @@ export class ReplayController {
     if (rec?.sessionId !== session.id || rec?.mode !== mode) {
       // The new recording starts from a full snapshot; anything drained before it is the old screen.
       this.recording = this.newRecording(session, mode);
-      await this.native.checkout();
+      // It starts at shrink level 0, like a native start: the shrink request also asks for the snapshot.
+      if (rec && rec.shrink > 0 && this.native.shrink) await this.native.shrink(0);
+      else await this.native.checkout();
     }
   }
 
@@ -518,6 +533,9 @@ export class ReplayController {
       awaitSnapshot: true,
       suppress: false,
       held: min > 0 ? { minDurationMs: min, units: [], bytes: 0 } : null,
+      shrink: 0,
+      shrinkWarned: false,
+      floorAt: 0,
     };
   }
 
@@ -613,7 +631,7 @@ export class ReplayController {
       }
       if (rest?.length) groups.push(rest);
       if (groups.length === 0) {
-        if (admitted.droppedSnapshot && this.recording === rec) await this.native.checkout();
+        if (admitted.droppedSnapshot && admitted.suppress && this.recording === rec) await this.requestSmallerSnapshot(rec);
         return;
       }
     } else {
@@ -626,7 +644,37 @@ export class ReplayController {
       );
     }
     // A snapshot too large to ever send: the next one makes the rest playable again.
-    if (admitted.droppedSnapshot && this.recording === rec) await this.native.checkout();
+    if (admitted.droppedSnapshot && admitted.suppress && this.recording === rec) await this.requestSmallerSnapshot(rec);
+  }
+
+  /**
+   * A snapshot of `rec` was dropped as too large to send: asks native code
+   * for one at the next shrink level (sticky for the recording). At the last
+   * level nothing is asked, so a screen that never fits never loops; without
+   * `shrink` it is a checkout, as before.
+   */
+  private async requestSmallerSnapshot(rec: Recording): Promise<void> {
+    if (!this.native.shrink) {
+      await this.native.checkout();
+      return;
+    }
+    if (rec.shrink >= MAX_SHRINK_LEVEL) {
+      if (!rec.shrinkWarned) {
+        rec.shrinkWarned = true;
+        warnSnapshotTooLarge();
+      }
+      // No loop: at most one plain checkout per CHECKOUT_EVERY_MS, so a chain broken by a
+      // mutation too large (not a snapshot) is mended, and a screen that never fits stays quiet.
+      const now = Date.now();
+      if (rec.floorAt > 0 && now - rec.floorAt >= CHECKOUT_EVERY_MS) {
+        rec.floorAt = now;
+        await this.native.checkout();
+      }
+      return;
+    }
+    rec.shrink += 1;
+    if (rec.shrink >= MAX_SHRINK_LEVEL) rec.floorAt = Date.now();
+    await this.native.shrink(rec.shrink);
   }
 
   private async bufferBatches(rec: Recording, batches: string[]): Promise<void> {
@@ -723,7 +771,7 @@ export class ReplayController {
     );
     if (!kept.some((u) => u.hasSnapshot)) {
       // Every snapshot was too large: a marker alone would replay nothing.
-      if (keepBuffering) await this.native.checkout();
+      if (keepBuffering) await this.requestSmallerSnapshot(rec);
       return;
     }
     this.lastErrorSend = { sessionId, at: Date.now() };

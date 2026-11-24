@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/web",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Browser SDK for Cohorly, hosted product analytics (Mixpanel-style). localStorage persistence, fetch/sendBeacon transport, and SPA pageview autotracking on top of @cohorly/core.",
   "type": "module",
   "main": "dist/index.js",

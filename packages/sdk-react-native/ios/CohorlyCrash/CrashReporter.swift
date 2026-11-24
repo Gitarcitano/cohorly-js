@@ -36,6 +36,17 @@ final class CrashReporter: CrashBackend {
         return installed
     }
 
+    /// True when the previous launch ended in a crash a crash handler
+    /// recorded (the report this launch sends). Not KSCrash's
+    /// `crashedLastLaunch`: that is also true for a termination it could not
+    /// explain (an app killed in foreground, by the system or a debugger),
+    /// which sends no report. Meaningful only once the reporter is installed
+    /// (false before).
+    var crashedLastLaunch: Bool {
+        guard isInstalled else { return false }
+        return KSCrash.shared.previousTerminationReason == .crash
+    }
+
     /// Applies the launch decision once per process. A second call after the
     /// reporter is installed only refreshes the user info.
     @discardableResult

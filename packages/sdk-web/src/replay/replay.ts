@@ -36,7 +36,7 @@
  */
 import { CONSOLE_LEVELS, observeConsole } from "../console.js";
 import { absoluteWithoutQuery, observeNetwork, sdkRequestMatcher } from "../network.js";
-import { canvasFilter } from "./canvas.js";
+import { canvasBudgetFull, canvasFilter } from "./canvas.js";
 import { CONSOLE_TAG, consoleRecorder } from "./console-record.js";
 import { iframeBridge } from "./iframes.js";
 import { networkRecorder } from "./network-record.js";
@@ -146,9 +146,16 @@ function combineSelectors(base: string, extra: unknown): string {
  * checkout lazily, right after the event that crossed the interval, so the
  * buffer cut at that checkout would lose the event that caused an error. The
  * SDK times the checkouts instead.
+ *
+ * `canvas: false` leaves the canvas keys out whatever the option says: the
+ * session's canvas budget is spent (VEL-2176) and rrweb must stop drawing and
+ * encoding frames the SDK would drop.
  */
-export function recordOptions(options: SessionReplayOptions): Record<string, unknown> {
-  const canvas = canvasSettings(options.canvas);
+export function recordOptions(
+  options: SessionReplayOptions,
+  { canvas: withCanvas = true }: { canvas?: boolean } = {},
+): Record<string, unknown> {
+  const canvas = withCanvas ? canvasSettings(options.canvas) : null;
   return {
     maskInputOptions: { ...MASK_INPUT_OPTIONS },
     maskTextSelector: combineSelectors(DEFAULT_MASK_SELECTOR, options.maskTextSelector),
@@ -257,7 +264,8 @@ export function startRecording(
   const { store } = ctx;
   const load = recordingDeps.load ?? loadRecorder;
   let halted = false; // stop(), optOut() or 404
-  let recorder: { mode: ChunkMode; sessionId: string; stop: () => void } | null = null;
+  /** `canvas`: rrweb was asked for canvas frames. */
+  let recorder: { mode: ChunkMode; sessionId: string; canvas: boolean; stop: () => void } | null = null;
   let record: RecordFn | null = null;
   let generation = 0;
   /** Session mode's events not queued yet, serialized once, with their size and the last one's timestamp. */
@@ -471,8 +479,29 @@ export function startRecording(
     segments = segments.slice(count);
   };
 
-  const limitCanvas = canvasFilter(ctx.log);
   const canvasOn = canvasSettings(options.canvas) !== null;
+  /** The recorder generation a canvas-off restart was already asked for (one per recorder). */
+  let cappedGeneration = -1;
+  const limitCanvas = canvasFilter(ctx.log, {
+    storage: ctx.sessionStorage,
+    // The session's canvas budget is spent: rrweb keeps drawing and encoding
+    // frames that would all be dropped, so the recorder restarts without canvas
+    // (a new full snapshot, same session, pending events queued first). Only a
+    // recorder that asks for canvas: a child iframe's frames (the parent
+    // records none) are dropped by the filter and restarting would not stop them.
+    onCeiling: (sessionId) => {
+      if (halted || !recorder?.canvas || recorder.mode !== "session" || recorder.sessionId !== sessionId) return;
+      if (cappedGeneration === generation) return;
+      cappedGeneration = generation;
+      ctx.log("session replay canvas budget spent, recording goes on without canvas");
+      const mine = generation;
+      // Never from inside rrweb's emit: on the next task, if nothing restarted it since.
+      setTimeout(() => {
+        if (halted || generation !== mine || store.active()?.id !== sessionId) return;
+        restart();
+      }, 0);
+    },
+  });
 
   const emit = (raw: RrwebEvent) => {
     if (halted || !recorder) return;
@@ -503,7 +532,8 @@ export function startRecording(
     }
     const kept = limitCanvas(event, {
       budget: recorder.mode === "session",
-      pixels: canvasOn || iframes?.fromChild() === true,
+      sessionId: recorder.sessionId,
+      pixels: recorder.canvas || iframes?.fromChild() === true,
     });
     if (!kept) return;
     event = kept;
@@ -612,7 +642,9 @@ export function startRecording(
       .then((mod) => {
         if (halted || mine !== generation) return;
         record = mod.record;
-        recorder = { mode, sessionId: session.id, stop: () => {} };
+        // A session whose canvas budget is spent (on an earlier page load too) records without canvas.
+        const canvas = canvasOn && !(mode === "session" && canvasBudgetFull(ctx.sessionStorage, session.id));
+        recorder = { mode, sessionId: session.id, canvas, stop: () => {} };
         recStart = mode === "session" ? session.recStart : undefined;
         minDuration = mode === "session" ? (session.minDurationMs ?? 0) : 0;
         minReached = minDuration <= 0;
@@ -621,7 +653,7 @@ export function startRecording(
         // Before record(): its message filter must run ahead of rrweb's listener.
         iframes?.attach();
         const stop = mod.record({
-          ...recordOptions(options),
+          ...recordOptions(options, { canvas }),
           ...(iframes ? { recordCrossOriginIframes: true } : {}),
           emit,
         });

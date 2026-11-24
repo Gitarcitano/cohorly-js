@@ -1,5 +1,22 @@
 # @cohorly/react-native
 
+## 1.8.0
+
+### Minor Changes
+
+- 83d2b5a: Session replay on Android records the software keyboard (VEL-2174): opening it sends the `keyboard` event with its height in dp and closing it sends `open: false`, so the player shows the keyboard over the screen. A `GradientDrawable` background with a stroke is recorded with its border (width and color).
+
+### Patch Changes
+
+- a6e6600: iOS session replay: before the first frame is recorded, a touch on another window than the key window (an alert, the keyboard) is no longer recorded.
+- be45c9d: Session replay: on iOS a full snapshot too large to send is captured again with smaller screenshots (up to 3 levels) instead of leaving the session without a playable screen, and a storage write that never answers no longer stops replay uploads (the seq reservation waits at most 5 s, then retries with backoff).
+
+## 1.7.2
+
+### Patch Changes
+
+- 2afee31: iOS session replay: a `TextInput` with `multiline` and `editable={false}` is now recorded as a masked input, like every other `TextInput` and like on Android and web. Its text view (`RCTUITextView`) was recorded as plain text when it had never been editable, so its content showed in clear in the replay, in wireframe and screenshot mode. A plain `UITextView` that is not editable still records its text.
+
 ## 1.7.1
 
 ### Patch Changes

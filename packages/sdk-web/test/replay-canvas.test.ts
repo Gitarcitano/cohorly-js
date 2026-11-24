@@ -1,14 +1,17 @@
+import type { CohorlyStorage } from "@cohorly/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionReplayOptions } from "../src/index.js";
 import { cohorly, init } from "../src/index.js";
 import {
+  CANVAS_BUDGET_KEY,
+  canvasBudgetFull,
   canvasFilter,
   MAX_CANVAS_FRAME_CHARS,
-  MAX_CANVAS_PAGE_CHARS,
+  MAX_CANVAS_SESSION_CHARS,
   resetCanvasBudget,
 } from "../src/replay/canvas.js";
 import { MAX_CHUNK_BYTES, recordOptions } from "../src/replay/replay.js";
-import { canvasSettings } from "../src/replay/session.js";
+import { canvasSettings, SESSION_KEY } from "../src/replay/session.js";
 
 // Canvas recording (VEL-2155). jsdom has no canvas: a stand-in for
 // @rrweb/record hands the SDK the events the real one emits, and the real
@@ -182,20 +185,17 @@ describe("canvas frame limits (C2, C3, C6)", () => {
     expect(MAX_CANVAS_FRAME_CHARS).toBe(400_000);
   });
 
-  it("stops at 64 MiB per page load, counts only the frames it keeps, and says so once", () => {
+  it("stops at 64 MiB, says so once, and once a frame was refused for it takes no other", () => {
     const filter = canvasFilter(log);
-    expect(MAX_CANVAS_PAGE_CHARS).toBe(64 * MiB);
+    expect(MAX_CANVAS_SESSION_CHARS).toBe(64 * MiB);
     // 64 MiB = 167 x 400000 + 308864.
     for (let i = 0; i < 167; i += 1) expect(filter(frame(400_000))).not.toBeNull();
     expect(filter(frame(400_000))).toBeNull();
     expect(filter(frame(399_999))).toBeNull();
-    expect(filter(frame(400_000))).toBeNull();
     expect(log).toHaveBeenCalledTimes(1);
     expect(String(log.mock.calls[0][0])).toContain("canvas");
-    // The dropped frames did not count: what is left of the budget still takes a frame that fits exactly...
-    const rest = frame(64 * MiB - 167 * 400_000);
-    expect(filter(rest)).toBe(rest);
-    // ...and nothing after it.
+    // The budget is spent (the recorder restarts without canvas): even a frame that would fit what is left goes.
+    expect(filter(frame(64 * MiB - 167 * 400_000))).toBeNull();
     expect(filter(frame(10_000))).toBeNull();
     // Events that are not canvas frames carry on.
     for (const event of [interaction, meta, { type: 5, timestamp: T0, data: { tag: "$network", payload: {} } }]) {
@@ -218,7 +218,7 @@ describe("canvas frame limits (C2, C3, C6)", () => {
     expect(filter(frame(400_000))).not.toBeNull();
   });
 
-  it("keeps the page budget across recorders (rotation, restart)", () => {
+  it("keeps the budget across recorders of the page (restart)", () => {
     const first = canvasFilter(log);
     for (let i = 0; i < 167; i += 1) first(frame(400_000));
     const second = canvasFilter(log);
@@ -236,6 +236,197 @@ describe("canvas frame limits (C2, C3, C6)", () => {
     ];
     for (const event of events) expect(filter(event)).toBe(event);
     expect(filter(frame(500_000))).toBeNull();
+  });
+});
+
+/** sessionStorage as the SDK sees it (storage.ts), in memory; `broken` throws on every call. */
+function memoryStorage(broken = false): CohorlyStorage & { data: Map<string, string> } {
+  const data = new Map<string, string>();
+  const check = () => {
+    if (broken) throw new DOMException("blocked", "SecurityError");
+  };
+  return {
+    data,
+    get: (key) => {
+      check();
+      return data.get(key) ?? null;
+    },
+    set: (key, value) => {
+      check();
+      data.set(key, value);
+    },
+    remove: (key) => {
+      check();
+      data.delete(key);
+    },
+  };
+}
+
+describe("canvas budget per session, across page loads (VEL-2176)", () => {
+  const log = vi.fn();
+  beforeEach(() => {
+    resetCanvasBudget();
+    log.mockClear();
+  });
+
+  /** Frames of 400000 characters offered to `filter` until one is refused; the characters it kept. */
+  function fill(filter: ReturnType<typeof canvasFilter>, sessionId: string, max: number): number {
+    let kept = 0;
+    for (let i = 0; i < max; i += 1) {
+      const f = frame(400_000);
+      if (filter(f, { sessionId }) === null) break;
+      kept += jsonChars(f);
+    }
+    return kept;
+  }
+
+  it("never keeps more than 64 MiB in a session, summing its page loads and recorders (C1)", () => {
+    const storage = memoryStorage();
+    const onCeiling = vi.fn();
+    // First page load: 100 frames.
+    const first = canvasFilter(log, { storage, onCeiling });
+    let kept = fill(first, "s1", 100);
+    expect(kept).toBe(100 * 400_000);
+    // A reload: a new module state (memory forgotten) and a new recorder, the same session in sessionStorage.
+    resetCanvasBudget();
+    const second = canvasFilter(log, { storage, onCeiling });
+    kept += fill(second, "s1", 1000);
+    // 64 MiB = 167 x 400000 + 308864: the 168th frame of the session is the one refused.
+    expect(kept).toBe(167 * 400_000);
+    expect(kept).toBeLessThanOrEqual(MAX_CANVAS_SESSION_CHARS);
+    expect(onCeiling).toHaveBeenCalledWith("s1");
+    // A third load of the session starts full: no frame at all, and the recorder knows before asking rrweb.
+    resetCanvasBudget();
+    expect(canvasBudgetFull(storage, "s1")).toBe(true);
+    const third = canvasFilter(log, { storage, onCeiling });
+    expect(third(frame(1000), { sessionId: "s1" })).toBeNull();
+    expect(JSON.parse(storage.data.get(CANVAS_BUDGET_KEY) as string)).toEqual({ id: "s1", chars: 167 * 400_000, full: true });
+  });
+
+  it("a new session starts from zero, and its count replaces the old one in sessionStorage (C2)", () => {
+    const storage = memoryStorage();
+    const filter = canvasFilter(log, { storage });
+    fill(filter, "s1", 1000);
+    expect(canvasBudgetFull(storage, "s1")).toBe(true);
+    expect(canvasBudgetFull(storage, "s2")).toBe(false);
+    resetCanvasBudget();
+    const next = canvasFilter(log, { storage });
+    expect(fill(next, "s2", 1000)).toBe(167 * 400_000);
+    expect(JSON.parse(storage.data.get(CANVAS_BUDGET_KEY) as string)).toMatchObject({ id: "s2" });
+  });
+
+  it("without sessionStorage (every call throws) it counts in memory for the page load and never throws (C3)", () => {
+    const storage = memoryStorage(true);
+    const filter = canvasFilter(log, { storage });
+    expect(() => fill(filter, "s1", 1000)).not.toThrow();
+    expect(filter(frame(1000), { sessionId: "s1" })).toBeNull();
+    // A recorder restart on the same page keeps the memory count...
+    expect(canvasFilter(log, { storage })(frame(1000), { sessionId: "s1" })).toBeNull();
+    expect(canvasBudgetFull(storage, "s1")).toBe(true);
+    // ...and a new page load starts over, as before VEL-2176.
+    resetCanvasBudget();
+    expect(fill(canvasFilter(log, { storage }), "s1", 1000)).toBe(167 * 400_000);
+  });
+
+  it("error mode (budget off) still counts nothing in sessionStorage (C4)", () => {
+    const storage = memoryStorage();
+    const filter = canvasFilter(log, { storage });
+    for (let i = 0; i < 200; i += 1) expect(filter(frame(400_000), { sessionId: "s1", budget: false })).not.toBeNull();
+    expect(storage.data.has(CANVAS_BUDGET_KEY)).toBe(false);
+  });
+});
+
+/** A snapshot with three canvases of the given pixel lengths and a paragraph of `textChars` characters. */
+function threeCanvases(pixels: [number, number, number], textChars = 0) {
+  return {
+    type: 2,
+    timestamp: T0,
+    data: {
+      node: {
+        type: 0,
+        childNodes: [
+          {
+            type: 2,
+            tagName: "html",
+            id: 1,
+            attributes: {},
+            childNodes: [
+              { type: 2, tagName: "p", id: 2, attributes: {}, childNodes: [{ type: 3, id: 3, textContent: "t".repeat(textChars) }] },
+              canvasNode(10, `data:image/webp;base64,${"S".repeat(pixels[0])}`),
+              { type: 2, tagName: "div", id: 20, attributes: {}, childNodes: [canvasNode(22, `data:image/webp;base64,${"L".repeat(pixels[1])}`)] },
+              canvasNode(30, `data:image/webp;base64,${"M".repeat(pixels[2])}`),
+            ],
+          },
+        ],
+      },
+    },
+  };
+}
+
+/** Ids of the canvases that still carry rr_dataURL. */
+const withPixels = (node: Node) => canvases(node).filter((n) => "rr_dataURL" in (n.attributes ?? {})).map((n) => n.id);
+
+describe("largest canvas pixels go first, only until the event fits (C5)", () => {
+  /** What enqueue counts for a Meta and a FullSnapshot kept in one chunk. */
+  const unitBytes = (snapshot: unknown) => 2 + (utf8(meta) + 1) + (utf8(snapshot) + 1);
+
+  it("drops only the largest canvas when that is enough; the two smaller keep theirs", () => {
+    const filter = canvasFilter(vi.fn());
+    filter(meta);
+    // Small (id 10), large (22), medium (30).
+    const big = threeCanvases([1000, 700_000, 300_000]);
+    expect(unitBytes(big)).toBeGreaterThan(MAX_CHUNK_BYTES);
+    const before = JSON.stringify(big);
+    const out = filter(big) as typeof big;
+    expect(out).not.toBe(big);
+    expect(withPixels(out.data.node as Node)).toEqual([10, 30]);
+    expect(unitBytes(out)).toBeLessThanOrEqual(MAX_CHUNK_BYTES);
+    expect(JSON.stringify(big)).toBe(before);
+    expect(withPixels(big.data.node as Node)).toEqual([10, 22, 30]);
+  });
+
+  it("drops the second largest too when the largest is not enough; the smallest stays", () => {
+    const filter = canvasFilter(vi.fn());
+    filter(meta);
+    // 850000 of text: without the largest it is still over, without the two largest it fits.
+    const big = threeCanvases([1000, 200_000, 150_000], 850_000);
+    expect(unitBytes(big)).toBeGreaterThan(MAX_CHUNK_BYTES);
+    const out = filter(big) as typeof big;
+    expect(withPixels(out.data.node as Node)).toEqual([10]);
+    expect(unitBytes(out)).toBeLessThanOrEqual(MAX_CHUNK_BYTES);
+    expect(withPixels(big.data.node as Node)).toEqual([10, 22, 30]);
+  });
+
+  it("an event that fits is the same object", () => {
+    const filter = canvasFilter(vi.fn());
+    filter(meta);
+    const small = threeCanvases([1000, 2000, 3000]);
+    expect(filter(small)).toBe(small);
+  });
+
+  it("the same in a DOM mutation that adds several canvases", () => {
+    const filter = canvasFilter(vi.fn());
+    const mutation = {
+      type: 3,
+      timestamp: T0,
+      data: {
+        source: 0,
+        texts: [],
+        attributes: [],
+        removes: [],
+        adds: [
+          { parentId: 1, nextId: null, node: canvasNode(60, `data:image/webp;base64,${"S".repeat(1000)}`) },
+          { parentId: 1, nextId: null, node: canvasNode(61, `data:image/webp;base64,${"L".repeat(700_000)}`) },
+          { parentId: 1, nextId: null, node: canvasNode(62, `data:image/webp;base64,${"M".repeat(300_000)}`) },
+        ],
+      },
+    };
+    const before = JSON.stringify(mutation);
+    const out = filter(mutation) as typeof mutation;
+    expect(out.data.adds.map((a) => "rr_dataURL" in (a.node.attributes ?? {}))).toEqual([true, false, true]);
+    expect(out.data.adds[0]).toBe(mutation.data.adds[0]);
+    expect(Buffer.byteLength(JSON.stringify(out)) + 3).toBeLessThanOrEqual(MAX_CHUNK_BYTES);
+    expect(JSON.stringify(mutation)).toBe(before);
   });
 });
 
@@ -257,15 +448,15 @@ describe("full snapshot over the chunk limit (C4)", () => {
     expect(filter(exact)).toBe(exact);
   });
 
-  it("one byte over drops rr_dataURL from every canvas, nested and in iframe documents, and keeps the rest", () => {
+  it("one byte over drops rr_dataURL from the largest canvas only, and keeps the rest", () => {
     const filter = canvasFilter(vi.fn());
     filter(meta);
     const big = snapshotOf(dataUrlFor(MAX_CHUNK_BYTES + 1));
     const out = filter(big);
     expect(out).not.toBe(big);
-    // Parseable, and everything but the pixels is as it was.
+    // Parseable, and everything but the large pixels is as it was (the nested and the iframe's small ones too).
     const parsed = JSON.parse(JSON.stringify(out)) as typeof big;
-    expect(JSON.stringify(parsed)).not.toContain("rr_dataURL");
+    expect(withPixels(parsed.data.node as Node)).toEqual([22, 41]);
     const found = canvases(parsed.data.node as Node);
     expect(found.map((n) => n.id)).toEqual([10, 22, 41, 50]);
     for (const node of found) expect(node.attributes).toMatchObject({ width: "800", height: "600", class: "chart" });
@@ -292,8 +483,8 @@ describe("full snapshot over the chunk limit (C4)", () => {
     const wide = snapshotOf("é".repeat(499_400));
     expect(jsonChars(wide)).toBeLessThan(MAX_CHUNK_BYTES);
     expect(utf8(wide)).toBeGreaterThan(MAX_CHUNK_BYTES);
-    const out = filter(wide);
-    expect(JSON.stringify(out)).not.toContain("rr_dataURL");
+    const out = filter(wide) as typeof wide;
+    expect(withPixels(out.data.node as Node)).toEqual([22, 41]);
   });
 
   it("counts the Meta that came before it", () => {
@@ -440,7 +631,7 @@ describe("through the SDK", () => {
     }
     expect(delivered).toBe(kept);
     expect(sentEvents().filter((e) => e.type === 3 && e.data?.source === 2).length).toBeGreaterThanOrEqual((kept + 20) / 3);
-    expect(warn.mock.calls.filter((args) => String(args[1]).includes("canvas"))).toHaveLength(1);
+    expect(warn.mock.calls.filter((args) => String(args[1]).includes("64 MiB"))).toHaveLength(1);
   });
 
   it("a snapshot over the limit goes out without its canvas pixels and its chunk is accepted whole, in session and error mode (C4)", async () => {
@@ -466,8 +657,10 @@ describe("through the SDK", () => {
       expect(bodies.length).toBeGreaterThan(0);
       for (const body of bodies) {
         expect(Buffer.byteLength(body)).toBeLessThan(1_000_000);
-        expect(body).not.toContain("rr_dataURL");
+        expect(body).not.toContain("BBBB");
       }
+      // Only the large canvas lost its pixels.
+      expect(bodies.join("")).toContain(SMALL_URL);
       expect(bodies.join("")).toContain("Visible text");
       expect(JSON.stringify(snapshot)).toBe(before);
     }
@@ -492,6 +685,95 @@ describe("through the SDK", () => {
       expect(Buffer.byteLength(body)).toBeLessThan(1_000_000);
     }
     expect(sentEvents().filter((e) => e.data?.source === 9)).toHaveLength(emitted);
+  });
+
+  const sessionId = () => (JSON.parse(window.sessionStorage.getItem(SESSION_KEY) as string) as { id: string }).id;
+  /** The session's canvas budget, as an earlier page load of it would have left it. */
+  const spendBudget = (chars: number, full = false) =>
+    window.sessionStorage.setItem(CANVAS_BUDGET_KEY, JSON.stringify({ id: sessionId(), chars, full }));
+  const recordCalls = () => rr.record.mock.calls.map(([options]) => options as Record<string, unknown>);
+
+  it("past the session budget the recorder restarts once without canvas, keeps recording the DOM, and a reload starts without canvas (C8)", async () => {
+    start({ sampleRate: 1, canvas: {} });
+    await recording();
+    expect(recordCalls()[0]).toMatchObject({ recordCanvas: true, sampling: { canvas: 2 } });
+    const id = sessionId();
+    spendBudget(MAX_CANVAS_SESSION_CHARS - 50_000);
+    emit(interaction);
+    emit(frame(40_000));
+    emit(frame(40_000)); // over the ceiling
+    emit(frame(40_000)); // still over: no second restart
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(rr.record).toHaveBeenCalledTimes(2));
+    const restarted = recordCalls()[1];
+    for (const key of ["recordCanvas", "sampling", "dataURLOptions"]) expect(key in restarted).toBe(false);
+    expect(restarted).toHaveProperty("maskInputOptions");
+    expect(rr.state.stops).toBe(1);
+    // The new recorder keeps the DOM coming, same session; frames that still arrive (a child iframe) are dropped.
+    emit({ ...interaction, data: { source: 2, type: 2, id: 9 } });
+    emit(frame(40_000));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionId()).toBe(id);
+    const events = sentEvents();
+    // What was pending went out (the interaction and the frame that fit), then the restart's snapshot.
+    expect(events.map((e) => [e.type, e.data?.source])).toEqual([
+      [4, undefined],
+      [2, undefined],
+      [3, 2],
+      [3, 9],
+      [4, undefined],
+      [2, undefined],
+      [3, 2],
+    ]);
+    expect(rr.record).toHaveBeenCalledTimes(2);
+    // A later page load of this session (memory gone, sessionStorage kept) asks rrweb for no canvas from the start.
+    resetCanvasBudget();
+    start({ sampleRate: 1, canvas: {} });
+    await vi.waitFor(() => expect(rr.record).toHaveBeenCalledTimes(3));
+    expect(sessionId()).toBe(id);
+    expect("recordCanvas" in recordCalls()[2]).toBe(false);
+    emit(frame(40_000));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(rr.record).toHaveBeenCalledTimes(3);
+  });
+
+  it("a session not at the ceiling asks rrweb for canvas on a reload, and a new session starts from zero (C8, C2)", async () => {
+    start({ sampleRate: 1, canvas: {} });
+    await recording();
+    spendBudget(MAX_CANVAS_SESSION_CHARS - 50_000);
+    resetCanvasBudget();
+    start({ sampleRate: 1, canvas: {} });
+    await vi.waitFor(() => expect(rr.record).toHaveBeenCalledTimes(2));
+    expect(recordCalls()[1]).toMatchObject({ recordCanvas: true });
+    // Full, but for another session: this one records canvas.
+    window.sessionStorage.setItem(CANVAS_BUDGET_KEY, JSON.stringify({ id: "older-session", chars: MAX_CANVAS_SESSION_CHARS, full: true }));
+    resetCanvasBudget();
+    start({ sampleRate: 1, canvas: {} });
+    await vi.waitFor(() => expect(rr.record).toHaveBeenCalledTimes(3));
+    expect(recordCalls()[2]).toMatchObject({ recordCanvas: true });
+  });
+
+  it("frames from a child iframe still count, but a parent that records no canvas is never restarted for them (C9)", async () => {
+    start({ sampleRate: 1 });
+    await recording();
+    spendBudget(MAX_CANVAS_SESSION_CHARS - 50_000);
+    emit(frame(40_000));
+    emit(frame(40_000)); // over the ceiling: dropped
+    emit(interaction);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(rr.record).toHaveBeenCalledTimes(1);
+    expect(rr.state.stops).toBe(0);
+    expect(sentEvents().filter((e) => e.data?.source === 9)).toHaveLength(1);
+  });
+
+  it("error mode counts nothing and never restarts for canvas (C4)", async () => {
+    start({ sampleRate: 0, onErrorSampleRate: 1, canvas: {} });
+    await recording();
+    spendBudget(MAX_CANVAS_SESSION_CHARS, true);
+    for (let i = 0; i < 5; i += 1) emit(frame(40_000));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(rr.record).toHaveBeenCalledTimes(1);
+    expect(recordCalls()[0]).toMatchObject({ recordCanvas: true });
   });
 
   it("a canvas frame is activity for the error buffer: it earns the next checkout, silence does not (C7)", async () => {
@@ -531,7 +813,8 @@ describe("through the SDK", () => {
     start({ sampleRate: 0, onErrorSampleRate: 1, canvas: {} });
     await recording();
     for (let i = 0; i < 170; i += 1) emit(frame(399_000));
-    expect(canvasFilter(vi.fn())(frame(400_000))).not.toBeNull();
+    expect(window.sessionStorage.getItem(CANVAS_BUDGET_KEY)).toBeNull();
+    expect(canvasFilter(vi.fn())(frame(400_000), { sessionId: sessionId() })).not.toBeNull();
   });
 
   it("a page that does not record canvas never has its snapshots touched (pixels are only looked for when the option is on)", async () => {

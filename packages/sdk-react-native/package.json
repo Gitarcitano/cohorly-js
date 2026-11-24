@@ -1,6 +1,6 @@
 {
   "name": "@cohorly/react-native",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "Standalone React Native SDK for Cohorly, hosted product analytics (Mixpanel-style). No hard dependency on react-native; works out of the box with in-memory storage and upgrades to AsyncStorage when injected. Ships an autolinked native module for device-info auto-capture.",
   "type": "module",
   "main": "dist/index.js",

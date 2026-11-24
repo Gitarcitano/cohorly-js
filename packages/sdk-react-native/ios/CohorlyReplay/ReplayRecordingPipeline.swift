@@ -25,11 +25,17 @@ protocol ReplayEventSink: AnyObject {
     /// `CohorlyReplay.notifyError()`). `distinctId`: who is identified now
     /// (nil = unknown), so an identify since the last capture is not missed.
     func errorOccurred(sessionId: String, distinctId: String?)
+    /// `sessionId` leaves this sink's mode (error) for session mode: what it
+    /// holds of that session goes now, once, before any session-mode chunk.
+    /// The sink is discarded right after.
+    func sendBeforeSessionMode(sessionId: String)
 }
 
 extension ReplayEventSink {
     /// A sink that sends what it records anyway has nothing to do on an error.
     func errorOccurred(sessionId: String, distinctId: String?) {}
+    /// Nor when its session changes mode.
+    func sendBeforeSessionMode(sessionId: String) {}
 }
 
 /// A delayed run of `work` on the recorder's serial queue.
@@ -113,10 +119,10 @@ final class ReplayRecordingPipeline {
         var capture = capture
         if let lastMode, lastMode != capture.mode {
             // Another sink from here on: it has no snapshot to build on. The
-            // error buffer is dropped (timer included), never sent: only an
-            // error sends it, and none can reach it outside error mode.
+            // error buffer goes once when the same session moves on to
+            // session mode, and is dropped otherwise (see `leaveErrorMode`).
             if lastMode == .error {
-                sinks[lastMode]?.discard()
+                leaveErrorMode(to: capture.mode, sessionId: capture.sessionId)
             } else {
                 sinks[lastMode]?.flush()
             }
@@ -175,10 +181,16 @@ final class ReplayRecordingPipeline {
         sinks[.error]?.errorOccurred(sessionId: sessionId, distinctId: distinctId)
     }
 
-    /// The session left error mode (to `.off` too, which records nothing):
-    /// the error buffer is dropped, timer included.
-    func leaveErrorMode() {
-        sinks[.error]?.discard()
+    /// The live session (`sessionId`) left error mode for `mode`. To
+    /// `.session` the buffer of that same session goes first, once (the web
+    /// SDK's `sendBufferBeforeSession`: the quota pause ended); to `.off`, or
+    /// for a buffer of another session (a rotation), nothing is sent. The
+    /// buffer is then dropped, timer included, so the recorder's two ways of
+    /// seeing the change (here and `record`) never send it twice.
+    func leaveErrorMode(to mode: ReplayMode, sessionId: String) {
+        guard let sink = sinks[.error] else { return }
+        if mode == .session { sink.sendBeforeSessionMode(sessionId: sessionId) }
+        sink.discard()
     }
 
     /// Forgets the buffers, the screen sent and the waiting touches.

@@ -1,5 +1,11 @@
 # @cohorly/cli
 
+## 0.2.2
+
+### Patch Changes
+
+- a8ad42a: `debug-files upload` and `react-native xcode` no longer fail the build when the server answers `409 debug_id already uploaded` for a dSYM slice: an unchanged framework (Firebase, an app extension) rebuilt under another DerivedData keeps its LC_UUID while its symcache carries other absolute paths, so the copy on the server already serves it. The slice is printed as `already uploaded <file> (<arch> <uuid>)` and counted in the summary (`N already uploaded`). Any other status, a network error, and a `409` for a source map index still fail with exit 1.
+
 ## 0.2.1
 
 ### Patch Changes

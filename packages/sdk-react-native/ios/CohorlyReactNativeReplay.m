@@ -14,6 +14,10 @@ RCT_EXTERN_METHOD(replayStop:(RCTPromiseResolveBlock)resolve
 RCT_EXTERN_METHOD(replayCheckout:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(replayShrink:(nonnull NSNumber *)level
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
 RCT_EXTERN_METHOD(replayDrain:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
